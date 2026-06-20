@@ -239,11 +239,15 @@ relying on a codex node in a run (cheap, de-risks quoting/auth/sandbox):
 
 ```bash
 OUT=$(mktemp); SCH=$(mktemp)
-printf '%s' '{"type":"object","additionalProperties":false,"required":["refuted"],"properties":{"refuted":{"type":"boolean"},"reasoning":{"type":"string"}}}' > "$SCH"
+printf '%s' '{"type":"object","additionalProperties":false,"required":["refuted","reasoning"],"properties":{"refuted":{"type":"boolean"},"reasoning":{"type":"string"}}}' > "$SCH"
 codex exec --skip-git-repo-check -s read-only \
   --output-schema "$SCH" -o "$OUT" \
-  "Adversarially verify, defaulting to refuted=true if uncertain: 2+2=5" >/dev/null
+  "Adversarially verify, defaulting to refuted=true if uncertain: 2+2=5" </dev/null >/dev/null
 cat "$OUT"   # expect schema-valid JSON, e.g. {"refuted":true,...}
+# </dev/null: with a positional prompt, codex still reads stdin — closing it
+# stops the snippet from hanging on "Reading additional input from stdin" in
+# non-interactive shells (CI, pipes). The codexNode helper avoids this by
+# passing the prompt via stdin (- < "$TASK") instead.
 ```
 
 If that returns clean JSON, the node will too. Then run the Workflow.

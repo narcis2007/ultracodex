@@ -337,8 +337,11 @@ Full failure-mode table in `codex-headless.md` → Troubleshooting.
 
 - **Keep Codex nodes short** (read-only verify/judge/small-gen). They hold a
   concurrency slot for Codex's full runtime — do not put long implementations here.
-- **Schemas must be strict** (`additionalProperties: false`, `required: [...]`):
-  it makes both Codex's `--output-schema` and the Workflow re-validation reliable.
+- **Schemas must be strict** — set `additionalProperties: false` **and** list
+  *every* key from `properties` in `required` (OpenAI's structured-output backend
+  400s on a partial `required` *before the run starts* — strict mode has no
+  optional keys). Strictness also makes both Codex's `--output-schema` and the
+  Workflow re-validation reliable.
 - **Speed/cost knob:** pass `effort: 'medium'` (or `'low'`) to `codexNode` for
   cheaper/faster verify nodes — it maps to `-c model_reasoning_effort`. See
   `codex-headless.md`.

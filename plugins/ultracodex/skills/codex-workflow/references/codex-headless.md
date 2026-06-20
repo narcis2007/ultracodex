@@ -10,7 +10,7 @@ with `codex exec --help` and the preflight if behavior differs.
 | Flag | Use |
 | --- | --- |
 | `-m, --model <MODEL>` | Model override. The default model is whatever the install is configured for (recent builds default to a GPT family model — a *different* family from Claude, which is the entire point). Confirm with the preflight; do not hard-code a model name in shared scripts. |
-| `--output-schema <FILE>` | Path to a **JSON Schema file** the final response must satisfy. Codex emits validated JSON. Strict schemas (`additionalProperties:false`, `required`) work best. |
+| `--output-schema <FILE>` | Path to a **JSON Schema file** the final response must satisfy. Codex emits validated JSON. Use strict schemas: `additionalProperties:false` and a `required` listing **every** key in `properties` — OpenAI's backend 400s on a partial `required` before the run starts (strict mode has no optional keys). |
 | `-o, --output-last-message <FILE>` | Writes the final message to a file. **This is the clean extraction path** — `cat "$OUT"`. stdout also prints it but with session chrome around it. |
 | `--json` | Stream events as JSONL to stdout. For debugging/observability, not for clean extraction. |
 | `-s, --sandbox <MODE>` | `read-only` \| `workspace-write` \| `danger-full-access`. See tiers below. |
@@ -106,6 +106,7 @@ Two adjacent failure shapes worth understanding:
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | Empty `-o` file | auth expired, or the model failed schema validation | Re-run the preflight; capture stderr (gotcha #2) to see the real error. |
+| OpenAI 400 before any output (`-o` never written) | strict schema with a partial `required` — a key in `properties` is missing from `required` | List **every** `properties` key in `required`; strict mode has no optional keys. |
 | Node returns `{"_codex_error":true}` | codex exited non-zero or `-o` was empty | Treat as "no result" and filter it **before** aggregating — never as pass/refute (gotcha #5). |
 | Session header on stderr but malformed JSON in `-o` | schema too loose | Tighten with `additionalProperties:false` + `required`; keep `revalidate:true` for small payloads. |
 | `codex login` / auth error in `exec` | not authenticated | Run `codex login` interactively — it cannot be done headlessly. |
@@ -162,7 +163,7 @@ command -v codex && codex --version
 # bare structured smoke (cheap):
 OUT=$(mktemp); SCH=$(mktemp)
 printf '%s' '{"type":"object","additionalProperties":false,"required":["ok"],"properties":{"ok":{"type":"boolean"}}}' > "$SCH"
-codex exec --skip-git-repo-check -s read-only --output-schema "$SCH" -o "$OUT" "Return {\"ok\":true}." >/dev/null && cat "$OUT"
+codex exec --skip-git-repo-check -s read-only --output-schema "$SCH" -o "$OUT" "Return {\"ok\":true}." </dev/null >/dev/null && cat "$OUT"
 ```
 
 If that prints schema-valid JSON, codex nodes will work. If it errors on auth,
