@@ -53,7 +53,7 @@ a few K tokens — cents even at flagship rates (sol $5/$30, terra $2.50/$15,
 luna $1/$6 per 1M in/out) — so `max` is a reasonable pick for a hard node, not
 a last resort. Typical mappings, not rules:
 
-- **Wide verify/judge fan-outs** → `gpt-5.6-luna` or `terra` at `low`/`medium` —
+- **Wide verify/judge fan-outs** → `gpt-5.6-luna` or `gpt-5.6-terra` at `low`/`medium` —
   the per-node cost drop compounds across the fan-out.
 - **Deep second opinion, judge of record, risky-conclusion cross-check** →
   `gpt-5.6-sol` at `high`/`xhigh`, or `max` when the node's verdict is

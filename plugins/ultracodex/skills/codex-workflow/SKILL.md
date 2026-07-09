@@ -165,10 +165,10 @@ reasoning with automatic sub-agent delegation). A structured verify is a few K
 tokens — cents even at flagship rates — so the high end is a real option, not
 an emergency lever. Typical shape:
 
-- wide verify/judge fan-outs → `luna`/`terra` at `low`/`medium` (compounds
-  across the fan-out);
+- wide verify/judge fan-outs → `gpt-5.6-luna`/`gpt-5.6-terra` at `low`/`medium`
+  (compounds across the fan-out);
 - a load-bearing verdict — deep judge, risky-conclusion cross-check →
-  `sol` at `high`/`xhigh`, or `max` when it matters most;
+  `gpt-5.6-sol` at `high`/`xhigh`, or `max` when it matters most;
 - `ultra` → the strongest, longest option: at most one deliberate cross-check
   per run — a knowing exception to "keep Codex nodes SHORT" (below), trading one
   held slot for the strongest verdict — or a Pattern B worker; never a wide
