@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "ultracodex",
   "displayName": "Ultracodex",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Blend Codex headless (codex exec) nodes into Claude Code's Workflow (ultracode) orchestration — cross-model adversarial verification, judge panels with a Codex juror, and second-opinion generation.",
   "author": {
     "name": "KingGyuSuh",

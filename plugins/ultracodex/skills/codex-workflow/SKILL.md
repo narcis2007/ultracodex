@@ -101,8 +101,11 @@ codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidat
 - **schema** — a JS JSON-Schema object, the single source of truth: feeds Codex's
   `--output-schema` AND (when `revalidate`) re-validates the result in `agent()`.
 - **cwd** — optional working root (`-C`) so Codex can read files itself (variant
-  below). **effort** — optional reasoning-effort knob (`-c model_reasoning_effort`).
-  **model** — optional model override (`-m`).
+  below). **effort** — optional reasoning-effort knob (`-c model_reasoning_effort`;
+  ladder `low`→`xhigh`, plus `max` on all GPT-5.6 tiers and `ultra` on
+  Sol/Terra). **model** — optional model override (`-m`; use fully-qualified tier
+  IDs like `gpt-5.6-sol`/`-terra`/`-luna`). Both are open, per-node choices — see
+  "Picking tier & effort per node" below.
 - **returns** a parsed object matching `schema`, or `{ _codex_error: true }` on
   failure (always filter that out before aggregating — see codex-headless.md).
 - **invariant** — self-contained: the Bash-capable subagent writes schema + task
@@ -150,6 +153,30 @@ multi-file verification with no new machinery.
 | Judge / score candidates | **Codex** (or mixed panel) | a juror that didn't write the candidate |
 | One attempt in a diverse panel | **mix** | genuine solution diversity, not reworded Claude |
 | Synthesize / decide / write-up | **Claude** | holds the orchestration context |
+
+### Picking tier & effort per node
+
+Once a node routes to Codex, *which* Codex is a second, per-node decision — and
+it is deliberately left open: match the tier and effort to what the node is for.
+The GPT-5.6 generation names its tiers (`gpt-5.6-sol` flagship / `gpt-5.6-terra`
+balanced / `gpt-5.6-luna` fast-cheap), and the effort ladder runs
+`low`→`xhigh` plus `max` (all tiers) and `ultra` (Sol/Terra only — maximum
+reasoning with automatic sub-agent delegation). A structured verify is a few K
+tokens — cents even at flagship rates — so the high end is a real option, not
+an emergency lever. Typical shape:
+
+- wide verify/judge fan-outs → `luna`/`terra` at `low`/`medium` (compounds
+  across the fan-out);
+- a load-bearing verdict — deep judge, risky-conclusion cross-check →
+  `sol` at `high`/`xhigh`, or `max` when it matters most;
+- `ultra` → the strongest, longest option: at most one deliberate cross-check
+  per run — a knowing exception to "keep Codex nodes SHORT" (below), trading one
+  held slot for the strongest verdict — or a Pattern B worker; never a wide
+  fan-out (it holds a slot and burns quota fast).
+
+Tier table, caveats (fully-qualified IDs on ChatGPT auth, ~372K effective
+context), and the full ladder: `references/codex-headless.md` → "Model tiers &
+reasoning effort".
 
 ## Concurrency & cost — keep Codex nodes SHORT
 
@@ -227,9 +254,11 @@ adds no new *confirmed* findings (Template 4) — for thorough audits.
 
 `-s/--sandbox <read-only|workspace-write|danger-full-access>` · `--output-schema
 <FILE>` · `-o/--output-last-message <FILE>` (clean final JSON — use this) ·
-`--skip-git-repo-check` · `-m/--model` · `-C/--cd <DIR>` (let Codex read a tree) ·
-`-c model_reasoning_effort="medium"` (trade depth for speed). Full annotated table
-(plus `--json`, `resume`, image, gotchas, **troubleshooting**) in
+`--skip-git-repo-check` · `-m/--model` (fully-qualified tier IDs, e.g.
+`gpt-5.6-sol`/`-terra`/`-luna`) · `-C/--cd <DIR>` (let Codex read a tree) ·
+`-c model_reasoning_effort="…"` (`low`→`xhigh`, plus `max` on all GPT-5.6 tiers
+and `ultra` on Sol/Terra — trade depth for speed, per node). Full annotated table (plus `--json`,
+`resume`, image, gotchas, **troubleshooting**, the tier table) in
 `references/codex-headless.md`.
 
 ## Verify your blend before trusting it

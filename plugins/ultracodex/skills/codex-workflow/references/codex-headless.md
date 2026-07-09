@@ -2,20 +2,21 @@
 
 Everything the `codexNode` helper relies on, plus the escalation patterns for
 when a Workflow node is the wrong container. The flag set below was verified
-against `codex` 0.139.0; flags are stable across recent releases, but confirm
-with `codex exec --help` and the preflight if behavior differs.
+against `codex` 0.144.0 (the first release bundling the GPT-5.6 generation);
+flags are stable across recent releases, but confirm with `codex exec --help`
+and the preflight if behavior differs.
 
 ## `codex exec` flags that matter
 
 | Flag | Use |
 | --- | --- |
-| `-m, --model <MODEL>` | Model override. The default model is whatever the install is configured for (recent builds default to a GPT family model — a *different* family from Claude, which is the entire point). Confirm with the preflight; do not hard-code a model name in shared scripts. |
+| `-m, --model <MODEL>` | Model override. The default model is whatever the install is configured for (recent builds default to the flagship GPT tier — a *different* family from Claude, which is the entire point). Use **fully-qualified IDs** (e.g. `gpt-5.6-sol`): on ChatGPT-account auth, aliases like bare `gpt-5.6` and shorthand tier names are rejected with a 400 mid-run — after the banner has already echoed them (see the caveats below). Confirm availability with the preflight; do not hard-code a model name in shared scripts — pick tiers per run/node (see "Model tiers & reasoning effort" below). |
 | `--output-schema <FILE>` | Path to a **JSON Schema file** the final response must satisfy. Codex emits validated JSON. Use strict schemas: `additionalProperties:false` and a `required` listing **every** key in `properties` — OpenAI's backend 400s on a partial `required` before the run starts (strict mode has no optional keys). |
 | `-o, --output-last-message <FILE>` | Writes the final message to a file. **This is the clean extraction path** — `cat "$OUT"`. stdout also prints it but with session chrome around it. |
 | `--json` | Stream events as JSONL to stdout. For debugging/observability, not for clean extraction. |
 | `-s, --sandbox <MODE>` | `read-only` \| `workspace-write` \| `danger-full-access`. See tiers below. |
 | `--skip-git-repo-check` | Run outside a git repo. Codex normally insists on a repo as a safety boundary; include this for scratch/verify nodes. |
-| `-c key=value` | Override any `~/.codex/config.toml` value, TOML-parsed. E.g. `-c model_reasoning_effort="medium"` for cheaper/faster runs, or `-c model="o3"`. |
+| `-c key=value` | Override any `~/.codex/config.toml` value, TOML-parsed. E.g. `-c model_reasoning_effort="medium"` for cheaper/faster runs, or `-c model="gpt-5.6-terra"`. |
 | `-i, --image <FILE>` | Attach image(s) to the prompt. |
 | `-C, --cd <DIR>` | Use the specified directory as the working root. `read-only` blocks writes, **not reads** — a `-C` node can read the whole tree, which is what makes large-context / multi-file verify cheap (name the files in the prompt instead of inlining them). |
 | `--dangerously-bypass-approvals-and-sandbox` | No approvals, no sandbox. Only for trusted headless harnesses. |
@@ -27,6 +28,58 @@ the *model's* shell commands cannot modify the workspace, so a verify/judge node
 has no model-driven side effects on your files. (Codex still writes its own
 session files unless `--ephemeral`, and `-o` writes the output file by design —
 `read-only` constrains the model's commands, not Codex's own bookkeeping.)
+
+## Model tiers & reasoning effort (GPT-5.6 generation)
+
+OpenAI's stated naming convention for the GPT-5.6 generation (Codex CLI ≥
+0.144.0): the number is the generation; Sol/Terra/Luna are capability tiers
+meant to advance on their own cadence. Both knobs map straight onto `codexNode`
+options (`model` → `-m`, `effort` → `-c model_reasoning_effort`), and **the
+choice is per node — leave it to the orchestrating model** to match tier and
+effort to what each node is for.
+
+| Tier (API ID) | Position | Catalog default effort |
+| --- | --- | --- |
+| `gpt-5.6-sol` | flagship reasoning — hardest verification, deep judging, long-horizon | `low` |
+| `gpt-5.6-terra` | balanced mid-tier — everyday verify/judge at roughly half flagship cost | `medium` |
+| `gpt-5.6-luna` | fastest/cheapest — wide verify fan-outs, routine structured checks | `medium` |
+
+Effort ladder for the 5.6 tiers, per the CLI's bundled catalog (confirm with
+`codex debug models`): `low` · `medium` · `high` · `xhigh` · **`max`** (all
+three tiers) · **`ultra`** (Sol/Terra only — maximum reasoning with automatic
+sub-agent task delegation; Luna's catalog omits it, yet passing it anyway is
+*silently accepted*, not rejected — see the caveats below). All are legitimate options; a structured verify is
+a few K tokens — cents even at flagship rates (sol $5/$30, terra $2.50/$15,
+luna $1/$6 per 1M in/out) — so `max` is a reasonable pick for a hard node, not
+a last resort. Typical mappings, not rules:
+
+- **Wide verify/judge fan-outs** → `gpt-5.6-luna` or `terra` at `low`/`medium` —
+  the per-node cost drop compounds across the fan-out.
+- **Deep second opinion, judge of record, risky-conclusion cross-check** →
+  `gpt-5.6-sol` at `high`/`xhigh`, or `max` when the node's verdict is
+  load-bearing.
+- **`ultra`** — the strongest option, and the one to place deliberately: it
+  spawns its own sub-agent delegation, so runs are long (a Workflow node holds
+  its concurrency slot throughout) and can consume usage quota quickly. Right
+  for **at most one** decisive cross-check per run — a *knowing exception* to
+  "keep Codex nodes short" that trades one held slot for the strongest verdict —
+  or for a Pattern B worker; wrong for a 20-finding verify fan-out.
+
+Caveats that bite in practice:
+
+- **Fully-qualified IDs only** on ChatGPT-account auth — bare `gpt-5.6`,
+  shorthand `sol`/`terra`/`luna`, and unlisted variants are rejected with a 400
+  *after* the banner echoes them, so the banner alone doesn't prove the model ran.
+- **Effort names are enforced asymmetrically.** A name outside the 5.6 catalog
+  (e.g. `minimal`, still listed in the general config docs) 400s mid-run
+  (`unsupported_value` on `reasoning.effort`) — but the unlisted *combination*
+  `ultra` on `gpt-5.6-luna` is silently accepted: clean exit, banner echoing
+  `ultra`. A clean run proves the node ran, not that the effort you asked for is
+  what engaged; the catalog (`codex debug models`) is the source of truth.
+- **Codex-side effective context is ~372K tokens** for the 5.6 tiers — smaller
+  than the API-advertised 1.05M window; size `cwd`-variant nodes accordingly.
+- Availability differs per install/account — the **preflight stays authoritative**;
+  hard-code no model in shared scripts, pass tiers per run instead.
 
 ## Sandbox tiers
 
@@ -111,7 +164,9 @@ Two adjacent failure shapes worth understanding:
 | Session header on stderr but malformed JSON in `-o` | schema too loose | Tighten with `additionalProperties:false` + `required`; keep `revalidate:true` for small payloads. |
 | `codex login` / auth error in `exec` | not authenticated | Run `codex login` interactively — it cannot be done headlessly. |
 | Node hangs / a slot stays busy for minutes | a long task slipped into a Workflow node | Move it to Pattern B (background pool); Workflow nodes are for short reads. |
-| Verify/judge nodes are slow or expensive | reasoning effort defaulting high for a "short" node | Pin `effort: 'medium'` (or `'low'`) on `codexNode` → `-c model_reasoning_effort` — this changes whether a node is actually short. |
+| Verify/judge nodes are slow or expensive | reasoning effort defaulting high for a "short" node | Pin `effort: 'medium'` (or `'low'`) on `codexNode` → `-c model_reasoning_effort`, and/or drop the tier (`model: 'gpt-5.6-luna'`) — this changes whether a node is actually short. See "Model tiers & reasoning effort". |
+| `-m` accepted but the run 400s (`model is not supported`) | alias or shorthand model name on ChatGPT-account auth | Use the fully-qualified tier ID (`gpt-5.6-sol` / `-terra` / `-luna`); the banner echoes whatever you passed, so only a completed run proves the model. |
+| Run 400s with `unsupported_value` on `reasoning.effort` | effort name outside the 5.6 catalog (e.g. `minimal` from the general config docs) | Use catalog names only (`low`→`xhigh`, `max`, `ultra` on Sol/Terra). Note the asymmetry: `ultra` on Luna does **not** 400 — it runs with the banner echoing `ultra` (see caveats), so a clean exit is not proof the effort engaged. |
 | The verify "passed" but feels too easy | the wrapper answered instead of relaying to Codex | Audit with the stderr check in gotcha #2; strengthen the "relay, not solver" preamble. |
 | Big diff/file verification bloats the prompt | inlining file contents into `taskText` | Pass `cwd` (`-C`) and name the files; Codex reads them under read-only (see `-C` row). |
 

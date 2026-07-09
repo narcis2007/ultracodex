@@ -23,6 +23,13 @@ Workflow (Claude JS orchestration)
  └─ verify / judge / 2nd-opinion ... codex node     ← GPT, independent failure modes
 ```
 
+> **GPT-5.6 지원 완료.** 설계상 모델 불가지론적이므로, GPT-5.6 세대
+> (**Sol / Terra / Luna**, Codex CLI ≥ 0.144.0)는 출시 당일 아무 수정 없이
+> ultracodex에서 동작했다. 문서에는 노드별 **티어·effort** 가이드가 추가되었다 —
+> 넓은 verify 팬아웃에는 저가 티어를, 판정이 결정적인 노드에는 플래그십(최대
+> `max`, Sol/Terra에서는 `ultra`까지)을 — 선택은 오케스트레이션하는 모델에
+> 맡긴다.
+
 > **ultracode 모드가 필요하다.** 이 스킬은 Workflow를 *작성하고 실행*하므로
 > **Workflow** 오케스트레이션 도구가 반드시 사용 가능해야 한다. Claude Code에서
 > 이는 곧 **ultracode 모드**를 의미한다(`/effort` → ultracode로 활성화하면 동적
@@ -67,6 +74,10 @@ Workflow (Claude JS orchestration)
 - **새로운 장치 없이 가능한 대용량 컨텍스트, 다중 파일 검증** — Codex의 작업 대상을
   트리로 지정하면(`cwd` / `-C`; read-only는 쓰기를 막을 뿐 읽기는 막지 않는다) 큰
   diff와 파일을 Codex가 직접 읽으므로, 프롬프트에 일일이 붙여 넣을 필요가 없다.
+- **노드별 티어·effort 라우팅** — 모든 codex 노드는 `model` / `effort`를 열린
+  선택지로 받는다: 넓은 verify 팬아웃에는 `gpt-5.6-luna` + `low`, 판정 하나가
+  결정적일 때는 `gpt-5.6-sol` + `xhigh`/`max`(또는 `ultra`). 아무것도 하드코딩하지
+  않으며, 오케스트레이션하는 모델이 노드마다 고른다.
 - **복사-붙여넣기 즉시 사용 가능** — 완성된 네 가지 Workflow 템플릿(cross-model 리뷰,
   혼합 심사 패널, 단일 결론 교차 검증, loop-until-dry)과 표준 `codexNode` 헬퍼를
   제공한다. 빈 파일이 아니라 동작하는 스크립트에서 시작한다.
