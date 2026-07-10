@@ -22,6 +22,13 @@ Workflow (Claude JS orchestration)
  └─ verify / judge / 2nd-opinion ... codex node     ← GPT, independent failure modes
 ```
 
+> **GPT-5.6 ready.** Model-agnostic by design: the GPT-5.6 generation
+> (**Sol / Terra / Luna**, Codex CLI ≥ 0.144.0) worked with ultracodex on day
+> one, no changes needed. The docs now add per-node **tier & effort** guidance —
+> cheap tiers for wide verify fan-outs, the flagship (up to `max`, or `ultra` on
+> Sol/Terra) for load-bearing verdicts — with the choice left to the
+> orchestrating model.
+
 > **Requires ultracode mode.** Because the skill *authors and runs* Workflows, the
 > **Workflow** orchestration tool must be available — which in Claude Code means
 > **ultracode mode** (enable it with `/effort` → ultracode; it turns on dynamic
@@ -66,6 +73,10 @@ That is the whole idea:
 - **Large-context, multi-file verification with no new machinery** — point Codex at
   a tree (`cwd` / `-C`; read-only blocks writes, not reads) so it reads big diffs
   and files itself instead of you pasting them into a prompt.
+- **Per-node tier & effort routing** — every codex node takes an open `model` /
+  `effort` choice: `gpt-5.6-luna` at `low` for wide verify fan-outs,
+  `gpt-5.6-sol` at `xhigh`/`max` (or `ultra`) when one verdict is load-bearing.
+  Nothing is hard-coded; the orchestrating model picks per node.
 - **Copy-paste ready** — four complete Workflow templates (cross-model review,
   mixed judge panel, single-conclusion cross-check, loop-until-dry) plus the
   canonical `codexNode` helper. You start from working scripts, not a blank file.

@@ -21,6 +21,12 @@ Workflow (Claude JS orchestration)
  └─ verify / judge / 2nd-opinion ... codex node     ← GPT, independent failure modes
 ```
 
+> **已支持 GPT-5.6。** 由于设计上与具体模型无关，GPT-5.6 一代
+> （**Sol / Terra / Luna**，Codex CLI ≥ 0.144.0）发布当天即可在 ultracodex 上
+> 无改动运行。文档新增了按节点选择**层级与 effort**的指引——宽扇出的 verify 用
+> 低价层级，裁决起决定性作用的节点用旗舰（最高 `max`，Sol/Terra 上还有
+> `ultra`）——选择权留给负责编排的模型。
+
 > **需要 ultracode 模式。** 由于该 skill 会*编写并运行* Workflow，所以
 > **Workflow** 编排工具必须可用——在 Claude Code 中，这意味着
 > **ultracode 模式**（用 `/effort` → ultracode 启用它；它会开启动态
@@ -59,6 +65,10 @@ Workflow (Claude JS orchestration)
 - **无需新机制的大上下文、多文件验证**——让 Codex 直接指向一个目录树
   （`cwd` / `-C`；read-only 只阻止写，不阻止读），这样它会自己去读大块 diff 和文件，而
   不是靠你把它们粘进 prompt。
+- **按节点的层级与 effort 路由**——每个 codex 节点的 `model` / `effort` 都是开放
+  选项：宽扇出 verify 用 `gpt-5.6-luna` + `low`；当单个裁决至关重要时用
+  `gpt-5.6-sol` + `xhigh`/`max`（或 `ultra`）。没有任何硬编码；由负责编排的模型
+  逐节点选择。
 - **开箱即用、可直接复制粘贴**——四个完整的 Workflow 模板（cross-model 审查、混合评判团、
   单结论交叉核验、loop-until-dry）外加标准的 `codexNode` helper。你从可运行的脚本起步，
   而不是从一张白纸。

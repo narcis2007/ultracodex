@@ -11,6 +11,8 @@ mental model, see the [repository README](../../README.md).
 - `skills/codex-workflow/SKILL.md` — Pattern A mental model, the `codexNode`
   relay helper, routing rules, concurrency/cost guidance, preflight.
 - `skills/codex-workflow/references/codex-headless.md` — `codex exec` reference,
+  model tiers & reasoning effort (GPT-5.6: Sol/Terra/Luna, `low`→`max`, plus
+  `ultra` on Sol/Terra),
   sandbox tiers, output extraction, gotchas, escalation patterns.
 - `skills/codex-workflow/references/workflow-templates.md` — the canonical
   `codexNode` helper plus four complete, copy-paste blended Workflow scripts

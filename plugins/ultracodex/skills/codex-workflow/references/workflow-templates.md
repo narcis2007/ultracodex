@@ -30,7 +30,9 @@ object.
 // schema:     a JS object (JSON Schema). Drives BOTH codex --output-schema and the
 //             Workflow's re-validation (when revalidate), so this returns a parsed object.
 // cwd:        optional working root (-C) so Codex can READ files itself (read-only still reads).
-// effort:     optional reasoning-effort knob, mapped to -c model_reasoning_effort="...".
+// effort:     optional reasoning-effort knob, mapped to -c model_reasoning_effort="..."
+//             (low→xhigh; GPT-5.6 tiers also take "max", and "ultra" on sol/terra).
+// model:      optional -m override; use fully-qualified tier IDs (gpt-5.6-sol/-terra/-luna).
 // revalidate: default true; set false for large payloads and JSON.parse the string yourself.
 function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort, revalidate = true, phase, label } = {}) {
   const flags = [
@@ -342,6 +344,14 @@ Full failure-mode table in `codex-headless.md` → Troubleshooting.
   400s on a partial `required` *before the run starts* — strict mode has no
   optional keys). Strictness also makes both Codex's `--output-schema` and the
   Workflow re-validation reliable.
-- **Speed/cost knob:** pass `effort: 'medium'` (or `'low'`) to `codexNode` for
-  cheaper/faster verify nodes — it maps to `-c model_reasoning_effort`. See
-  `codex-headless.md`.
+- **Tier & effort knobs — pick per node, the choice is open.** `effort:` maps to
+  `-c model_reasoning_effort` (`low`→`xhigh`, plus `max` on all GPT-5.6 tiers
+  and `ultra` on sol/terra); `model:` maps to `-m` (fully-qualified tier IDs:
+  `gpt-5.6-sol` flagship / `gpt-5.6-terra` balanced / `gpt-5.6-luna` fast-cheap).
+  Wide verify fan-outs like Template 1 pair well with `model: 'gpt-5.6-luna'` +
+  `effort: 'low'`; a load-bearing single verdict (Template 3) with
+  `gpt-5.6-sol` at `high`/`xhigh` or `max` — a structured verify is a few K
+  tokens, so the high end is a real option even at flagship rates. Reserve
+  `ultra` (auto sub-agent delegation, long runs) for one decisive node, never a
+  fan-out. Tier table and caveats: `codex-headless.md` →
+  "Model tiers & reasoning effort".
