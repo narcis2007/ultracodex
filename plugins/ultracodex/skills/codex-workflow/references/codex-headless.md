@@ -88,6 +88,26 @@ Caveats that bite in practice:
 - Availability differs per install/account — the **preflight stays authoritative**;
   hard-code no model in shared scripts, pass tiers per run instead.
 
+## Concurrency, rate limits & retry (stability)
+
+Codex 429s are overwhelmingly **RPM** (requests-per-minute), not token quota, and
+retrying *immediately* extends the block. Two levers keep a blend stable:
+
+- **Concurrency cap.** Wrap every codex node in a `codexGate` (`makeLimiter(n)`) set
+  BELOW the Workflow's global cap. Empirically ~6 small `gpt-5.6-sol` verifies run
+  concurrently with zero 429s (Plus-tier ChatGPT auth), so **4** is a safe default with
+  headroom; drop to **1-2** for `-C`/large-context or `max`/`ultra` nodes.
+- **Keep each node short.** A small self-contained verify is ~7-9s at any effort;
+  latency scales with CONTEXT, not effort. The throttling failure mode is a handful of
+  long, large-context, high-effort runs at once — never a wide fan-out of tiny verifies.
+
+**Retry policy (hardened helper).** On a classified transient error
+(`429`/`rate limit`/`timed out`/HTTP `5xx`) retry up to `maxAttempts` with linear
+backoff (`attempt*8s`); on a hard `400`/auth error do NOT retry — emit
+`{"_codex_error":true}` at once. `--ephemeral` (opt-in) avoids session-file litter for
+stateless verify nodes, and a `trap ... EXIT` removes the SCHEMA/TASK/OUT/ERR temp files
+on any outcome.
+
 ## Sandbox tiers
 
 - **`read-only`** — default for verify/judge/read-and-reason nodes. No writes, no
@@ -176,6 +196,8 @@ Two adjacent failure shapes worth understanding:
 | Run 400s with `unsupported_value` on `reasoning.effort` | effort name outside the 5.6 catalog (e.g. `minimal` from the general config docs) | Use catalog names only (`low`→`xhigh`, `max`, `ultra` on Sol/Terra). Note the asymmetry: `ultra` on Luna does **not** 400 — it runs with the banner echoing `ultra` (see caveats), so a clean exit is not proof the effort engaged. |
 | The verify "passed" but feels too easy | the wrapper answered instead of relaying to Codex | Audit with the stderr check in gotcha #2; strengthen the "relay, not solver" preamble. |
 | Big diff/file verification bloats the prompt | inlining file contents into `taskText` | Pass `cwd` (`-C`) and name the files; Codex reads them under read-only (see `-C` row). |
+| Many nodes 429 / rate-limited in one run | too many concurrent Codex runs, or long high-effort `-C` runs sustaining high RPM/TPM | Lower the `codexGate` cap (4 → 2); keep verifies small & self-contained; the hardened helper already backs off and retries transient errors. |
+| N of M fan-out verifiers silently return nothing | fail-OPEN aggregation: errored nodes drop to null and vanish | Fail closed — partition `confirmed`/`refuted`/`unverified` and surface the unverified count (workflow-templates.md Template 1). |
 
 ## Escalation — when Pattern A is the wrong shape
 

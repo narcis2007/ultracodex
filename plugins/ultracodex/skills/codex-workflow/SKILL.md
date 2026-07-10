@@ -93,7 +93,7 @@ the top of `references/workflow-templates.md` — paste it once near the top of 
 script):
 
 ```
-codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidate=true, phase, label })
+codexNode(taskText, { schema, sandbox='read-only', model, effort, cwd, revalidate=true, ephemeral=false, maxAttempts=2, phase, label })
   → Promise<parsedObject>
 ```
 
@@ -124,7 +124,7 @@ of the helper):
    and `cat "$OUT"`.
 3. **Pass the prompt via stdin (`- < "$TASK"`), not as a shell argument.** Task
    text contains quotes, `$`, and backticks that would break or expand inside a
-   double-quoted arg. The heredoc + stdin path is quoting-proof.
+   double-quoted arg. In this fork the heredoc delimiter is **salted per payload** (`safeDelim`), so even a payload line that equals the delimiter — or contains `$(...)`/backticks — stays inert. (The earlier flat "quoting-proof" claim held only until a payload happened to contain the fixed delimiter; verifying arbitrary repo content, or this plugin's own docs, breaks it.)
 
 `revalidate: true` (the default) re-validates Codex's JSON and returns a parsed
 object — best for small structured payloads (verdicts, scores), immune to schema
@@ -195,6 +195,38 @@ Bash call. So:
 - Verifying/judging **many small items**? Use the **batch codex node** (one Codex
   run for N items, keyed by id) in `references/workflow-templates.md` to amortize
   the slot + run; fan out (Template 1) only when each item needs a fresh context.
+
+
+## Stability & routing (read this before scaling out)
+
+The single biggest determinant of a stable, high-quality blend is **who does what**,
+not which knob you turn. Measured on `codex` 0.144.0 / `gpt-5.6-sol` (confirm on your
+box — numbers move):
+
+- A **small, self-contained verify is ~7-9s at *any* effort** (`low`/`high`/`xhigh`
+  alike). Latency is dominated by **context size, not effort** — so pick effort for
+  *quality* and keep the *task* small.
+- **~6 small verifies run concurrently with zero 429s**; throttling comes from a few
+  **long, large-context, high-effort** runs sustaining high token throughput — not from
+  modest width.
+
+That yields five rules the templates already encode:
+
+1. **Division of labor: Claude finds → Codex verifies → Claude synthesizes.** Claude
+   owns breadth and all file-reading (fast, cache-warm, high concurrency). Codex only
+   adversarially verifies **small, self-contained** findings. Claude synthesizes. Never
+   put file-reading breadth in a Codex fan-out — that is the one shape that throttles.
+2. **Keep the best model; vary effort by role.** `gpt-5.6-sol` everywhere; verify at
+   `xhigh`; a single load-bearing cross-check (Template 3) at `max`/`ultra`. Don't
+   downgrade the model for "stability" — downgrade the *task size* and *concurrency*.
+3. **Cap concurrent Codex nodes** with `codexGate` (default 4, well under the Workflow's
+   global cap; 1-2 for `-C`/large-context nodes).
+4. **Fail closed.** Partition `confirmed`/`refuted`/`unverified`; a dead Codex node is
+   `unverified`, never a silent pass. Return `status:'incomplete'` when any required node
+   failed. (Without this, an all-failed run is indistinguishable from an all-clean one.)
+5. **Retry transient errors with backoff, never immediately.** The helper retries once on
+   429/5xx/timeout after a backoff (immediate retry *extends* an RPM block) and never
+   retries a hard 400/auth error.
 
 ## Sandbox tiers
 
