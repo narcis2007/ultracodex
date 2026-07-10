@@ -212,10 +212,15 @@ box — numbers move):
 
 That yields five rules the templates already encode:
 
-1. **Division of labor: Claude finds → Codex verifies → Claude synthesizes.** Claude
-   owns breadth and all file-reading (fast, cache-warm, high concurrency). Codex only
-   adversarially verifies **small, self-contained** findings. Claude synthesizes. Never
-   put file-reading breadth in a Codex fan-out — that is the one shape that throttles.
+1. **The hard invariant is ≤4 concurrent Codex agents — not the role.** Within that cap
+   Codex is fair game for what it's good at: reads, research, analysis, *and* adversarial
+   verification — you are NOT limited to tiny self-contained verifies. The usual division
+   of labor (Claude finds/reads for breadth → Codex verifies/analyzes → Claude synthesizes)
+   is still the cheap default because Claude is cache-warm for wide fan-out, but routing
+   reads/research to Codex is fine. **Caveat:** what throttles is several *long,
+   large-context, high-effort* Codex runs at once (draining RPM/TPM), so for heavy Codex
+   read nodes prefer `effort: 'high'` and/or a tighter gate (1–2) — and never exceed the
+   global cap of 4.
 2. **Keep the best model; vary effort by role.** `gpt-5.6-sol` everywhere; verify at
    `xhigh`; a single load-bearing cross-check (Template 3) at `max`/`ultra`. Don't
    downgrade the model for "stability" — downgrade the *task size* and *concurrency*.

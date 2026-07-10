@@ -207,11 +207,11 @@ const report = await agent(
 return { status: unverified.length ? 'incomplete' : 'complete', report, confirmed, refuted, unverified }
 ```
 
-> **Do NOT invert this.** Putting Codex in the *find* stage (reading many files at high
-> effort, fanned out wide) is the one shape that reliably throttles: several long,
-> high-token runs at once drain RPM/TPM. Keep Codex on small self-contained verifies.
-> If a verify genuinely needs file context, see the `cwd` (`-C`) variant in Variants —
-> and gate it to 1–2 concurrent.
+> **The invariant is the cap, not the role.** Codex CAN do the finding/reading/research
+> too — just keep **≤4 concurrent Codex agents** (`codexGate`). What throttles is *many
+> long high-effort Codex runs at once*, not Codex reading per se: so for long
+> large-context nodes prefer `effort: 'high'` over `max` and gate to 1–2 (see the `cwd`
+> `-C` variant in Variants). Small self-contained verifies stay cheap at any effort.
 
 ---
 
