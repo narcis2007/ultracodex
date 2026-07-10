@@ -44,6 +44,13 @@ effort to what each node is for.
 | `gpt-5.6-terra` | balanced mid-tier — everyday verify/judge at roughly half flagship cost | `medium` |
 | `gpt-5.6-luna` | fastest/cheapest — wide verify fan-outs, routine structured checks | `medium` |
 
+Defaults are surface-dependent — treat them as a fallback, not a contract. The
+column above is the CLI bundled catalog's `default_reasoning_level` (per
+`codex debug models`, what a bare `codex exec` falls back to); the official
+models docs' "Power" preset instead pairs `gpt-5.6-sol` with `medium`, and any
+`model_reasoning_effort` in `~/.codex/config.toml` overrides both. **Pin
+`effort` explicitly on any node whose cost, latency, or depth matters.**
+
 Effort ladder for the 5.6 tiers, per the CLI's bundled catalog (confirm with
 `codex debug models`): `low` · `medium` · `high` · `xhigh` · **`max`** (all
 three tiers) · **`ultra`** (Sol/Terra only — maximum reasoning with automatic
