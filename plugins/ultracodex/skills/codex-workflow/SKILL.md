@@ -86,28 +86,35 @@ and relays the clean `-o` output file.
 > access** — it can't write the schema file itself. So the node embeds the
 > schema as a string and the (Bash-capable) wrapper subagent writes it. One
 > `schema` object is the single source of truth: `JSON.stringify` feeds Codex's
-> `--output-schema`, and the same object is passed to `agent()` for re-validation.
+> `--output-schema`; `codexNode` then `JSON.parse`s the relayed result in JS. (It does
+> NOT pass a schema to the relay `agent()` — a top-level union/`anyOf` tool `input_schema`
+> is rejected by the Anthropic API, and a strict schema would nudge the relay to fabricate
+> a fake success object on error.)
 
 The helper's **contract** (the full copy-paste implementation lives canonically at
 the top of `references/workflow-templates.md` — paste it once near the top of your
 script):
 
 ```
-codexNode(taskText, { schema, sandbox='read-only', model, effort, cwd, revalidate=true, ephemeral=false, maxAttempts=2, phase, label })
+codexNode(taskText, { schema, sandbox='read-only', model, effort, cwd, revalidate=true, ephemeral=false, maxAttempts=2, attemptTimeoutSec, gate, phase, label })
   → Promise<parsedObject>
 ```
 
 - **taskText** — the verify / judge / generate prompt for Codex.
 - **schema** — a JS JSON-Schema object, the single source of truth: feeds Codex's
-  `--output-schema` AND (when `revalidate`) re-validates the result in `agent()`.
+  `--output-schema`; `codexNode` `JSON.parse`s the relayed result (no tool schema on the
+  relay `agent()`). **gate** — the concurrency limiter (default `codexDefaultGate`, ≤4);
+  pass `makeLimiter(2)` for heavy `-C` nodes. **attemptTimeoutSec** — opt-in per-attempt
+  wall-clock kill (needs coreutils `timeout`). **maxAttempts** — transient-retry budget (default 2).
 - **cwd** — optional working root (`-C`) so Codex can read files itself (variant
   below). **effort** — optional reasoning-effort knob (`-c model_reasoning_effort`;
   ladder `low`→`xhigh`, plus `max` on all GPT-5.6 tiers and `ultra` on
   Sol/Terra). **model** — optional model override (`-m`; use fully-qualified tier
   IDs like `gpt-5.6-sol`/`-terra`/`-luna`). Both are open, per-node choices — see
   "Picking tier & effort per node" below.
-- **returns** a parsed object matching `schema`, or `{ _codex_error: true }` on
-  failure (always filter that out before aggregating — see codex-headless.md).
+- **returns** a parsed object matching `schema`, or `{ _codex_error: true, kind, attempts }`
+  on failure (`kind` ∈ rate_limit|server|timeout|auth|schema|empty_output|parse|unknown;
+  always filter it out before aggregating — see codex-headless.md).
 - **invariant** — self-contained: the Bash-capable subagent writes schema + task
   to temp files because Workflow JS has no filesystem.
 
@@ -126,10 +133,10 @@ of the helper):
    text contains quotes, `$`, and backticks that would break or expand inside a
    double-quoted arg. In this fork the heredoc delimiter is **salted per payload** (`safeDelim`), so even a payload line that equals the delimiter — or contains `$(...)`/backticks — stays inert. (The earlier flat "quoting-proof" claim held only until a payload happened to contain the fixed delimiter; verifying arbitrary repo content, or this plugin's own docs, breaks it.)
 
-`revalidate: true` (the default) re-validates Codex's JSON and returns a parsed
-object — best for small structured payloads (verdicts, scores), immune to schema
-drift. For large structured outputs, set `revalidate: false` and `JSON.parse` the
-relayed string yourself (Codex's own `--output-schema` still enforces shape) —
+`revalidate: true` (the default) `JSON.parse`s the relayed result and returns an object
+— best for small structured payloads (verdicts, scores). Codex's own `--output-schema`
+enforces the shape; a parse failure returns `{_codex_error:true, kind:'parse'}`. For large
+structured outputs, set `revalidate: false` and `JSON.parse` the relayed string yourself —
 concrete snippet in `references/workflow-templates.md`.
 
 ### Variant: let Codex read the files itself
@@ -224,8 +231,10 @@ That yields five rules the templates already encode:
 2. **Keep the best model; vary effort by role.** `gpt-5.6-sol` everywhere; verify at
    `xhigh`; a single load-bearing cross-check (Template 3) at `max`/`ultra`. Don't
    downgrade the model for "stability" — downgrade the *task size* and *concurrency*.
-3. **Cap concurrent Codex nodes** with `codexGate` (default 4, well under the Workflow's
-   global cap; 1-2 for `-C`/large-context nodes).
+3. **Cap concurrent Codex nodes — intrinsically.** `codexNode` self-gates through a shared
+   `codexDefaultGate` (≤4, well under the Workflow's global cap) so you can't forget it; pass
+   `gate: makeLimiter(2)` for `-C`/large-context nodes. Do NOT wrap calls in an outer gate
+   (double-gating can deadlock).
 4. **Fail closed.** Partition `confirmed`/`refuted`/`unverified`; a dead Codex node is
    `unverified`, never a silent pass. Return `status:'incomplete'` when any required node
    failed. (Without this, an all-failed run is indistinguishable from an all-clean one.)

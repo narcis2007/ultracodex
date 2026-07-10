@@ -60,8 +60,12 @@ a few K tokens — cents even at flagship rates (sol $5/$30, terra $2.50/$15,
 luna $1/$6 per 1M in/out) — so `max` is a reasonable pick for a hard node, not
 a last resort. Typical mappings, not rules:
 
-- **Wide verify/judge fan-outs** → `gpt-5.6-luna` or `gpt-5.6-terra` at `low`/`medium` —
-  the per-node cost drop compounds across the fan-out.
+- **Wide verify/judge fan-outs** → two valid schools. *Cost-first:* `gpt-5.6-luna`/
+  `gpt-5.6-terra` at `low`/`medium` (the per-node drop compounds). *Quality-first (this
+  fork's default):* keep `gpt-5.6-sol` everywhere at `xhigh` and instead bound cost/latency
+  by keeping each node SMALL and the concurrency `gate` ≤4 — a small verify is ~7-9s at any
+  effort, so sol+xhigh fan-out is affordable. Pick one policy per project and pin it in a
+  role-policy const; don't leave `model`/`effort` unset and inherit the CLI default silently.
 - **Deep second opinion, judge of record, risky-conclusion cross-check** →
   `gpt-5.6-sol` at `high`/`xhigh`, or `max` when the node's verdict is
   load-bearing.
@@ -101,12 +105,17 @@ retrying *immediately* extends the block. Two levers keep a blend stable:
   latency scales with CONTEXT, not effort. The throttling failure mode is a handful of
   long, large-context, high-effort runs at once — never a wide fan-out of tiny verifies.
 
-**Retry policy (hardened helper).** On a classified transient error
-(`429`/`rate limit`/`timed out`/HTTP `5xx`) retry up to `maxAttempts` with linear
-backoff (`attempt*8s`); on a hard `400`/auth error do NOT retry — emit
-`{"_codex_error":true}` at once. `--ephemeral` (opt-in) avoids session-file litter for
-stateless verify nodes, and a `trap ... EXIT` removes the SCHEMA/TASK/OUT/ERR temp files
-on any outcome.
+**Retry policy (hardened helper).** The relay classifies each failure into a `kind`
+(`rate_limit | server | timeout | auth | schema | empty_output | parse | unknown`) from the
+exit code and a *narrowly anchored* stderr match, and returns the structured sentinel
+`{"_codex_error":true,"kind":...,"attempts":...}`. Only `rate_limit`/`server`/`timeout` are
+retried (up to `maxAttempts`, linear backoff `attempt*8s`); `auth`/`schema`/`unknown` are
+NOT retried — retrying them wastes quota or extends an RPM block. Immediate retry is never
+used. `attemptTimeoutSec` (opt-in; needs coreutils `timeout`) kills a hung attempt (→
+`kind:timeout`) so it can't hold a Workflow slot forever. `--ephemeral` (opt-in) avoids
+session-file litter, and a `trap ... EXIT` removes the SCHEMA/TASK/OUT/ERR temp files on any
+outcome. (The stderr regex is a pragmatic fallback; a versioned `--json` event classifier is
+on the v0.3 roadmap.)
 
 ## Sandbox tiers
 
