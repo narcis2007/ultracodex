@@ -1,32 +1,18 @@
 # ultracodex (plugin)
 
-Blend Codex headless (`codex exec`) nodes into Claude Code's Workflow (ultracode)
-orchestration. Provides the **`codex-workflow`** skill.
+Codex (GPT-6 via `codex exec`) inside Claude Code.
 
-This is the plugin directory. For full documentation, installation, and the
-mental model, see the [repository README](../../README.md).
+- **Workflows**: `ultracodex:cross-review`, `ultracodex:codex-review`, `ultracodex:crosscheck`,
+  `ultracodex:judge-panel` (`workflows/`).
+- **Skills**: `codex-workflow` (Codex nodes in custom Workflow scripts), `codex-review`
+  (adversarial review with triage), `codex-implement` (delegate to Codex in a worktree, verify).
+- **Agent**: `codex-relay` — internal relay for Workflow nodes.
+- **Runner**: `scripts/codex-node.mjs` — run `node scripts/codex-node.mjs help`.
 
-## Contents
+Tier policy: `light` → gpt-6-luna@max · `daily` → gpt-6-sol (xhigh verify / max) ·
+`final` → gpt-6-astra@max. See `skills/codex-workflow/references/model-policy.md`.
 
-- `skills/codex-workflow/SKILL.md` — Pattern A mental model, the `codexNode`
-  relay helper, routing rules, concurrency/cost guidance, preflight.
-- `skills/codex-workflow/references/codex-headless.md` — `codex exec` reference,
-  model tiers & reasoning effort (GPT-5.6: Sol/Terra/Luna, `low`→`max`, plus
-  `ultra` on Sol/Terra),
-  sandbox tiers, output extraction, gotchas, escalation patterns.
-- `skills/codex-workflow/references/workflow-templates.md` — the canonical
-  `codexNode` helper plus four complete, copy-paste blended Workflow scripts
-  (cross-model review, judge panel, cross-check, loop-until-dry) and batch-node /
-  large-payload variants.
+Requires the Codex CLI (logged in) and Node.js 18+. Check with
+`node scripts/codex-node.mjs preflight --pretty`.
 
-## Prerequisites
-
-- Claude Code with the Workflow tool (ultracode).
-- Codex CLI installed and authenticated (`codex login`).
-
-## Local testing
-
-```bash
-claude --plugin-dir .            # from this directory
-claude plugin validate .         # validate plugin.json + skill frontmatter
-```
+Fork of KingGyuSuh/ultracodex — Apache-2.0.

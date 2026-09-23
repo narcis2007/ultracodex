@@ -1,24 +1,23 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "ultracodex",
-  "description": "A single-plugin marketplace that blends Codex headless into Claude Code Workflow (ultracode) orchestration.",
+  "description": "A single-plugin marketplace: use Codex (GPT-6) from Claude Code for cross-model review, verification and implementation delegation.",
   "owner": {
-    "name": "KingGyuSuh",
-    "email": "tjdhkdrb@gmail.com"
+    "name": "Narcis Ciobotariu",
+    "url": "https://github.com/narcis2007"
   },
   "plugins": [
     {
       "name": "ultracodex",
       "displayName": "Ultracodex",
       "source": "./plugins/ultracodex",
-      "description": "Blend Codex headless (codex exec) nodes into Claude Code Workflow (ultracode) orchestration for cross-model adversarial verification, judge panels with a Codex juror, and second-opinion generation.",
+      "description": "Codex (GPT-6 astra/sol/luna) inside Claude Code: cross-model review/verification workflows, delegation and adversarial-review skills, a tested runner with deadlines, teardown and provenance.",
       "author": {
-        "name": "KingGyuSuh",
-        "email": "tjdhkdrb@gmail.com",
-        "url": "https://github.com/KingGyuSuh"
+        "name": "Narcis Ciobotariu",
+        "url": "https://github.com/narcis2007"
       },
-      "homepage": "https://github.com/KingGyuSuh/ultracodex",
-      "repository": "https://github.com/KingGyuSuh/ultracodex",
+      "homepage": "https://github.com/narcis2007/ultracodex",
+      "repository": "https://github.com/narcis2007/ultracodex",
       "license": "Apache-2.0",
       "category": "workflow",
       "tags": [
@@ -26,6 +25,8 @@
         "cross-model",
         "verification",
         "workflow",
+        "delegation",
+        "code-review",
         "llm-judge",
         "second-opinion"
       ]

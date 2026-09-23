@@ -1,38 +1,16 @@
-# Workflow templates — Codex blended in (Pattern A)
+export const meta = {
+  name: 'codex-review',
+  description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude. Daily tier sol@max, final gate astra@max. Fails closed.',
+  whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: daily|final, context, lessons, triage }',
+  phases: [
+    { title: 'Review', detail: 'one Codex review per lens (read-only, hermetic)' },
+    { title: 'Triage', detail: 'Claude checks each Codex finding against the code' },
+    { title: 'Report', detail: 'confirmed / refuted / needs-info / unverified' },
+  ],
+}
 
-Two ways to use Codex nodes in a Workflow:
+// Generated from tools/src/workflows/codex-review.js — edit the source, then `npm run build`.
 
-1. **Run a shipped workflow** (tested, no copy-paste). Invoke by name with `args`:
-
-   | Workflow | What it does | Key args |
-   | --- | --- | --- |
-   | `ultracodex:cross-review` | Claude finders per dimension → Codex refutes each finding against the code → Claude report | `target`, `cwd`, `dimensions`, `verifyTier: 'daily'\|'final'`, `context`, `lessons`, `batch` |
-   | `ultracodex:codex-review` | Codex reviews through lenses (code, domain, security, tests, performance) → Claude checks each finding in the code → report | `cwd`, `base` \| `commit` \| `uncommitted`, `lenses`, `tier: 'daily'\|'final'`, `context`, `lessons`, `triage` |
-   | `ultracodex:crosscheck` | one Codex attempt to refute one load-bearing claim (astra@max) | `claim`, `evidence`, `cwd`, `tier` |
-   | `ultracodex:judge-panel` | Claude angles + a Codex candidate, Claude+Codex jury, cross-family ranking, synthesis | `problem`, `angles`, `cwd`, `codexCandidate` |
-
-   Example: `Workflow({ name: 'ultracodex:cross-review', args: { cwd: 'C:/repo', verifyTier: 'final' } })`.
-
-2. **Write a custom script** when none fits: paste the helper block below once near the top,
-   then call `codexNode(...)` wherever a node should run on Codex. The templates further down
-   are starting points (they assume the helper is pasted where the stub comment is).
-
-## The helper block
-
-`codexNode(task, opts)` — `opts`: `schema` (strict JSON Schema) or `schemaPreset`
-(`verdict` · `score` · `review` · `implement`), `tier` (`light` · `daily` · `final`), `kind`
-(`verify` · `ask` · `review`), optional `model`/`effort` overrides, `cwd` (the tree Codex may
-read), `timeoutSec`, `maxAttempts`, `label`, `phase`, `meta`. It resolves to the parsed object
-(provenance in the non-enumerable `_codex`), the final text (no schema), or
-`{ _codex_error: true, kind, message, retryable, runId }`. Always test with `isCodexError(x)`.
-
-Also in the block: `codexBatchNode(instruction, items, opts)` (N small items, one Codex run,
-id integrity enforced), `ucxPartition(items, verdictOf)` (fail-closed confirmed / refuted /
-unverified), `isCodexError(x)` and `ucxError(kind, message)`.
-
-<!-- BEGIN ULTRACODEX HELPER (generated from tools/src/helper.js) -->
-
-```js
 // ── ultracodex helper v0.3.0 ───────────────────────────────────────────────────
 // Generated from tools/src/helper.js in the ultracodex repo — edit the source, then
 // `npm run build`. Needs the ultracodex plugin (its `codex-relay` agent + runner).
@@ -277,152 +255,80 @@ function ucxPartition(items, verdictOf = x => x.verdict) {
   return { confirmed, refuted, unverified, status: unverified.length ? 'incomplete' : 'complete' }
 }
 // ── end ultracodex helper ──────────────────────────────────────────────────────
-```
 
-<!-- END ULTRACODEX HELPER -->
+const A = args || {}
+const CWD = A.cwd || null
+const TIER = A.tier === 'final' ? 'final' : A.tier === 'light' ? 'light' : 'daily'
+const TRIAGE = A.triage !== false
+const CONTEXT = A.context ? '\nWHAT THE CHANGE IS FOR / DOMAIN RULES (from the owner):\n' + A.context : ''
+const LESSONS = A.lessons ? '\nBefore reviewing, read ' + A.lessons + ' — a checklist of defect classes this project keeps producing — and check the change against every item.' : ''
+const SCOPE = A.commit
+  ? 'the changes introduced by commit ' + A.commit + ' (git show ' + A.commit + ')'
+  : A.uncommitted
+    ? 'the uncommitted changes (git status, git diff, git diff --cached, and untracked files)'
+    : 'the changes on the current branch against ' + (A.base || 'main') + ' (git diff ' + (A.base || 'main') + '...HEAD), plus any uncommitted changes'
 
-Rules the helper already enforces — do not work around them:
+const LENSES = {
+  code: 'CODE lens — correctness, edge cases, error handling, resource and lifecycle handling, concurrency and ordering, API/contract mismatches between caller and callee (headers, bodies, query params), and tests that cannot fail or silently skip.',
+  domain: 'DOMAIN lens — business rules and invariants, data integrity across writes, idempotency and retries of external effects, time zones and clocks, money/quantities, what the user sees versus what is true, and irreversible actions guarded only by assumptions.',
+  security: 'SECURITY lens — authentication/authorization gaps, injection, path traversal, secrets, unsafe deserialization, SSRF, tenant isolation, and trust in third-party input.',
+  tests: 'TESTS lens — missing coverage of the risky paths, assertions that pass for the wrong reason, tests that depend on shared global state or neighbours, and behaviour changes with no test.',
+  performance: 'PERFORMANCE lens — unbounded work or memory, N+1 queries, missing indexes, hot-path allocations, blocking calls in async code, and timeouts/pool settings.',
+}
+const lensKeys = (Array.isArray(A.lenses) && A.lenses.length ? A.lenses : ['code', 'domain']).filter(k => LENSES[k])
+if (!lensKeys.length) throw new Error('codex-review: no known lens in args.lenses (use code, domain, security, tests, performance)')
 
-- **Relay, not solver.** Every node goes through the `ultracodex:codex-relay` agent (Bash only,
-  Sonnet at low effort). It uploads the request, polls, and returns the runner's JSON line. A
-  result without a Codex thread id and token usage is rejected (`no_provenance`), so a relay that
-  "answers" by itself cannot pass as Codex.
-- **Byte-exact or rejected.** The request is normalized, percent-encoded (no quote, backslash or
-  control character reaches the relay's Bash command), split into ≤2.4 KB parts (the Windows
-  command line breaks near 8 KB) and hash-checked by the runner. A corrupted copy is rejected
-  (`relay_corruption`) and retried once with a stronger relay.
-- **No slot is held by a blocked call.** Codex runs detached under the runner's supervisor, which
-  owns the deadline and stops only the process tree it started. Each `wait` returns within two
-  minutes, so the relay never hits the Bash timeout; if the relay stops polling for five minutes
-  the supervisor tears the run down (`abandoned`).
-- **Intrinsic concurrency cap:** 4 Codex jobs per workflow, an astra job counting as 2, plus the
-  runner's machine-wide cap (`ULTRACODEX_MAX_CONCURRENT`, default 4). Don't add another gate.
-- **Fail closed.** A dead node is unverified, never a pass: partition with `ucxPartition`, report
-  `status: 'incomplete'` when a required node failed.
+const lensTask = key => `You are reviewing ${SCOPE} in your working directory. Be adversarial and concrete.
+${LENSES[key]}
+Read the diff, then the surrounding code of every changed hunk. Report only real defects, each with file, line, evidence from the code, a reachable failure scenario and a recommendation.
+Do not report style nits unless they hide a defect. Give each finding a short unique id. Use verdict "blocked" only for defects that must not ship.${CONTEXT}${LESSONS}`
 
----
-
-## Template — Cross-model review (custom variant)
-
-Prefer the shipped `ultracodex:cross-review`. Copy this when you need different prompts.
-
-```js
-export const meta = {
-  name: 'my-cross-review',
-  description: 'Claude finds; Codex refutes each finding; Claude reports. Fails closed.',
-  phases: [{ title: 'Find' }, { title: 'Verify' }, { title: 'Synthesize' }],
+const TRIAGE_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['verdict', 'reasoning'],
+  properties: {
+    verdict: { type: 'string', enum: ['confirmed', 'refuted', 'needs_info'] },
+    reasoning: { type: 'string' },
+  },
 }
 
-/* paste the helper block here */
-
-const CWD = 'C:/path/to/repo'   // Codex reads the code itself (read-only, hermetic)
-const FINDINGS = {
-  type: 'object', additionalProperties: false, required: ['findings'],
-  properties: { findings: { type: 'array', items: {
-    type: 'object', additionalProperties: false, required: ['id', 'title', 'file', 'detail'],
-    properties: { id: { type: 'string' }, title: { type: 'string' }, file: { type: 'string' }, detail: { type: 'string' } },
-  } } },
-}
-const DIMENSIONS = ['correctness', 'security']
-
-const results = await pipeline(
-  DIMENSIONS,
-  d => agent(`Review the branch in ${CWD} for ${d} issues. Concrete findings only.`, { label: 'find:' + d, phase: 'Find', schema: FINDINGS }),
-  (review, d) => parallel(((review && review.findings) || []).map(f => () =>
-    codexNode(`Adversarially verify this finding against the code; refuted=true unless the code confirms it.\n${JSON.stringify(f)}`,
-      { schemaPreset: 'verdict', tier: 'daily', kind: 'verify', cwd: CWD, label: 'codex:' + d + ':' + f.id, phase: 'Verify' })
-      .then(v => ({ ...f, dimension: d, verdict: v })))),
+phase('Review')
+const lensResults = await pipeline(
+  lensKeys,
+  key => codexNode(lensTask(key), { schemaPreset: 'review', tier: TIER, kind: 'review', cwd: CWD || undefined, label: 'codex:' + key, phase: 'Review' }),
+  async (review, key) => {
+    if (isCodexError(review)) return { lens: key, error: review, findings: [] }
+    const findings = (review.findings || []).map(f => ({ ...f, id: key + ':' + f.id, lens: key }))
+    if (!TRIAGE) return { lens: key, verdict: review.verdict, summary: review.summary, findings }
+    const triaged = await parallel(findings.map(f => () =>
+      agent(`A Codex reviewer reported this finding about ${SCOPE}${CWD ? ' in ' + CWD : ''}. Check it yourself against the code (read the file and its callers; run git if needed).
+Decide: "confirmed" (the defect is real and the failure scenario is reachable), "refuted" (it is not — explain why), or "needs_info" (it depends on something you cannot see).
+FINDING (JSON): ${JSON.stringify(f)}`, { label: 'triage:' + f.id, phase: 'Triage', schema: TRIAGE_SCHEMA })
+        .then(t => ({ ...f, triage: t || { verdict: 'needs_info', reasoning: 'triage agent returned nothing' } }))))
+    return { lens: key, verdict: review.verdict, summary: review.summary, findings: triaged.filter(Boolean) }
+  },
 )
-const part = ucxPartition(results.flat())
-if (part.unverified.length) log(`⚠ ${part.unverified.length} findings UNVERIFIED — incomplete`)
-phase('Synthesize')
-const report = await agent(`Report CONFIRMED: ${JSON.stringify(part.confirmed)}\nUNVERIFIED (say so up top): ${JSON.stringify(part.unverified.map(f => f.title))}`, { label: 'synthesize' })
-return { status: part.status, report, confirmed: part.confirmed, unverified: part.unverified }
-```
 
-## Template — Loop-until-dry with a Codex gate
+const lenses = lensResults.filter(Boolean)
+const failedLenses = lenses.filter(l => l.error)
+const findings = lenses.flatMap(l => l.findings)
+const by = v => findings.filter(f => (TRIAGE ? f.triage && f.triage.verdict === v : v === 'confirmed'))
+const confirmed = by('confirmed'), refuted = TRIAGE ? by('refuted') : [], needsInfo = TRIAGE ? by('needs_info') : []
+if (failedLenses.length) log('⚠ ' + failedLenses.length + '/' + lensKeys.length + ' Codex lenses failed — the review is INCOMPLETE')
 
-Rounds of Claude finding → Codex verifying until a round is **fully judged** and adds nothing
-confirmed. Findings whose verdict errored are carried to the next round and retried directly;
-at the cap, leftovers are returned as unverified with `status: 'incomplete'`.
+phase('Report')
+const report = await agent(`Write the final review report for ${SCOPE}.
+${failedLenses.length ? 'At the very top, state that these lenses FAILED and were not reviewed: ' + JSON.stringify(failedLenses.map(l => ({ lens: l.lens, error: l.error.kind, message: l.error.message }))) : ''}
+Per-lens Codex verdicts: ${JSON.stringify(lenses.filter(l => !l.error).map(l => ({ lens: l.lens, verdict: l.verdict, summary: l.summary })))}
+CONFIRMED findings (rank by severity; file:line, failure scenario, fix): ${JSON.stringify(confirmed)}
+NEEDS-INFO findings (say what must be checked): ${JSON.stringify(needsInfo)}
+REFUTED by triage (one line each, with the reason): ${JSON.stringify(refuted.map(f => ({ id: f.id, title: f.title, why: f.triage.reasoning })))}
+End with a one-line overall verdict: ship / ship after fixes / do not ship.`, { label: 'report', phase: 'Report' })
 
-```js
-export const meta = {
-  name: 'loop-until-dry-codex',
-  description: 'Iterate Claude-find → Codex-verify until a fully judged round confirms nothing new',
-  phases: [{ title: 'Hunt' }],
+return {
+  status: failedLenses.length ? 'incomplete' : 'complete',
+  tier: TIER,
+  report,
+  lenses: lenses.map(l => ({ lens: l.lens, verdict: l.verdict || null, error: l.error ? l.error.kind : null })),
+  confirmed, needsInfo,
+  refuted: refuted.map(f => ({ id: f.id, title: f.title, why: f.triage.reasoning })),
 }
-
-/* paste the helper block here */
-
-const CWD = 'C:/path/to/repo'
-const FINDINGS = { /* strict schema: findings[{ id, title, detail }] with a STABLE id */ }
-const MAX_ROUNDS = 4                  // always cap loops in Workflow JS
-const confirmed = [], refuted = [], resolved = new Set()
-let pending = [], finderDry = false, rounds = 0
-
-for (let round = 0; round < MAX_ROUNDS; round++) {
-  rounds = round + 1
-  phase('Round ' + rounds)
-  let toVerify = [...pending]
-  if (!finderDry) {
-    const review = await agent(`Find issues in ${CWD}. Stable ids. Skip these already-resolved ids: ${[...resolved].join(', ') || '(none)'}`,
-      { label: 'find:r' + rounds, schema: FINDINGS })
-    const fresh = ((review && review.findings) || []).filter(f => !resolved.has(f.id) && !pending.some(p => p.id === f.id))
-    if (!fresh.length) finderDry = true
-    toVerify = [...pending, ...fresh]
-  }
-  if (!toVerify.length) break
-  pending = []
-  const verdicts = await parallel(toVerify.map(f => () =>
-    codexNode(`Adversarially verify; refuted=true unless the code confirms it.\n${JSON.stringify(f)}`,
-      { schemaPreset: 'verdict', tier: 'daily', kind: 'verify', cwd: CWD, label: 'codex:' + f.id }).then(v => ({ ...f, verdict: v }))))
-  for (const f of verdicts.filter(Boolean)) {
-    if (isCodexError(f.verdict)) { pending.push(f); continue }      // no verdict → retry next round
-    resolved.add(f.id)
-    ;(f.verdict.refuted === false ? confirmed : refuted).push(f)
-  }
-  if (verdicts.filter(Boolean).every(f => isCodexError(f.verdict))) log('round ' + rounds + ': every Codex verdict errored — check `node <runner> preflight`')
-  if (finderDry && !pending.length) break
-}
-return { status: pending.length ? 'incomplete' : 'complete', confirmed, refuted, unverified: pending, rounds }
-```
-
-## Batch node — N small items, one Codex run
-
-```js
-const batch = await codexBatchNode(
-  'Adversarially verify each finding against the code; refuted=true unless confirmed.',
-  findings.map(f => ({ id: f.id, title: f.title, detail: f.detail })),
-  { tier: 'daily', kind: 'verify', cwd: CWD, label: 'codex:batch' },
-)
-// batch.byId: Map(id → {refuted, confidence, reasoning}); batch.missing / batch.extras;
-// on failure batch is a _codex_error (with .missing = every id) — treat all as unverified.
-```
-
-## Picking tier & effort
-
-Policy (enforced by the runner; override per node only with a reason):
-
-| Node | tier / kind | Runs as |
-| --- | --- | --- |
-| wide fan-out of small checks, triage, dedupe | `light` / `verify` | gpt-6-luna @ max |
-| everyday adversarial verify, jurors | `daily` / `verify` | gpt-6-sol @ xhigh |
-| a second opinion, one lens of a review | `daily` / `ask` or `review` | gpt-6-sol @ max |
-| final gate, load-bearing single verdict, hardest analysis | `final` / any | gpt-6-astra @ max |
-
-`ultra` is never implicit: pass `effort: 'ultra'` on at most one decisive astra/sol node per run
-(it delegates to sub-agents and runs long). Details: `model-policy.md`.
-
-## Error discipline
-
-`kind` values: `rate_limit` · `server` · `network` (retried by the runner with backoff) ·
-`timeout` · `abandoned` · `cancelled` · `auth` · `usage_limit` · `model` · `effort` · `schema` ·
-`schema_mismatch` · `parse` · `empty_output` · `invalid_request` · `execution` · `spawn` ·
-relay-side `relay_corruption` · `relay_incomplete_upload` · `relay_gave_up` · `relay_failed` ·
-`relay_no_envelope` · `relay_error` · `no_provenance` · `supervisor_lost`.
-
-- Treat every one as **no data**. Exclude errored jurors from averages; never score them 0.
-- Many errors in one run → stop and run `node <runner> preflight` (auth, catalog, CLI).
-- `supervisor_lost` means the runner's supervisor died while Codex may still run: it is **not**
-  stopped automatically — look at `node <runner> status` and ask the owner before stopping it.
