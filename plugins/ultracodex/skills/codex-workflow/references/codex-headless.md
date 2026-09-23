@@ -18,7 +18,7 @@ shell. Every command prints one JSON line tagged `{"ultracodex":1,...}`; exit co
 | `run --request FILE` | start + one wait |
 | `status [RUN_ID] [--all]` · `result RUN_ID` | inspect runs (never refresh the heartbeat) |
 | `page RUN_ID K` | slice K of a large result (see "Paged results") |
-| `key` | the per-machine result key + its `keyCheck`, for the Workflow helper's KEY relay only |
+| `key` | the per-machine key, a fresh nonce and their `keyCheck` — for the Workflow helper's key agent only |
 | `cancel RUN_ID` | ask that run's supervisor to stop its own process tree |
 | `preflight [--live]` | CLI, auth, catalog, policy models, home dir; `--live` = one tiny luna call |
 | `dry-run --request FILE` | show the exact codex argv, model, effort, deadline — no model call |
@@ -36,13 +36,34 @@ for `orphanAfterSec`, default 300; the Workflow helper sends 900); `ephemeral` (
 `label`; `meta` (echoed back); `serviceTier` (`priority` = Fast); `addDirs`; `images`;
 `profile`; `review: {base|commit|uncommitted, title}`; `resume: {sessionId}`.
 
-Envelope: `ok: true` + `result` (schema) or `text`, `resultHash` (FNV-1a of the body, so a
-relay's transcription can be verified), `mac` (HMAC-SHA256 under `~/.ultracodex/key` over
-`runId \n SHA-256(task) \n body` — proves this machine's runner produced it for this task), and
-`provenance` {threadId, model, effort, tier, mode, sandbox, hermetic, usage (last attempt),
+Envelope: `ok: true` + `result` (schema) or `text` — never both —, `resultHash` (FNV-1a of the
+body, so a relay's transcription can be verified), `mac` (see "Signed requests and results"),
+and `provenance` {threadId, model, effort, tier, mode, sandbox, hermetic, usage (last attempt),
 usageTotal (all attempts), durationMs, attempts, codexVersion, launcher, taskHash, teardown,
 slotLost}. Failures: `ok: false`, `state` (`failed`, `timeout`, `cancelled`, `abandoned`,
 `rejected`, `lost`) and `error` {kind, retryable, message}.
+
+### Signed requests and results
+
+A per-machine secret, `~/.ultracodex/key` (created once, published atomically), is fetched
+once per workflow — with a fresh nonce — by the helper's **key agent**, a separate agent type
+whose prompt carries no task text. With it the helper:
+
+- **signs every request it builds**: the frame header carries `nonce` (`<workflow nonce>.<n>`)
+  and `rmac` = HMAC(key, `ucx-request` \n requestDigest), requestDigest being the SHA-256 of
+  the exact signed header (model, effort, tier, cwd, schema preset, label, nonce, …), the
+  schema and the task. The runner starts a relayed (`part`, `start --framed`) job only with a
+  valid `rmac` (`unauthenticated_request` otherwise). A relay hijacked by reviewed content
+  therefore cannot start a job of its own — say, one asking Codex to read the key and sign a
+  forgery — nor swap the schema, model or directory of a real one. Each nonce starts one run:
+  a second upload of the same signed request joins the first run;
+- **verifies every result**: `mac` = HMAC(key, `ucx-result` \n runId \n requestDigest \n kind
+  \n body), kind being `result` or `text`. A result is thereby bound to the one request the
+  helper made (an older run of the same task, from another workflow, does not pass) and to
+  the payload type it returns (`unauthenticated_result` otherwise).
+
+Requests from the conversation (`start --request`) are trusted as they are and signed over
+`ucx-direct` \n task, which never matches a relayed request.
 
 ### Paged results
 
@@ -71,26 +92,28 @@ sleep the supervisor extends the deadline by the time asleep and pauses abandonm
 ### The relay guard (plugin hook)
 
 `hooks/hooks.json` registers `scripts/relay-guard.mjs` as a PreToolUse hook. It ignores every
-tool call except those from the `ultracodex:codex-relay` agent (hook input `agent_type`), and
-for the relay it allows exactly these command shapes without a permission prompt —
+tool call except those from the plugin's two agent types (hook input `agent_type`). The job
+relay (`ultracodex:codex-relay`) may run exactly
 `node "<plugin>/scripts/codex-node.mjs" part (new|ucx-…) K N HASH <<'UCX_P…' … UCX_P…` with a
-quote- and backslash-free body, `… wait <runId>`, `… page <runId> <k>` and `… key` — and
-denies everything else. Roles are fixed by a relay's first command (recorded in
-`~/.ultracodex/relay-roles/<agent_id>`): a relay that uploaded or collected a job — and so
-had untrusted text in its prompt — can never read the key, and the key relay can never run a
-job. A relay prompt-injected by reviewed content therefore cannot run other commands, pick
-another executable, compute hashes, or sign a fabricated result. Residual risk: with hooks
-disabled (`disableAllHooks`) the relay keeps its plain Bash tool and could read the key file;
-results are then still bound to the request (`taskHash`, SHA-256 of the task in the mac) and
-must carry a matching `resultHash`. The signature defends against the confined relay, not
+quote- and backslash-free body, `… wait <runId>` and `… page <runId> <k>`; the key agent
+(`ultracodex:codex-key`) may run exactly `… key`. Both without a permission prompt; everything
+else is denied. What each may do follows from the agent type the helper chose, never from
+what the model asks for: a job relay cannot read the key, whatever its prompt says. A relay
+prompt-injected by reviewed content therefore cannot run other commands, pick another
+executable, compute hashes, read the key, or start a job the helper did not sign.
+
+Residual risks: with hooks disabled (`disableAllHooks`) the relays keep their plain Bash tool
+and could read the key file. And the signatures defend against the confined relays, not
 against a Claude agent the owner lets run arbitrary Bash or Write on this machine: such an
 agent could read `~/.ultracodex/key` or plant a run file — keep workflow agents on normal
-permission prompts when they read untrusted repositories.
+permission prompts when they read untrusted repositories. (Codex jobs themselves can read
+the key — read-only still reads the whole disk — but cannot use it: every job's own answer is
+already bound to its own request, and a relayed job cannot start another.)
 
-The runner also never resolves executables through the current directory: `taskkill` and
-PowerShell are called by their System32 paths and supervisors run with `~/.ultracodex` as
-their working directory. There is no command-line option to replace the Codex binary (only
-the operator's `ULTRACODEX_CODEX_PATH`).
+The runner never resolves executables through the current directory: PowerShell is called by
+its System32 path, and no process of the runner works in the reviewed repository or in the
+home (a supervisor works in Node's own directory). There is no command-line option to replace
+the Codex binary (only the operator's `ULTRACODEX_CODEX_PATH`).
 
 ### Why a supervisor
 
@@ -99,13 +122,18 @@ the operator's `ULTRACODEX_CODEX_PATH`).
   subagent answers. Real Codex runs take 8–60+ minutes, so a relay must never block on `codex exec`.
 - On Windows, the Codex process is a native `codex.exe` that Git Bash cannot signal or even see
   (`pgrep` and `ps -o` do not exist there). The supervisor spawns `codex.exe` directly (resolved
-  behind the npm shim, with the same `CODEX_MANAGED_*` env the shim sets) and tracks its tree by
-  identity (PID + creation time, snapshotted every minute), so a child is only ever taken for
-  ours when it was created after its parent and before any reuse of the parent's PID. Teardown
-  is `taskkill /F /PID` on exactly those identities (never `/T`, which trusts reused parent
-  PIDs), then a re-check that also stops children started during the teardown; whatever
-  survives is reported. On POSIX: the child's process group, SIGTERM then SIGKILL. It only
-  ever stops the tree it started.
+  behind the npm shim, with the same `CODEX_MANAGED_*` env the shim sets). Before that, a small
+  PowerShell helper puts the supervisor into a fresh **Job Object**, so every process of the run
+  is born into the job — including ones whose parent has exited, which no PID bookkeeping could
+  attribute. Stopping terminates exactly the job's members, each through a handle checked to
+  belong to the job (a PID can be reused, a membership cannot). Without a job (`preflight`
+  reports `windowsJob`; `ULTRACODEX_NO_JOB=1` forces it) an identity-checked fallback kills
+  only through handles pinned before their PID + creation time was verified, attributes
+  children only through pinned parents (live snapshots every 20 s), and reports what it cannot
+  prove as `possibleLeftovers` — never killing them. `taskkill /T`, which follows the parent
+  PIDs of orphans and so can reach processes of other sessions, is never used. On POSIX: the
+  child's process group, SIGTERM then SIGKILL. Only the run's own tree is ever stopped;
+  survivors are reported.
 - Detached, the run survives the relay's Bash call ending and even the relay dying; the
   heartbeat rule then cleans up attached runs.
 
@@ -176,7 +204,11 @@ MCP OAuth refresh noise filtered out.
 | `invalid_request` · `execution` · `spawn` | no | inspect `supervisor.log` and `attempt-*/stderr.log` |
 | `relay_corruption` | helper retries once | relay altered the upload (hash mismatch) |
 | `upload_busy` | no | another caller is assembling that upload (rare; a scanner lock is retried first) |
-| `unauthenticated_result` · `key_unavailable` | helper re-collects once | result not signed by this runner / key could not be fetched — never trusted |
+| `unauthenticated_result` · `key_unavailable` | helper re-collects once / retryable | result not signed by this runner for this request / the key agent could not fetch the key — never trusted |
+| `unauthenticated_request` | no | a relayed frame without the helper's valid signature (a relay composing its own job) |
+| `nonce_reused` | no | a signed request was uploaded again while its first upload was still being registered |
+| `result_too_large` | no | over 400 pages (4 MB): read the run's `result.json` from the conversation instead |
+| `helper_error` | no | an unexpected error inside the helper — reported as a failed node, never a crash |
 | `supervisor_lost` | no | supervisor died; Codex may still run — **not** stopped automatically, ask the owner |
 
 ## Headless (`claude -p`) sessions

@@ -1,7 +1,7 @@
 export const meta = {
   name: 'crosscheck',
   description: 'One load-bearing claim, one Codex (GPT) attempt to refute it — astra@max by default. An errored cross-check is never a pass.',
-  whenToUse: 'Before acting on a risky conclusion. args: { claim, evidence, cwd, tier: final|daily|light }',
+  whenToUse: 'Before acting on a risky conclusion. args: { claim, evidence, cwd, tier: final|daily|light, fast }',
   phases: [{ title: 'Cross-check', detail: 'Codex tries to refute the claim' }],
 }
 
@@ -17,7 +17,7 @@ Check it against the code and data in your working directory where relevant (rea
 Set refuted=false only if the evidence is airtight; otherwise refuted=true. confidence is 0..1; reasoning must cite what you checked.
 CLAIM:
 ${A.claim}${A.evidence ? '\nEVIDENCE OFFERED:\n' + A.evidence : ''}`,
-  { schemaPreset: 'verdict', tier: TIER, kind: 'verify', cwd: A.cwd || undefined, label: 'codex:crosscheck', phase: 'Cross-check' })
+  { schemaPreset: 'verdict', tier: TIER, kind: 'verify', cwd: A.cwd || undefined, label: 'codex:crosscheck', phase: 'Cross-check', ...(A.fast === true && TIER === 'final' ? { serviceTier: 'priority' } : {}) })
 
 const ok = !isCodexError(verdict)
 return {

@@ -25,6 +25,7 @@ see [CHANGELOG.md](CHANGELOG.md) for what changed.
 | Skill `codex-review` | Standalone adversarial review of a branch / commit / uncommitted change, with triage. |
 | Skill `codex-implement` | Delegate implementation to Codex in a worktree, verify, iterate, review. |
 | Agent `codex-relay` | Internal: the Bash-only relay that runs one Codex job for a Workflow node. |
+| Agent `codex-key` | Internal: fetches the runner key and a nonce once per workflow (no task text in its prompt). |
 | Runner `scripts/codex-node.mjs` | Validates requests, runs `codex exec` under a detached supervisor with deadlines, process-tree teardown, retries, machine-wide slots and a provenance envelope. |
 
 ## Model policy — astra, sol, luna
@@ -89,19 +90,23 @@ Workflow script ──agent({agentType:'ultracodex:codex-relay'})──▶ relay
 - **Byte-exact transport.** On Windows the Bash tool halves backslashes and breaks commands over
   ~8 KB. Requests are percent-encoded (no quotes, backslashes or control characters), split into
   small parts with per-part hashes, and verified end to end.
-- **Signed results.** The runner signs every result (HMAC-SHA256 under a per-machine key, bound
-  to the SHA-256 of the task); the helper refuses anything unsigned, foreign or without a Codex
-  thread id and token usage, so a relay that "answers" by itself cannot pass for Codex. Large
-  results travel in verified pages.
+- **Signed both ways.** The helper signs every request it builds (the runner starts nothing a
+  relay composed itself) and accepts only results the runner signed for that exact request —
+  nonce, model, directory, schema, task and payload type — so a relay that "answers" by itself,
+  replays an old run or retargets a job cannot pass for Codex. The key reaches the helper
+  through a separate key agent; no job relay ever holds it. Large results travel in verified
+  pages.
 - **Hermetic by default.** Verification and review runs ignore `~/.codex/config.toml` (no user
   MCP servers); the Windows sandbox setting is carried over.
 - **Own processes only.** The supervisor stops only the tree it started (deadline, cancel, or a
-  relay that stopped polling). It never touches other Codex sessions.
-- **A confined relay.** A plugin hook lets the relay agent run exactly the runner's `part`,
-  `wait`, `page` and `key` commands (without permission prompts) and denies anything else; a
-  relay that has seen a job's text can never read the key. Reviewed content that tries to
-  hijack the relay gets nowhere. Workflow nodes are read-only and hermetic by construction,
-  and writing tasks are never retried automatically.
+  relay that stopped polling) — on Windows exactly the members of the run's Job Object, so an
+  orphan whose parent exited is still stopped and nothing of another session ever is. It
+  never touches other Codex sessions.
+- **Confined relays.** A plugin hook lets the job relay run exactly the runner's `part`,
+  `wait` and `page` commands, and the key agent exactly `key` (without permission prompts),
+  and denies anything else. Reviewed content that tries to hijack a relay gets nowhere.
+  Workflow nodes are read-only and hermetic by construction, and writing tasks are never
+  retried automatically.
 
 ## Development
 

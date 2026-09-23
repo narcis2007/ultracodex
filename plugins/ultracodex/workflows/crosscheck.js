@@ -1,7 +1,7 @@
 export const meta = {
   name: 'crosscheck',
   description: 'One load-bearing claim, one Codex (GPT) attempt to refute it — astra@max by default. An errored cross-check is never a pass.',
-  whenToUse: 'Before acting on a risky conclusion. args: { claim, evidence, cwd, tier: final|daily|light }',
+  whenToUse: 'Before acting on a risky conclusion. args: { claim, evidence, cwd, tier: final|daily|light, fast }',
   phases: [{ title: 'Cross-check', detail: 'Codex tries to refute the claim' }],
 }
 
@@ -9,7 +9,8 @@ export const meta = {
 
 // ── ultracodex helper v0.3.0 ───────────────────────────────────────────────────
 // Generated from tools/src/helper.js in the ultracodex repo — edit the source, then
-// `npm run build`. Needs the ultracodex plugin (its `codex-relay` agent + runner).
+// `npm run build`. Needs the ultracodex plugin (its `codex-relay` and `codex-key`
+// agents + runner).
 //
 // codexNode(task, opts) runs ONE Codex (GPT) job and resolves to:
 //   • the parsed object when a schema/schemaPreset is given — with a non-enumerable
@@ -114,11 +115,12 @@ function ucxError(kind, message, runId = null, retryable = false) {
 }
 function isCodexError(x) { return x == null || (typeof x === 'object' && x._codex_error === true) }
 
-// ── result authentication: HMAC-SHA256 in plain JS (the Workflow runtime has no crypto) ──
-// The runner signs every result with a per-machine key; the helper fetches that key once
-// per workflow through a relay whose context holds no untrusted text. A relay hijacked by
-// reviewed content cannot compute an HMAC (the relay guard gives it no code), so it cannot
-// pass its own answer off as Codex's.
+// ── authentication: HMAC-SHA256 in plain JS (the Workflow runtime has no crypto) ──
+// The helper fetches the per-machine key and a fresh nonce once per workflow through the
+// key agent (a separate agent type whose prompt holds no untrusted text), signs every
+// request it builds — the runner starts nothing else a relay uploads — and accepts only
+// results the runner signed for that very request. A relay hijacked by reviewed content
+// can neither start a job of its own nor pass off an answer as Codex's.
 const UCX_K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
   0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
   0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
@@ -178,21 +180,30 @@ function ucxHmacHex(keyHex, message) {
   return ucxHex(ucxSha256(key.map(b => b ^ 0x5c).concat(inner)))
 }
 
-// The key, fetched once per workflow by a relay that sees no untrusted text (the relay
-// guard lets a relay read the key only if it never uploads or collects a job). keyCheck,
-// the runner's hash of the key, catches a mis-copied key. Only a success is cached.
+// The runner key and this workflow's nonce, fetched once by the key agent: its own agent
+// type, so the relay guard never lets a job relay read the key, and its prompt holds no
+// task text. keyCheck (the runner's hash of key and nonce) catches a mis-copied answer.
+// Only a success is cached.
+const UCX_KEY_AGENT = 'ultracodex:codex-key'
 let ucxKeyPromise = null
+let ucxKeyFailure = ''
+let ucxNodeSeq = 0
 function ucxKey(call, phase) {
   if (!ucxKeyPromise) {
     ucxKeyPromise = (async () => {
       for (let attempt = 0; attempt < 2; attempt++) {
-        const env = ucxEnvelope(await call('ULTRACODEX KEY', {
-          agentType: UCX_RELAY, label: 'codex:key' + (attempt ? ':retry' : ''), phase, ...(attempt ? { model: 'opus' } : { effort: 'low' }),
-        }))
-        if (env && env.ok === true && /^[0-9a-f]{64}$/.test(String(env.key)) && ucxHash(env.key) === env.keyCheck) return env.key
+        const raw = await call('ULTRACODEX KEY', {
+          agentType: UCX_KEY_AGENT, label: 'codex:key' + (attempt ? ':retry' : ''), phase, ...(attempt ? { model: 'opus' } : { effort: 'low' }),
+        })
+        const env = ucxEnvelope(raw)
+        if (env && env.ok === true && /^[0-9a-f]{64}$/.test(String(env.key)) && /^[0-9a-f]{32}$/.test(String(env.nonce))
+          && ucxHash(env.key + ':' + env.nonce) === env.keyCheck) return { key: env.key, nonce: env.nonce }
+        ucxKeyFailure = raw && raw.__ucxRejected !== undefined ? 'the key agent call failed: ' + raw.__ucxRejected
+          : env && env.ok === false ? 'the runner refused: ' + ((env.error && env.error.message) || env.state)
+            : 'the key agent returned no valid key line'
       }
       return null
-    })().then(key => { if (!key) ucxKeyPromise = null; return key })
+    })().then(auth => { if (!auth) ucxKeyPromise = null; return auth })
   }
   return ucxKeyPromise
 }
@@ -225,61 +236,84 @@ function ucxDecode(text) {
       : c[0] === 'u' ? String.fromCharCode(parseInt(c.slice(1), 16)) : String.fromCodePoint(parseInt(c.slice(1), 16)))
 }
 
-// `store` ({ runId, pages }) keeps the hash-verified pages of every reply for one node, so a
+// The last runner line of a relay's reply (a malformed reply is "no envelope", never a
+// thrown error). A large result arrives as a compact envelope plus `page` lines; `store`
+// ({ runId, pages }) keeps the hash-verified pages of every reply for one node, so a
 // re-collect only has to bring the pages the earlier replies got wrong.
+const UCX_MAX_PAGES = 400
 function ucxEnvelope(raw, store = null) {
-  if (raw && typeof raw === 'object') return raw.ultracodex === 1 ? raw : null
-  const lines = String(raw ?? '').split(/\r?\n/).map(l => l.trim().replace(/^`+|`+$/g, '').trim())
-  const parsed = []
-  for (const line of lines) {
-    if (!line.startsWith('{') || !line.includes('"ultracodex"')) continue
-    try { const obj = JSON.parse(line); if (obj && obj.ultracodex === 1) parsed.push(obj) } catch (e) { /* not a runner line */ }
-  }
-  const env = [...parsed].reverse().find(o => o.page === undefined) || null
-  if (env && env.paged) {
-    // a large result arrives as a compact envelope plus `page` lines; stitch the body back
-    const total = Number(env.paged.pages)
-    const hashes = Array.isArray(env.paged.hashes) && env.paged.hashes.length === total ? env.paged.hashes : null
+  try {
+    if (raw && typeof raw === 'object') return raw.ultracodex === 1 ? raw : null
+    const lines = String(raw ?? '').split(/\r?\n/).map(l => l.trim().replace(/^`+|`+$/g, '').trim())
+    const parsed = []
+    for (const line of lines) {
+      if (!line.startsWith('{') || !line.includes('"ultracodex"')) continue
+      try { const obj = JSON.parse(line); if (obj && obj.ultracodex === 1) parsed.push(obj) } catch (e) { /* not a runner line */ }
+    }
+    const env = [...parsed].reverse().find(o => o.page === undefined) || null
+    if (!env || !env.paged || env.ok !== true) return env
+    if (env.paged.tooLarge) return { ...env, __tooLarge: true }
+    const total = env.paged.pages
+    // bounds first: an absurd count must neither allocate nor throw
+    if (!Number.isInteger(total) || total < 1 || total > UCX_MAX_PAGES) return { ...env, __incompletePages: true }
+    const hashes = Array.isArray(env.paged.hashes) && env.paged.hashes.length === total && env.paged.hashes.every(h => /^[0-9a-f]{8}$/.test(String(h)))
+      ? env.paged.hashes : null
     // pages are only kept across replies when each one can be verified on its own
     const pages = hashes && store ? (store.runId === env.runId ? store.pages : (store.runId = env.runId, store.pages = new Map())) : new Map()
     for (const o of parsed) {
       if (o.page === undefined || o.runId !== env.runId || typeof o.data !== 'string' || !Number.isInteger(o.page) || o.page < 1 || o.page > total) continue
       if (!hashes || ucxHash(o.data) === hashes[o.page - 1]) pages.set(o.page, o.data)   // a garbled page is dropped
     }
-    const body = Array.from({ length: total }, (_, i) => pages.get(i + 1))
-    if (!(total >= 1) || body.some(p => p === undefined)) return { ...env, __incompletePages: true }
-    try {
-      const joined = body.join('')
-      const whole = JSON.parse(env.paged.enc === 'pct' ? ucxDecode(joined) : joined)
-      const out = { ...env }
-      delete out.paged
-      if (whole.result !== undefined) out.result = whole.result
-      else out.text = whole.text
-      return out
-    } catch (e) { return { ...env, __incompletePages: true } }
+    const body = []
+    for (let k = 1; k <= total; k++) {
+      if (!pages.has(k)) return { ...env, __incompletePages: true }
+      body.push(pages.get(k))
+    }
+    const joined = body.join('')
+    const whole = JSON.parse(env.paged.enc === 'pct' ? ucxDecode(joined) : joined)
+    const out = { ...env }
+    delete out.paged
+    if (whole && typeof whole === 'object' && 'result' in whole) out.result = whole.result
+    else if (whole && typeof whole === 'object' && 'text' in whole) out.text = whole.text
+    else return { ...env, __incompletePages: true }
+    return out
+  } catch (e) {
+    return null
   }
-  return env
 }
 
-function ucxBody(env) {
-  return env.result !== undefined && env.result !== null ? JSON.stringify(env.result) : String(env.text ?? '')
+// What an answer must look like for its request: an object `result` when a schema was
+// given, a string `text` otherwise — never both, never another type. Returns the signed
+// { kind, body } or null.
+function ucxPayload(env, wantsResult) {
+  if (!env || env.ok !== true) return null
+  if (wantsResult) {
+    if (env.text !== undefined || !env.result || typeof env.result !== 'object' || Array.isArray(env.result)) return null
+    return { kind: 'result', body: JSON.stringify(env.result) }
+  }
+  if (env.result !== undefined || typeof env.text !== 'string') return null
+  return { kind: 'text', body: env.text }
 }
 
 // The result also travels back through the relay (the model transcribes the runner's
-// line); resultHash proves it arrived unchanged, the mac proves the runner produced it.
-function ucxResultIntact(env) {
+// line): resultHash proves it arrived unchanged, the mac proves the runner produced it for
+// exactly this request (nonce, model, cwd, schema, task — all in the request digest).
+function ucxResultIntact(env, wantsResult) {
   if (!env || env.ok !== true) return true
-  if (env.__incompletePages || typeof env.resultHash !== 'string') return false
-  return ucxHash(ucxBody(env)) === env.resultHash
+  if (env.__incompletePages || env.__tooLarge || typeof env.resultHash !== 'string') return false
+  const payload = ucxPayload(env, wantsResult)
+  return !!payload && ucxHash(payload.body) === env.resultHash
 }
-function ucxResultAuthentic(env, key, taskText) {
+function ucxResultAuthentic(env, auth, digest, wantsResult) {
   if (!env || env.ok !== true) return true
-  return typeof env.mac === 'string' && !!key && ucxHmacHex(key, env.runId + '\n' + ucxSha256Hex(taskText) + '\n' + ucxBody(env)) === env.mac
+  const payload = ucxPayload(env, wantsResult)
+  return !!payload && !!auth && typeof env.mac === 'string'
+    && ucxHmacHex(auth.key, 'ucx-result\n' + env.runId + '\n' + digest + '\n' + payload.kind + '\n' + payload.body) === env.mac
 }
 
-// expected = { taskHash, text, key } of the request this reply must answer.
+// expected = { taskHash, digest, auth, wantsResult } of the request this reply must answer.
 function ucxUnwrap(env, raw, expected = {}) {
-  const { taskHash: expectedTaskHash, text: taskText, key } = expected
+  const { taskHash: expectedTaskHash, digest, auth, wantsResult } = expected
   if (raw && typeof raw === 'object' && raw.__ucxRejected !== undefined) {
     return ucxError('relay_failed', 'the relay agent call failed: ' + raw.__ucxRejected)
   }
@@ -288,11 +322,14 @@ function ucxUnwrap(env, raw, expected = {}) {
       ? ucxError('relay_failed', 'the relay agent returned nothing')
       : ucxError('relay_no_envelope', 'relay reply carried no runner line: ' + String(raw).slice(0, 200))
   }
+  if (env.ok === true && env.__tooLarge) {
+    return ucxError('result_too_large', 'the result is larger than ' + UCX_MAX_PAGES + ' pages', env.runId)
+  }
   if (env.ok === true && env.__incompletePages) {
     return ucxError('relay_incomplete_result', 'the relay returned only part of a large (paged) result', env.runId, true)
   }
-  if (env.ok === true && !ucxResultIntact(env)) {
-    return ucxError('relay_corruption', 'the result changed on its way back through the relay (hash mismatch)', env.runId, true)
+  if (env.ok === true && !ucxResultIntact(env, wantsResult)) {
+    return ucxError('relay_corruption', 'the result changed on its way back through the relay (hash or shape mismatch)', env.runId, true)
   }
   if (env.ok === true) {
     const p = env.provenance || {}
@@ -302,21 +339,20 @@ function ucxUnwrap(env, raw, expected = {}) {
     if (expectedTaskHash && p.taskHash !== expectedTaskHash) {
       return ucxError('relay_mismatch', 'the result belongs to a different request (taskHash ' + p.taskHash + ')', env.runId)
     }
-    if (!key) {
-      return ucxError('key_unavailable', 'the runner result key could not be fetched, so the result cannot be authenticated', env.runId, true)
+    if (!auth) {
+      return ucxError('key_unavailable', 'the runner key could not be fetched, so the result cannot be authenticated', env.runId, true)
     }
-    if (!ucxResultAuthentic(env, key, taskText)) {
-      return ucxError('unauthenticated_result', 'the result is not signed by this machine\'s runner — not trusted', env.runId)
+    if (!ucxResultAuthentic(env, auth, digest, wantsResult)) {
+      return ucxError('unauthenticated_result', 'the result is not signed by this machine\'s runner for this request — not trusted', env.runId)
     }
     const prov = { runId: env.runId, threadId: p.threadId, model: p.model, effort: p.effort, tier: p.tier,
       usage: p.usageTotal || p.usage, durationMs: p.durationMs, attempts: p.attempts, codexVersion: p.codexVersion, slotLost: p.slotLost || false }
     ucxRecordUsage(prov)
-    if (env.result && typeof env.result === 'object') {
+    if (wantsResult) {
       Object.defineProperty(env.result, '_codex', { value: prov, enumerable: false })
       return env.result
     }
-    if (typeof env.text === 'string') return env.text
-    return ucxError('parse', 'runner envelope had neither result nor text', env.runId)
+    return env.text
   }
   if (env.state === 'receiving') {
     return ucxError('relay_incomplete_upload', 'the relay uploaded ' + env.received + '/' + env.total + ' parts', null, true)
@@ -334,7 +370,7 @@ function ucxUnwrap(env, raw, expected = {}) {
 function codexNode(task, opts = {}) {
   // orphanAfterSec 900: a collector may queue behind other agents before it resumes polling.
   const { schema = null, schemaPreset = null, tier = 'daily', kind = 'verify', model, effort, cwd, timeoutSec,
-    maxAttempts = 2, orphanAfterSec = 900, workItems = 1, label, phase, meta } = opts
+    maxAttempts = 2, orphanAfterSec = 900, workItems = 1, serviceTier, label, phase, meta } = opts
   if (typeof task !== 'string' || !task.trim()) throw new Error('codexNode: task must be a non-empty string')
   if (!UCX_TIER_MODEL[tier]) throw new Error('codexNode: tier must be light, daily or final')
   if (!UCX_KINDS.includes(kind)) throw new Error('codexNode: kind must be verify, ask or review (implementation is not a workflow node)')
@@ -346,40 +382,24 @@ function codexNode(task, opts = {}) {
   if (timeoutSec !== undefined && !(Number.isInteger(timeoutSec) && timeoutSec >= 60)) throw new Error('codexNode: timeoutSec must be an integer >= 60')
   if (!(Number.isInteger(orphanAfterSec) && orphanAfterSec >= 60 && orphanAfterSec <= 3600)) throw new Error('codexNode: orphanAfterSec must be an integer 60..3600')
   if (!(Number.isInteger(workItems) && workItems >= 1 && workItems <= 256)) throw new Error('codexNode: workItems must be an integer 1..256')
+  if (serviceTier !== undefined && !['default', 'priority'].includes(serviceTier)) throw new Error('codexNode: serviceTier must be default or priority')
 
   const text = ucxNormalize(task)
+  const wantsResult = Boolean(schema || schemaPreset)
   // Workflow nodes are read-only and hermetic by construction; the runner refuses anything else from a relay.
-  const header = { v: 1, tier, kind, sandbox: 'read-only', hermetic: true, maxAttempts, attached: true }
-  if (model) header.model = model
-  if (effort) header.effort = effort
-  if (cwd) header.cwd = String(cwd).replace(/\\/g, '/')
-  if (timeoutSec) header.timeoutSec = timeoutSec
-  header.orphanAfterSec = orphanAfterSec
-  if (workItems > 1) header.workItems = workItems                 // the runner scales the deadline for a batch
-  if (schemaPreset) header.schemaPreset = schemaPreset
-  if (label) header.label = String(label).replace(/[^\w .:/@#+=-]/g, '_').slice(0, 120)
-  if (meta !== undefined) header.meta = meta
-  header.taskHash = ucxHash(text)
-  header.schemaHash = ucxHash(schema ? JSON.stringify(schema) : 'null')
-  header.h = ucxHash(JSON.stringify(header))                       // last: covers every field above
-
-  const frame = [JSON.stringify(header), '---ULTRACODEX-SCHEMA---', schema ? JSON.stringify(schema) : 'null',
-    '---ULTRACODEX-TASK---', text].join('\n')
-  // No separate marker line: relays tended to drop it. `part` uploads are always encoded.
-  const lines = ucxEncode(frame).split('\n').flatMap(ucxWrap)
-  const parts = ucxParts(lines)
-  const delim = ucxDelimiter(lines)
+  const base = { v: 1, tier, kind, sandbox: 'read-only', hermetic: true, maxAttempts, attached: true }
+  if (model) base.model = model
+  if (effort) base.effort = effort
+  if (cwd) base.cwd = String(cwd).replace(/\\/g, '/')
+  if (timeoutSec) base.timeoutSec = timeoutSec
+  base.orphanAfterSec = orphanAfterSec
+  if (workItems > 1) base.workItems = workItems                     // the runner scales the deadline for a batch
+  if (serviceTier) base.serviceTier = serviceTier
+  if (schemaPreset) base.schemaPreset = schemaPreset
+  if (label) base.label = String(label).replace(/[^\w .:/@#+=-]/g, '_').slice(0, 120)
+  if (meta !== undefined) base.meta = meta
+  const schemaText = schema ? JSON.stringify(schema) : 'null'
   const relayLabel = label || 'codex'
-  const partHashes = parts.map(p => ucxHash(p.join('\n')))        // the runner refuses a part that differs
-  // The runner allocates the upload id on part 1 ("part new"), so identical requests from
-  // different workflows or sessions can never share (or clear) each other's upload.
-  const startPrompt = [
-    'ULTRACODEX START', 'PARTS: ' + parts.length, 'DELIMITER: ' + delim,
-    'Part 1: node <runner> part new 1 ' + parts.length + ' <hash of part 1> — it prints the upload id.' +
-      ' Parts k = 2..' + parts.length + ': node <runner> part <upload id> k ' + parts.length + ' <hash of part k>.' +
-      " Each with <<'" + delim + "' + the part lines + " + delim + '. Resend a part the runner answers with part_rejected.',
-    ...parts.flatMap((p, i) => ['=====' + delim + ' PART ' + (i + 1) + '/' + parts.length + ' ' + partHashes[i] + '=====', ...p, '=====' + delim + ' END=====']),
-  ].join('\n')
   const weight = (model || UCX_TIER_MODEL[tier]) === 'gpt-6-astra' ? 2 : 1
   // agent() may reject (runtime error, exhausted budget): that is a failed node, never a vanished one.
   const call = async (prompt, callOpts) => {
@@ -387,42 +407,68 @@ function codexNode(task, opts = {}) {
   }
 
   return ucxGate(async () => {
-    let raw = null, env = null
-    const pageStore = { runId: null, pages: new Map() }
-    for (let attempt = 0; attempt < 2; attempt++) {                // a corrupted copy is retried once, by a stronger relay
-      raw = await call(startPrompt, {
-        agentType: UCX_RELAY, label: relayLabel + (attempt ? ':retry' : ''), phase, ...(attempt ? { model: 'opus' } : { effort: 'low' }),
-      })
-      env = ucxEnvelope(raw, pageStore)
-      const corrupted = env && env.ok === false && env.error && env.error.kind === 'relay_corruption'
-      const stuck = env && env.state === 'receiving'
-      if (!corrupted && !stuck) break
-    }
-    const collect = (runId, suffix, strong) => call('ULTRACODEX COLLECT\nRUN_ID: ' + runId, {
-      agentType: UCX_RELAY, label: relayLabel + ':' + suffix, phase, ...(strong ? { model: 'opus' } : { effort: 'low' }),
-    })
-    // The relay stopped while the run is still going: a collector resumes polling
-    // (the supervisor tears the run down if nobody polls for orphanAfterSec).
-    for (let round = 0; env && env.ok === null && ucxRunId(env) && round < 3; round++) {
-      raw = await collect(env.runId, 'collect', false)
-      env = ucxEnvelope(raw, pageStore)
-    }
-    // A result garbled (or cut short) on the way back is fetched again: the runner keeps it.
-    for (let round = 0; env && env.ok === true && ucxRunId(env) && !ucxResultIntact(env) && round < 2; round++) {
-      raw = await collect(env.runId, 'recollect', round > 0)
-      env = ucxEnvelope(raw, pageStore)
-    }
-    // An intact result must also carry this machine's signature. A mac mangled in
-    // transcription is fetched once more; a forged one fails again and is refused.
-    let key = null
-    if (env && env.ok === true && ucxResultIntact(env)) {
-      key = await ucxKey(call, phase)
-      if (key && ucxRunId(env) && !ucxResultAuthentic(env, key, text)) {
-        const again = ucxEnvelope(await collect(env.runId, 'recollect', true), pageStore)
-        if (again && again.ok === true && ucxResultIntact(again)) env = again
+    try {
+      // The request is signed before it leaves: the runner starts only requests this helper built.
+      const auth = await ucxKey(call, phase)
+      if (!auth) return ucxError('key_unavailable', 'no request can be signed: ' + ucxKeyFailure, null, true)
+      const header = { ...base, nonce: auth.nonce + '.' + (++ucxNodeSeq) }
+      header.taskHash = ucxHash(text)
+      header.schemaHash = ucxHash(schemaText)
+      header.h = ucxHash(JSON.stringify(header))                   // transport check: every field above
+      const digest = ucxSha256Hex(JSON.stringify(header) + '\n' + schemaText + '\n' + text)
+      const frame = [JSON.stringify({ ...header, rmac: ucxHmacHex(auth.key, 'ucx-request\n' + digest) }),
+        '---ULTRACODEX-SCHEMA---', schemaText, '---ULTRACODEX-TASK---', text].join('\n')
+      // No separate marker line: relays tended to drop it. `part` uploads are always encoded.
+      const lines = ucxEncode(frame).split('\n').flatMap(ucxWrap)
+      const parts = ucxParts(lines)
+      const delim = ucxDelimiter(lines)
+      const partHashes = parts.map(p => ucxHash(p.join('\n')))    // the runner refuses a part that differs
+      // The runner allocates the upload id on part 1 ("part new"), so identical requests from
+      // different workflows or sessions can never share (or clear) each other's upload.
+      const startPrompt = [
+        'ULTRACODEX START', 'PARTS: ' + parts.length, 'DELIMITER: ' + delim,
+        'Part 1: node <runner> part new 1 ' + parts.length + ' <hash of part 1> — it prints the upload id.' +
+          ' Parts k = 2..' + parts.length + ': node <runner> part <upload id> k ' + parts.length + ' <hash of part k>.' +
+          " Each with <<'" + delim + "' + the part lines + " + delim + '. Resend a part the runner answers with part_rejected.',
+        ...parts.flatMap((p, i) => ['=====' + delim + ' PART ' + (i + 1) + '/' + parts.length + ' ' + partHashes[i] + '=====', ...p, '=====' + delim + ' END=====']),
+      ].join('\n')
+
+      let raw = null, env = null
+      const pageStore = { runId: null, pages: new Map() }
+      for (let attempt = 0; attempt < 2; attempt++) {              // a corrupted copy is retried once, by a stronger relay
+        raw = await call(startPrompt, {
+          agentType: UCX_RELAY, label: relayLabel + (attempt ? ':retry' : ''), phase, ...(attempt ? { model: 'opus' } : { effort: 'low' }),
+        })
+        env = ucxEnvelope(raw, pageStore)
+        const corrupted = env && env.ok === false && env.error && env.error.kind === 'relay_corruption'
+        const stuck = env && env.state === 'receiving'
+        if (!corrupted && !stuck) break
       }
+      const collect = (runId, suffix, strong) => call('ULTRACODEX COLLECT\nRUN_ID: ' + runId, {
+        agentType: UCX_RELAY, label: relayLabel + ':' + suffix, phase, ...(strong ? { model: 'opus' } : { effort: 'low' }),
+      })
+      // The relay stopped while the run is still going: a collector resumes polling
+      // (the supervisor tears the run down if nobody polls for orphanAfterSec).
+      for (let round = 0; env && env.ok === null && ucxRunId(env) && round < 3; round++) {
+        raw = await collect(env.runId, 'collect', false)
+        env = ucxEnvelope(raw, pageStore)
+      }
+      // A result garbled (or cut short) on the way back is fetched again: the runner keeps it.
+      for (let round = 0; env && env.ok === true && !env.__tooLarge && ucxRunId(env) && !ucxResultIntact(env, wantsResult) && round < 2; round++) {
+        raw = await collect(env.runId, 'recollect', round > 0)
+        env = ucxEnvelope(raw, pageStore)
+      }
+      // An intact result must also carry this machine's signature for this request. A mac
+      // mangled in transcription is fetched once more; a forged one fails again and is refused.
+      if (env && env.ok === true && ucxResultIntact(env, wantsResult) && ucxRunId(env) && !ucxResultAuthentic(env, auth, digest, wantsResult)) {
+        const again = ucxEnvelope(await collect(env.runId, 'recollect', true), pageStore)
+        if (again && again.ok === true && ucxResultIntact(again, wantsResult)) env = again
+      }
+      return ucxUnwrap(env, raw, { taskHash: header.taskHash, digest, auth, wantsResult })
+    } catch (e) {
+      // never let one node's surprise abort the whole workflow: it is a failed node
+      return ucxError('helper_error', 'codexNode failed unexpectedly: ' + String((e && e.message) || e))
     }
-    return ucxUnwrap(env, raw, { taskHash: header.taskHash, text, key })
   }, weight)
 }
 
@@ -480,7 +526,7 @@ Check it against the code and data in your working directory where relevant (rea
 Set refuted=false only if the evidence is airtight; otherwise refuted=true. confidence is 0..1; reasoning must cite what you checked.
 CLAIM:
 ${A.claim}${A.evidence ? '\nEVIDENCE OFFERED:\n' + A.evidence : ''}`,
-  { schemaPreset: 'verdict', tier: TIER, kind: 'verify', cwd: A.cwd || undefined, label: 'codex:crosscheck', phase: 'Cross-check' })
+  { schemaPreset: 'verdict', tier: TIER, kind: 'verify', cwd: A.cwd || undefined, label: 'codex:crosscheck', phase: 'Cross-check', ...(A.fast === true && TIER === 'final' ? { serviceTier: 'priority' } : {}) })
 
 const ok = !isCodexError(verdict)
 return {

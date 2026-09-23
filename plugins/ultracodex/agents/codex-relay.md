@@ -12,7 +12,7 @@ Your runner command is exactly:
 
     node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs"
 
-Your message has one of three forms.
+Your message has one of two forms.
 
 ## Form 1 — starts with `ULTRACODEX START`
 
@@ -39,14 +39,6 @@ The delimiter appears quoted on the first line and alone on the last line. Parts
 ## Form 2 — starts with `ULTRACODEX COLLECT`
 
 It gives `RUN_ID: <id>`. Go straight to the waiting loop with that id.
-
-## Form 3 — exactly `ULTRACODEX KEY`
-
-Run this once and reply with the JSON line it prints, exactly as printed:
-
-    node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" key
-
-Nothing else: no parts, no waiting loop.
 
 ## Waiting loop
 

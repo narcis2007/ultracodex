@@ -15,7 +15,7 @@
 // Exit codes: 0 done/ok, 1 failed or rejected, 2 usage error, 3 still running.
 
 import { spawn, spawnSync } from "node:child_process";
-import { createHash, createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -77,7 +77,7 @@ export const TIMING = Object.freeze({
   killGraceMs: envInt("ULTRACODEX_KILL_GRACE_MS", 5000),
   minOrphanSec: envInt("ULTRACODEX_MIN_ORPHAN_SEC", 60),
   minTimeoutSec: envInt("ULTRACODEX_MIN_TIMEOUT_SEC", 60),
-  treeSnapshotMs: envInt("ULTRACODEX_TREE_SNAPSHOT_MS", 60_000),
+  treeSnapshotMs: envInt("ULTRACODEX_TREE_SNAPSHOT_MS", 20_000), // fallback mode only (no Job Object)
 });
 
 // ─── small utilities ────────────────────────────────────────────────────────
@@ -165,6 +165,11 @@ function writeJsonAtomic(file, value) {
   }
 }
 
+// A synchronous pause without spinning the CPU (callers below are synchronous).
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 // Windows refuses a rename for a moment when a scanner (Defender, the indexer) holds a
 // handle on something just written: EPERM/EACCES/EBUSY, measured at ~1 % of directory
 // renames. Those are retried for up to ~1 s; anything else (ENOENT: someone else moved
@@ -176,10 +181,7 @@ function renameRetry(from, to) {
       return;
     } catch (error) {
       if (!["EPERM", "EACCES", "EBUSY"].includes(error.code) || attempt >= 40) throw error;
-      const until = Date.now() + 25;
-      while (Date.now() < until) {
-        // brief spin: callers are synchronous
-      }
+      sleepSync(25);
     }
   }
 }
@@ -576,6 +578,7 @@ const REQUEST_FIELDS = new Set([
   "taskHash",
   "schemaHash",
   "meta",
+  "nonce",
 ]);
 
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -630,10 +633,15 @@ export function modelSupportsEffort(model, effort, catalog) {
 
 // Returns a normalized request (task text loaded and normalized, schema resolved)
 // or throws RequestError(kind, message).
-export function validateRequest(raw, { catalog = null } = {}) {
+// requestDigest is trusted input: framedToRaw's digest of a verified, signed request (never
+// a request field). Requests from the conversation get directDigest(task).
+export function validateRequest(raw, { catalog = null, requestDigest: signedDigest = null } = {}) {
   if (!isPlainObject(raw)) throw new RequestError("invalid_request", "request must be a JSON object");
   const unknown = Object.keys(raw).filter((key) => !REQUEST_FIELDS.has(key));
   if (unknown.length) throw new RequestError("invalid_request", `unknown request fields: ${unknown.join(", ")}`);
+  if (raw.nonce !== undefined && (typeof raw.nonce !== "string" || !NONCE_RE.test(raw.nonce))) {
+    throw new RequestError("invalid_request", "nonce must look like <32 hex>.<counter>");
+  }
 
   if (raw.review !== undefined && raw.resume !== undefined) {
     throw new RequestError("invalid_request", "review and resume are mutually exclusive");
@@ -847,6 +855,8 @@ export function validateRequest(raw, { catalog = null } = {}) {
     review,
     resume,
     meta,
+    nonce: raw.nonce ?? null,
+    requestDigest: signedDigest ?? directDigest(task),
   };
 }
 
@@ -972,7 +982,11 @@ export function parseFramed(text, { encoded = false } = {}) {
   return { header, schema, task: lines.slice(taskAt + 1).join("\n") };
 }
 
-export function framedToRaw({ header, schema, task }) {
+// Returns { raw, requestDigest }. The transport hashes (h, taskHash, schemaHash) catch a
+// relay's copying mistakes (retryable); the request signature (rmac, see "request and
+// result authentication") proves the Workflow helper built this exact request — a frame
+// a relay composed itself, however consistent its hashes, is refused.
+export function framedToRaw({ header, schema, task }, { key = null } = {}) {
   // A frame without its integrity fields is never accepted: omitting them must not be
   // a way around the checks.
   for (const field of ["h", "taskHash", "schemaHash"]) {
@@ -980,7 +994,7 @@ export function framedToRaw({ header, schema, task }) {
       throw new RequestError("relay_corruption", `framed request lacks its ${field}`);
     }
   }
-  const { h, ...rest } = header;
+  const { h, rmac, ...rest } = header;
   if (fnv1a(JSON.stringify(rest)) !== h) {
     throw new RequestError("relay_corruption", "request header differs from what the workflow sent (hash mismatch)");
   }
@@ -989,6 +1003,17 @@ export function framedToRaw({ header, schema, task }) {
   }
   if (schemaHash(schema) !== header.schemaHash) {
     throw new RequestError("relay_corruption", "schema differs from what the workflow sent (hash mismatch)");
+  }
+  if (typeof header.nonce !== "string" || !NONCE_RE.test(header.nonce)) {
+    throw new RequestError("unauthenticated_request", "relayed request carries no valid nonce");
+  }
+  const { rmac: omitted, ...signed } = header; // every field the helper signed, in its order
+  const digest = requestDigest(signed, schema, task);
+  if (typeof rmac !== "string" || !KEY_RE.test(rmac) || !key || !sameHex(rmac, requestMac(key, digest))) {
+    throw new RequestError(
+      "unauthenticated_request",
+      "the request is not signed with this machine's key: a relay may only upload requests the Workflow helper built"
+    );
   }
   // Framed requests come from a relaying model. Whatever it was told, it may only
   // start read-only, hermetic jobs with the task it was given inline — never a
@@ -1006,8 +1031,9 @@ export function framedToRaw({ header, schema, task }) {
   delete raw.h;
   delete raw.taskHash;
   delete raw.schemaHash;
+  delete raw.rmac;
   if (schema !== null) raw.schema = schema;
-  return raw;
+  return { raw, requestDigest: digest };
 }
 
 // ─── locating the Codex CLI ─────────────────────────────────────────────────
@@ -1334,39 +1360,100 @@ export function runPaths(runId, env = process.env) {
   };
 }
 
-// ─── result authentication ──────────────────────────────────────────────────
+// ─── request and result authentication ─────────────────────────────────────
 //
-// Every successful result carries mac = HMAC-SHA256(key, runId \n SHA-256(task) \n body)
-// under a per-machine secret. The Workflow helper fetches the key once per workflow
-// through a relay whose context holds no untrusted text, then verifies each result. A
-// relay hijacked by reviewed content can neither know the key's output for a forged
-// body nor compute an HMAC (the relay guard allows it no code), so it cannot pass off
-// its own answer as Codex's. The task is bound by SHA-256, not by the 32-bit taskHash:
-// someone who holds the key must not be able to search for a task text whose own
-// hash matches a MAC embedded in it.
+// A per-machine secret (~/.ultracodex/key) is fetched once per workflow by a dedicated
+// key agent (its own agent type: the relay guard never lets a job relay read the key),
+// together with a fresh nonce. With it the Workflow helper:
+//   • signs every request it builds: rmac = HMAC(key, "ucx-request" \n requestDigest),
+//     where requestDigest = SHA-256 of the exact signed header (model, effort, tier, cwd,
+//     schema preset, nonce, …), the schema and the task. The runner starts a relayed job
+//     only with a valid rmac, so a relay hijacked by reviewed content cannot start a job
+//     of its own — for instance one that asks Codex to read this key and sign a forgery;
+//   • verifies every result: mac = HMAC(key, "ucx-result" \n runId \n requestDigest \n
+//     kind \n body), kind being "result" (schema) or "text". A result is thereby bound
+//     to the one request the helper made (nonce: no replay of an older run of the same
+//     task) and to the payload type it returns.
+// Each nonce starts one run; a second upload of the same request joins the first run.
+// SHA-256 (not the 32-bit transport hashes) binds everything, so nobody holding the key
+// can search for a request whose own digest matches a MAC embedded in it.
 
 export function keyPath(env = process.env) {
   return path.join(ucxHome(env), "key");
 }
 
+const KEY_RE = /^[0-9a-f]{64}$/;
+export const NONCE_RE = /^[0-9a-f]{32}\.[1-9]\d{0,6}$/;
+
+// Created once, published complete: the key is written to a private temp file and linked
+// into place, so a concurrent reader never sees an empty or partial key and a second
+// creator never replaces the first one's key.
 export function ensureKey(env = process.env) {
   const file = keyPath(env);
-  const existing = (readTextSafe(file) ?? "").trim();
-  if (/^[0-9a-f]{64}$/.test(existing)) return existing;
+  const read = () => (readTextSafe(file) ?? "").trim();
+  let current = read();
+  if (KEY_RE.test(current)) return current;
   fs.mkdirSync(ucxHome(env), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
+  fs.writeFileSync(tmp, randomBytes(32).toString("hex"), { mode: 0o600 });
   try {
-    fs.writeFileSync(file, randomBytes(32).toString("hex"), { flag: "wx", mode: 0o600 });
-  } catch (error) {
-    if (error.code !== "EEXIST") throw error;
+    try {
+      fs.linkSync(tmp, file);
+    } catch (error) {
+      if (error.code !== "EEXIST") {
+        // a filesystem without hard links: exclusive create (a reader may briefly see it empty)
+        try {
+          fs.writeFileSync(file, fs.readFileSync(tmp, "utf8"), { flag: "wx", mode: 0o600 });
+        } catch (inner) {
+          if (inner.code !== "EEXIST") throw inner;
+        }
+      }
+    }
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      current = read();
+      if (KEY_RE.test(current)) return current;
+      sleepSync(10); // an older runner's creator (open, then write) may still be writing
+    }
+    renameRetry(tmp, file); // an empty or corrupt key nobody completes: replace it
+    current = read();
+    if (KEY_RE.test(current)) return current;
+    throw new Error(`cannot establish the ultracodex result key at ${file}`);
+  } finally {
+    fs.rmSync(tmp, { force: true });
   }
-  const settled = (readTextSafe(file) ?? "").trim(); // a concurrent creator may have won
-  if (!/^[0-9a-f]{64}$/.test(settled)) throw new Error(`cannot establish the ultracodex result key at ${file}`);
-  return settled;
 }
 
-export function resultMac(key, runId, task, body) {
-  const taskDigest = createHash("sha256").update(String(task), "utf8").digest("hex");
-  return createHmac("sha256", Buffer.from(key, "hex")).update(`${runId}\n${taskDigest}\n${body}`, "utf8").digest("hex");
+function sha256Hex(text) {
+  return createHash("sha256").update(String(text), "utf8").digest("hex");
+}
+
+function hmacHex(key, text) {
+  return createHmac("sha256", Buffer.from(key, "hex")).update(String(text), "utf8").digest("hex");
+}
+
+function sameHex(a, b) {
+  const left = Buffer.from(String(a), "utf8");
+  const right = Buffer.from(String(b), "utf8");
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+// signedHeader: the frame header exactly as the helper signed it (every field but rmac).
+export function requestDigest(signedHeader, schema, task) {
+  return sha256Hex(`${JSON.stringify(signedHeader)}\n${schema === null || schema === undefined ? "null" : JSON.stringify(schema)}\n${task}`);
+}
+
+export function requestMac(key, digest) {
+  return hmacHex(key, `ucx-request\n${digest}`);
+}
+
+// Requests started from the conversation (start --request) are not relayed; their results
+// are bound to the task alone and never match a relayed request's digest.
+export function directDigest(task) {
+  return sha256Hex(`ucx-direct\n${task}`);
+}
+
+export function resultMac(key, runId, digest, kind, body) {
+  return hmacHex(key, `ucx-result\n${runId}\n${digest}\n${kind}\n${body}`);
 }
 
 // The exact string resultHash and mac cover: the result JSON, or the final text.
@@ -1418,7 +1505,8 @@ function slotOwner(dir) {
   const lease = names.find((name) => name.startsWith("lease-"));
   if (lease) {
     const leasePath = path.join(dir, lease);
-    return readJsonSafe(path.join(leasePath, "owner.json")) ?? { runId: lease.slice("lease-".length), pid: null, beatAt: null, partial: true, leasePath };
+    const owner = readJsonSafe(path.join(leasePath, "owner.json"));
+    return owner ? { ...owner, leasePath } : { runId: lease.slice("lease-".length), pid: null, beatAt: null, partial: true, leasePath };
   }
   return readJsonSafe(path.join(dir, "owner.json")); // pre-0.3 layout
 }
@@ -1462,9 +1550,11 @@ function ownerGone(dir, owner, watch) {
 
 const sameOwner = (a, b) => Boolean(a && b) && a.runId === b.runId && a.beatAt === b.beatAt;
 
-// Reclaiming renames the slot away first (only one reclaimer can win a rename) and then
-// checks it moved the owner it judged gone; if it moved someone's fresh slot instead,
-// it puts it back.
+// Reclaiming moves out only the generation it judged gone (only one reclaimer can win
+// that rename), then checks it moved that very owner — if the owner renewed meanwhile, it
+// is put straight back where nobody else can have recreated it (an owner never recreates
+// its generation directory, and the slot directory stays in place). The slot directory
+// itself is only moved when it holds no generation (debris) or a pre-0.3 owner file.
 function tryTakeSlot(index, runId, watch) {
   const dir = path.join(slotsDir(), `slot-${index}`);
   try {
@@ -1473,52 +1563,79 @@ function tryTakeSlot(index, runId, watch) {
     if (error.code !== "EEXIST") throw error;
     const judged = slotOwner(dir);
     if (!ownerGone(dir, judged, watch)) return null;
-    const tombstone = `${dir}.stale-${randomBytes(4).toString("hex")}`;
-    try {
-      fs.renameSync(dir, tombstone);
-    } catch {
-      return null; // another supervisor reclaimed it first (or it is busy on Windows)
-    }
-    const moved = slotOwner(tombstone);
-    if (judged ? !sameOwner(moved, judged) : moved !== null) {
+    if (judged?.leasePath) {
+      const generation = judged.leasePath;
+      const tombstone = `${dir}.stale-${randomBytes(4).toString("hex")}`;
       try {
-        renameRetry(tombstone, dir);
+        renameRetry(generation, tombstone);
       } catch {
-        // the rightful owner notices through lost() on its next renewal
+        return null; // another reclaimer won, or the owner released it
       }
-      return null;
-    }
-    fs.rmSync(tombstone, { recursive: true, force: true });
-    watch.suspects.delete(dir);
-    try {
-      fs.mkdirSync(dir);
-    } catch {
-      return null;
+      const moved = readJsonSafe(path.join(tombstone, "owner.json"));
+      const same = judged.partial ? moved === null : sameOwner(moved, judged);
+      if (!same) {
+        try {
+          renameRetry(tombstone, generation); // it renewed after all: give it back
+        } catch {
+          // its owner notices through lost() on its next renewal
+        }
+        return null;
+      }
+      fs.rmSync(tombstone, { recursive: true, force: true });
+      watch.suspects.delete(dir);
+      // the slot directory is now empty and fresh: no other taker judges it gone
+    } else {
+      const tombstone = `${dir}.stale-${randomBytes(4).toString("hex")}`;
+      try {
+        renameRetry(dir, tombstone);
+      } catch {
+        return null; // another supervisor reclaimed it first
+      }
+      const moved = slotOwner(tombstone);
+      if (judged ? !sameOwner(moved, judged) : moved !== null) {
+        try {
+          renameRetry(tombstone, dir);
+        } catch {
+          // an older runner's owner notices on its next renewal
+        }
+        return null;
+      }
+      fs.rmSync(tombstone, { recursive: true, force: true });
+      watch.suspects.delete(dir);
+      try {
+        fs.mkdirSync(dir);
+      } catch {
+        return null;
+      }
     }
   }
-  fs.mkdirSync(leaseDir(dir, runId));
+  try {
+    fs.mkdirSync(leaseDir(dir, runId));
+  } catch {
+    return null;
+  }
   writeJsonAtomic(path.join(leaseDir(dir, runId), "owner.json"), { runId, pid: process.pid, beatAt: Date.now() });
   return dir;
 }
 
-// Release moves the lease away first and deletes it only if it is still ours; a lease
-// that was reclaimed meanwhile is put back for its new owner.
+// Release touches only this run's own generation: it moves lease-<runId> out of the slot
+// (ENOENT: the slot was reclaimed, so nothing of ours is left in it) and then removes the
+// slot directory only if it is empty — an atomic rmdir that fails when a new owner is in
+// it. An empty slot directory is fresh (its mtime just moved), so nobody reclaims it in
+// between, and a taker's mkdir fails until it is gone. No other owner's lease is ever moved.
 function releaseSlot(dir, runId) {
-  const moved = `${dir}.released-${randomBytes(4).toString("hex")}`;
+  const moved = `${dir}.released-${runId}-${randomBytes(3).toString("hex")}`;
   try {
-    renameRetry(dir, moved);
+    renameRetry(leaseDir(dir, runId), moved);
   } catch {
-    return; // already gone (or still locked: a dead owner's slot is reclaimed at once)
-  }
-  if (isDirSync(leaseDir(moved, runId))) {
-    fs.rmSync(moved, { recursive: true, force: true });
-    return;
+    return; // no longer ours
   }
   try {
-    renameRetry(moved, dir);
+    fs.rmdirSync(dir);
   } catch {
-    // its owner notices through lost() on its next renewal
+    // not empty (a new owner) or already gone: nothing to do
   }
+  fs.rmSync(moved, { recursive: true, force: true });
 }
 
 // Takes `weight` slots out of ULTRACODEX_MAX_CONCURRENT (default 4) across every
@@ -1574,10 +1691,18 @@ export async function acquireSlots(weight, runId, shouldStop) {
 }
 
 // ─── process-tree teardown ──────────────────────────────────────────────────
-
-export function windowsTaskkill(env = process.env) {
-  return path.join(env.SystemRoot || env.windir || "C:\\Windows", "System32", "taskkill.exe");
-}
+//
+// Only process trees this runner started are ever stopped: the owner runs parallel Codex
+// sessions. POSIX: the child's own process group. Windows reuses PIDs quickly and keeps a
+// dead parent's PID in its orphans' records, so ownership is proven there, never inferred:
+//   • primary — a Job Object: before it spawns Codex, the supervisor has a small helper put
+//     it into a fresh job, so every process of the run is born into the job, including
+//     ones whose parent has exited. Stopping terminates exactly the job's members (each
+//     through a handle checked to belong to the job), never a PID looked up later;
+//   • fallback (no job: PowerShell or Add-Type unavailable) — processes are killed only
+//     through a handle opened before their identity (PID + creation time) was checked,
+//     children are only attributed through parents whose PID is pinned, and what can no
+//     longer be proven is reported as possibleLeftovers, never killed.
 
 function groupAlive(pid) {
   try {
@@ -1592,6 +1717,16 @@ export function windowsPowerShell(env = process.env) {
   return path.join(env.SystemRoot || env.windir || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 }
 
+function runPowerShell(script, { timeout = 60_000 } = {}) {
+  return spawnSync(windowsPowerShell(), ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], {
+    encoding: "utf8",
+    timeout,
+    windowsHide: true,
+    cwd: path.dirname(windowsPowerShell()), // neither the repository nor the home (which must stay deletable)
+    maxBuffer: 16 * 1024 * 1024,
+  });
+}
+
 export function parseProcessTable(text) {
   const rows = [];
   for (const line of String(text ?? "").split(/\r?\n/)) {
@@ -1603,24 +1738,20 @@ export function parseProcessTable(text) {
 
 // pid, parent pid and creation time (FILETIME) of every process, or null when unavailable.
 export function windowsProcessTable() {
-  const script =
-    "Get-CimInstance Win32_Process | ForEach-Object { if ($_.CreationDate) { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $_.CreationDate.ToFileTimeUtc() } }";
-  const out = spawnSync(windowsPowerShell(), ["-NoProfile", "-NonInteractive", "-Command", script], {
-    encoding: "utf8",
-    timeout: 30_000,
-    windowsHide: true,
-    cwd: ucxHome(),
-    maxBuffer: 16 * 1024 * 1024,
-  });
+  const out = runPowerShell(
+    "$ProgressPreference = 'SilentlyContinue'; Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate | ForEach-Object { if ($_.CreationDate) { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $_.CreationDate.ToFileTimeUtc() } }",
+    { timeout: 30_000 }
+  );
   if (out.status !== 0 || !out.stdout) return null;
   return parseProcessTable(out.stdout);
 }
 
-// Descendants of root whose parent link is genuine: a child is created after its parent,
-// so an orphan whose dead parent's PID was later reused by our root is never taken for
-// our child (taskkill /T would take it — and kill a process this run never started).
-// The other way round too: once a (dead) parent's PID belongs to a younger process, only
-// children created before that reuse can be the parent's.
+// Descendants of `root` in `table`. Sound only when `root` is alive or its PID is pinned
+// by the caller (a held handle), because every further parent is a live row of the table:
+// a child created after its live parent was created can only be that parent's. (The
+// creation-time checks also refuse an orphan whose dead parent's PID a younger process
+// took.) Never call it for a parent that died unpinned: its PID may have served another
+// process since.
 export function windowsDescendants(root, table) {
   const byParent = new Map();
   const byPid = new Map();
@@ -1655,8 +1786,7 @@ function windowsRoot(child, table, tracked) {
   return table.find((proc) => proc.pid === child.pid && (created !== undefined ? proc.created === created : alive)) ?? null;
 }
 
-// Remembers every process of the run's tree by identity (pid + creation time), so work
-// that later detaches from the tree (its parent exits) is still known at teardown.
+// Fallback mode only: remembers the live tree by identity, through live parents.
 export function trackWindowsTree(child, tracked, table = windowsProcessTable()) {
   if (!table) return;
   const root = windowsRoot(child, table, tracked);
@@ -1665,63 +1795,252 @@ export function trackWindowsTree(child, tracked, table = windowsProcessTable()) 
   for (const proc of windowsDescendants(root, table)) tracked.set(proc.pid, proc.created);
 }
 
-// Kills exactly the given identities (pid + creation time) that still exist, then — since
-// a process can start a child between the snapshot and its own death — sweeps the fresh
-// table for descendants of everything it stopped (by identity) and stops those too, a few
-// rounds at most. Returns which of them survived.
-function windowsKill(targets) {
-  if (!targets.size) return { targeted: 0, survivors: [] };
-  const all = new Map(targets);
-  let pending = new Map(targets);
-  let after = null;
-  for (let round = 0; round < 3 && pending.size; round += 1) {
-    spawnSync(windowsTaskkill(), ["/F", ...[...pending.keys()].flatMap((pid) => ["/PID", String(pid)])], {
-      windowsHide: true,
-      stdio: "ignore",
-      cwd: ucxHome(),
-    });
-    after = windowsProcessTable();
-    if (!after) break;
-    const fresh = new Map();
-    for (const [pid, created] of all) {
-      if (created === null) continue; // no identity, no descendants we could vouch for
-      for (const proc of windowsDescendants({ pid, created }, after)) if (!all.has(proc.pid)) fresh.set(proc.pid, proc.created);
-    }
-    for (const [pid, created] of fresh) all.set(pid, created);
-    pending = fresh;
+// ── the Job Object helper ──
+// A PowerShell process (outside the job) that owns the job handle for the supervisor's
+// lifetime: `ready 1` once the supervisor is in the job; `kill` terminates every member
+// but the supervisor and answers `killed N left M [pid,…]`; `exit` or end of input ends it.
+// When the supervisor dies, the helper sees end of input and exits too; the job's members
+// keep running (a lost supervisor's Codex is reported, never killed).
+const JOB_SOURCE = `using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class UcxJob {
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr CreateJobObject(IntPtr attributes, IntPtr name);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool TerminateProcess(IntPtr process, uint code);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern uint WaitForSingleObject(IntPtr handle, uint ms);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr info, int length, out int returned);
+  public static int[] Members(IntPtr job) {
+    int size = 8 + IntPtr.Size * 16384;
+    IntPtr buffer = Marshal.AllocHGlobal(size);
+    try {
+      int returned;
+      if (!QueryInformationJobObject(job, 3, buffer, size, out returned)) return null;
+      int count = Marshal.ReadInt32(buffer, 4);
+      int[] pids = new int[count];
+      for (int i = 0; i < count; i++) pids[i] = (int)Marshal.ReadIntPtr(buffer, 8 + i * IntPtr.Size).ToInt64();
+      return pids;
+    } finally { Marshal.FreeHGlobal(buffer); }
   }
-  const survivors = after
-    ? [...all].filter(([pid, created]) => after.some((proc) => proc.pid === pid && (created === null || proc.created === created))).map(([pid]) => pid)
-    : [];
-  // without a fresh process table the stop cannot be confirmed: say so instead of claiming it
-  return after ? { targeted: all.size, survivors } : { targeted: all.size, survivors, unverified: true };
+  // Every member but keep, each terminated through a handle checked to be in this job
+  // after it was opened: a PID can be reused, a job membership cannot be faked.
+  public static string KillAllBut(IntPtr job, int keep) {
+    int[] pids = Members(job);
+    if (pids == null) return "error " + Marshal.GetLastWin32Error();
+    List<IntPtr> held = new List<IntPtr>();
+    int killed = 0;
+    foreach (int pid in pids) {
+      if (pid == keep) continue;
+      IntPtr h = OpenProcess(0x00100000 | 0x1000 | 0x0001, false, pid);
+      if (h == IntPtr.Zero) continue;
+      bool member;
+      if (IsProcessInJob(h, job, out member) && member) { if (TerminateProcess(h, 1)) killed++; held.Add(h); } else CloseHandle(h);
+    }
+    foreach (IntPtr h in held) { WaitForSingleObject(h, 3000); CloseHandle(h); }
+    int[] after = Members(job);
+    List<string> left = new List<string>();
+    if (after != null) foreach (int pid in after) if (pid != keep) left.Add(pid.ToString());
+    return "killed " + killed + " left " + left.Count + (left.Count > 0 ? " " + String.Join(",", left.ToArray()) : "");
+  }
+}`;
+
+function jobHelperScript(pid) {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    "function Say($text) { [Console]::Out.WriteLine($text); [Console]::Out.Flush() }",
+    "try {",
+    `  Add-Type -TypeDefinition @'\n${JOB_SOURCE}\n'@`,
+    "  $job = [UcxJob]::CreateJobObject([IntPtr]::Zero, [IntPtr]::Zero)",
+    "  if ($job -eq [IntPtr]::Zero) { Say ('ready 0 create ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error()); exit 1 }",
+    `  $target = [UcxJob]::OpenProcess(0x0101, $false, ${Number(pid)})`,
+    "  if ($target -eq [IntPtr]::Zero) { Say ('ready 0 open ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error()); exit 1 }",
+    "  if (-not [UcxJob]::AssignProcessToJobObject($job, $target)) { Say ('ready 0 assign ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error()); exit 1 }",
+    "  [void][UcxJob]::CloseHandle($target)",
+    "} catch { Say ('ready 0 ' + $_.Exception.Message.Replace([char]10, ' ')); exit 1 }",
+    "Say 'ready 1'",
+    "while ($true) {",
+    "  $line = [Console]::In.ReadLine()",
+    "  if ($line -eq $null -or $line -eq 'exit') { break }",
+    `  if ($line -eq 'kill') { Say ([UcxJob]::KillAllBut($job, ${Number(pid)})) }`,
+    "}",
+  ].join("\n");
 }
 
-function windowsTargets(child, tracked) {
+// Puts process `pid` (default: this one) into a fresh Job Object. Resolves `ready` to
+// true once it is in; `kill()` resolves to a teardown report, or null when the helper is
+// unavailable (the caller then falls back).
+export function startWindowsJob({ pid = process.pid, readyMs = 30_000, killMs = 20_000 } = {}) {
+  const unavailable = { ready: Promise.resolve(false), kill: async () => null, close() {}, reason: null };
+  let helper;
+  try {
+    helper = spawn(windowsPowerShell(), ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(jobHelperScript(pid), "utf16le").toString("base64")], {
+      stdio: ["pipe", "pipe", "ignore"],
+      windowsHide: true,
+      cwd: path.dirname(windowsPowerShell()),
+    });
+  } catch (error) {
+    return { ...unavailable, reason: error.message };
+  }
+  let usable = true;
+  const waiting = [];
+  const settleAll = () => {
+    usable = false;
+    while (waiting.length) waiting.shift()(null);
+  };
+  helper.on("error", settleAll);
+  helper.on("exit", settleAll);
+  helper.stdin.on("error", () => {});
+  let buffered = "";
+  helper.stdout.on("data", (chunk) => {
+    buffered += chunk;
+    for (let at = buffered.indexOf("\n"); at >= 0; at = buffered.indexOf("\n")) {
+      const line = buffered.slice(0, at).trim();
+      buffered = buffered.slice(at + 1);
+      if (line) waiting.shift()?.(line);
+    }
+  });
+  // one request at a time; a late or missing answer makes the helper unusable (never desync)
+  const answer = (ms) =>
+    new Promise((resolve) => {
+      if (!usable) return resolve(null);
+      const timer = setTimeout(() => {
+        usable = false;
+        resolve(null);
+      }, ms);
+      waiting.push((line) => {
+        clearTimeout(timer);
+        resolve(line);
+      });
+    });
+  const controller = {
+    reason: null,
+    ready: answer(readyMs).then((line) => {
+      if (line === "ready 1") return true;
+      controller.reason = line ?? "no answer";
+      usable = false;
+      return false;
+    }),
+    async kill() {
+      if (!usable) return null;
+      const reply = answer(killMs);
+      helper.stdin.write("kill\n");
+      const match = /^killed (\d+) left (\d+)(?: ([\d,]+))?$/.exec((await reply) ?? "");
+      if (!match) {
+        usable = false;
+        return null;
+      }
+      const survivors = match[3] ? match[3].split(",").map(Number) : [];
+      return { targeted: Number(match[1]) + survivors.length, survivors, method: "job" };
+    },
+    close() {
+      if (helper.exitCode === null) {
+        try {
+          helper.stdin.end("exit\n");
+        } catch {
+          // already gone
+        }
+      }
+    },
+  };
+  return controller;
+}
+
+// ── fallback: kills through pinned handles ──
+// Each process is killed only through a handle opened before its identity was checked
+// (while the handle is held, its PID cannot be reused, so the table shows exactly it).
+// Children started meanwhile are attributed only to parents whose PID is pinned — held by
+// this script, or by the caller (the root, whose handle Node holds until it yields).
+function pinnedKillScript(seeds, pinnedParents) {
+  const assign = (name, pairs) => pairs.map(([pid, created]) => `$${name}[${Number(pid)}] = [long]${Number(created)}`).join("\n");
+  return `$ErrorActionPreference = 'Continue'
+$ProgressPreference = 'SilentlyContinue'
+function Say($text) { [Console]::Out.WriteLine($text) }
+$want = @{}
+${assign("want", seeds)}
+$parents = @{}
+${assign("parents", pinnedParents)}
+$held = @{}
+for ($round = 0; $round -lt 5 -and $want.Count -gt 0; $round++) {
+  $pinned = @{}
+  foreach ($procId in @($want.Keys)) {
+    try { $p = [System.Diagnostics.Process]::GetProcessById([int]$procId); $null = $p.Handle; $pinned[[int]$procId] = $p } catch { Say ('unpinned ' + $procId) }
+  }
+  $rows = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate | Where-Object { $_.CreationDate })
+  $created = @{}
+  foreach ($r in $rows) { $created[[int]$r.ProcessId] = $r.CreationDate.ToFileTimeUtc() }
+  foreach ($procId in @($pinned.Keys)) {
+    $p = $pinned[$procId]
+    if ($created[$procId] -ne $want[$procId]) { $p.Dispose(); continue }
+    try { if (-not $p.HasExited) { $p.Kill() } } catch { }
+    $held[$procId] = $p
+    $parents[$procId] = $want[$procId]
+  }
+  $want = @{}
+  foreach ($r in $rows) {
+    $pp = [int]$r.ParentProcessId
+    $procId = [int]$r.ProcessId
+    if ($parents.ContainsKey($pp) -and -not $held.ContainsKey($procId) -and -not $parents.ContainsKey($procId) -and $created[$procId] -ge $parents[$pp]) { $want[$procId] = $created[$procId] }
+  }
+}
+foreach ($procId in @($held.Keys)) { if ($held[$procId].WaitForExit(3000)) { Say ('killed ' + $procId) } else { Say ('survived ' + $procId) } }
+Say 'done'`;
+}
+
+function runPinnedKill(seeds, pinnedParents) {
+  if (!seeds.length && !pinnedParents.length) return { killed: [], survivors: [], ok: true };
+  const out = runPowerShell(pinnedKillScript(seeds, pinnedParents));
+  const lines = String(out.stdout ?? "").split(/\r?\n/).map((line) => line.trim());
+  const pick = (word) => lines.filter((line) => line.startsWith(`${word} `)).map((line) => Number(line.slice(word.length + 1)));
+  return { killed: pick("killed"), survivors: [...pick("survived"), ...pick("unpinned")], ok: lines.includes("done") };
+}
+
+function windowsPinnedStop(child, tracked, { killRoot }) {
+  const alive = child.exitCode === null && child.signalCode === null;
   const table = windowsProcessTable();
-  const targets = new Map();
   if (!table) {
-    if (child.exitCode === null && child.signalCode === null) targets.set(child.pid, null); // at least the root we hold
-    return targets;
+    if (killRoot && alive) child.kill("SIGKILL"); // through Node's own handle: never another process
+    return { targeted: killRoot && alive ? 1 : 0, survivors: [], method: "pinned", unverified: true };
   }
   const root = windowsRoot(child, table, tracked);
-  if (root) {
-    targets.set(root.pid, root.created);
-    for (const proc of windowsDescendants(root, table)) targets.set(proc.pid, proc.created);
+  if (root) tracked.set(root.pid, root.created);
+  const seeds = new Map();
+  for (const [pid, created] of tracked) {
+    const live = table.find((proc) => proc.pid === pid && proc.created === created);
+    if (!live) continue;
+    if (pid !== child.pid) seeds.set(pid, created);
+    for (const proc of windowsDescendants(live, table)) if (proc.pid !== child.pid) seeds.set(proc.pid, proc.created);
   }
-  for (const [pid, created] of tracked ?? []) {
-    if (table.some((proc) => proc.pid === pid && proc.created === created)) targets.set(pid, created);
-  }
-  return targets;
+  // The root goes through Node's own handle, which stays open until this synchronous code
+  // yields — so its PID is pinned and its last-moment children can still be attributed.
+  const rootPinned = Boolean(killRoot && root && alive);
+  if (rootPinned) child.kill("SIGKILL");
+  const report = runPinnedKill([...seeds], rootPinned ? [[root.pid, root.created]] : []);
+  const after = windowsProcessTable();
+  const survivors = [...report.survivors];
+  if (rootPinned && after?.some((proc) => proc.pid === root.pid && proc.created === root.created)) survivors.push(root.pid);
+  // Children of tracked processes that died before the teardown: probably ours, but their
+  // parent's PID is no longer pinned, so nothing proves it — reported, never killed.
+  const dead = [...tracked].filter(([pid, created]) => !(after ?? table).some((proc) => proc.pid === pid && proc.created === created));
+  const handled = new Set([...seeds.keys(), ...report.killed, child.pid]);
+  const possible = (after ?? []).filter((proc) => !handled.has(proc.pid) && dead.some(([pid, created]) => proc.ppid === pid && proc.created >= created));
+  const result = { targeted: report.killed.length + (rootPinned ? 1 : 0), survivors, method: "pinned" };
+  if (possible.length) result.possibleLeftovers = possible.map((proc) => proc.pid);
+  if (possible.length || !after || !report.ok) result.unverified = true;
+  return result;
 }
 
 // Stops the process tree this supervisor started and resolves once it is gone (or the
-// escalation window has passed), reporting what survived. Windows: the identity-checked
-// tree plus every tracked descendant, by absolute-path taskkill (never /T). POSIX: the
-// child's own process group, SIGTERM then SIGKILL.
-export async function stopOwnedTree(child, { platform = process.platform, tracked = null } = {}) {
+// escalation window has passed), reporting what survived. See the section comment.
+export async function stopOwnedTree(child, { platform = process.platform, tracked = null, job = null } = {}) {
   if (!child?.pid) return { targeted: 0, survivors: [] };
-  if (platform === "win32") return windowsKill(windowsTargets(child, tracked));
+  if (platform === "win32") {
+    const viaJob = job ? await job.kill() : null;
+    return viaJob ?? windowsPinnedStop(child, tracked ?? new Map(), { killRoot: true });
+  }
   const signalGroup = (name) => {
     try {
       process.kill(-child.pid, name);
@@ -1745,21 +2064,15 @@ export async function stopOwnedTree(child, { platform = process.platform, tracke
 }
 
 // After a normal exit, whatever the run started and left behind (e.g. a dev server Codex
-// forgot) is stopped: on POSIX the child's own process group, on Windows the tracked
-// identities that still exist plus — by identity — the descendants of the (exited) root and
-// of every tracked process, which catches children started after the last snapshot.
-function reapLeftovers(child, tracked, { platform = process.platform } = {}) {
+// forgot) is stopped: on POSIX the child's own process group, on Windows the job's members
+// (fallback: the tracked identities still alive and their live descendants).
+async function reapLeftovers(child, tracked, { platform = process.platform, job = null } = {}) {
   if (!child?.pid) return { targeted: 0, survivors: [] };
   if (platform === "win32") {
+    const viaJob = job ? await job.kill() : null;
+    if (viaJob) return viaJob;
     if (!tracked?.size) return { targeted: 0, survivors: [] }; // the root was never identified
-    const table = windowsProcessTable();
-    if (!table) return { targeted: 0, survivors: [] };
-    const targets = new Map();
-    for (const [pid, created] of tracked) {
-      if (pid !== child.pid && table.some((proc) => proc.pid === pid && proc.created === created)) targets.set(pid, created);
-      for (const proc of windowsDescendants({ pid, created }, table)) targets.set(proc.pid, proc.created);
-    }
-    return windowsKill(targets);
+    return windowsPinnedStop(child, tracked, { killRoot: false });
   }
   try {
     process.kill(-child.pid, "SIGKILL");
@@ -2010,7 +2323,8 @@ async function runAttempt(request, paths, attempt, context) {
           deadlineAt += suspendedMs; // time asleep is not time worked
           appendLine(paths.log, `${nowIso()} resumed after ~${Math.round(suspendedMs / 1000)} s suspended; deadline moved`);
         }
-        if (process.platform === "win32" && Date.now() >= nextSnapshotAt) {
+        // snapshots only without a job: the job already knows every member
+        if (process.platform === "win32" && !context.job && Date.now() >= nextSnapshotAt) {
           trackWindowsTree(child, context.tracked);
           nextSnapshotAt = Date.now() + TIMING.treeSnapshotMs;
         }
@@ -2018,17 +2332,20 @@ async function runAttempt(request, paths, attempt, context) {
         else stop = stopReason(paths, request, context.clock);
         if (timedOut || stop) {
           appendLine(paths.log, `${nowIso()} stopping codex pid ${child.pid}: ${timedOut ? "deadline" : stop}`);
-          teardown = await stopOwnedTree(child, { tracked: context.tracked });
-          await withTimeout(exitedPromise, 10_000); // a tree that survives taskkill/SIGKILL is reported, not awaited forever
+          teardown = await stopOwnedTree(child, { tracked: context.tracked, job: context.job });
+          await withTimeout(exitedPromise, 10_000); // a tree that survives the stop is reported, not awaited forever
           break;
         }
       }
-      if (!timedOut && !stop) teardown = reapLeftovers(child, context.tracked);
+      if (!timedOut && !stop) teardown = await reapLeftovers(child, context.tracked, { job: context.job });
       if (teardown?.survivors?.length) appendLine(paths.log, `${nowIso()} still running after teardown: ${teardown.survivors.join(", ")}`);
+      if (teardown?.possibleLeftovers?.length) {
+        appendLine(paths.log, `${nowIso()} possibly left running (ancestry not provable, not stopped): ${teardown.possibleLeftovers.join(", ")}`);
+      }
       outcome = { exitCode, stop, timedOut, teardown };
     } catch (error) {
       appendLine(paths.log, `${nowIso()} supervisor error after spawn, stopping its codex tree: ${error.message}`);
-      await stopOwnedTree(child, { tracked: context.tracked });
+      await stopOwnedTree(child, { tracked: context.tracked, job: context.job });
       throw error;
     }
   }
@@ -2045,7 +2362,8 @@ async function runAttempt(request, paths, attempt, context) {
     codexVersion: context.codexVersion,
     launcher: context.launcher.source,
   });
-  if (outcome.teardown?.targeted) provenance.teardown = outcome.teardown; // leftovers stopped after a normal exit
+  // leftovers stopped after a normal exit, or ones that may have been left
+  if (outcome.teardown?.targeted || outcome.teardown?.possibleLeftovers?.length || outcome.teardown?.survivors?.length) provenance.teardown = outcome.teardown;
 
   if (!spawnError && !outcome.stop && !outcome.timedOut && outcome.exitCode === 0 && lastMessage) {
     if (!request.schema) {
@@ -2057,7 +2375,7 @@ async function runAttempt(request, paths, attempt, context) {
           state: "done",
           text: lastMessage,
           resultHash: fnv1a(lastMessage),
-          mac: resultMac(context.key, context.runId, request.task, lastMessage),
+          mac: resultMac(context.key, context.runId, request.requestDigest ?? directDigest(request.task), "text", lastMessage),
           provenance,
         },
       };
@@ -2093,7 +2411,7 @@ async function runAttempt(request, paths, attempt, context) {
         state: "done",
         result: parsed,
         resultHash: fnv1a(JSON.stringify(parsed)),
-        mac: resultMac(context.key, context.runId, request.task, JSON.stringify(parsed)),
+        mac: resultMac(context.key, context.runId, request.requestDigest ?? directDigest(request.task), "result", JSON.stringify(parsed)),
         provenance,
       },
     };
@@ -2118,9 +2436,10 @@ async function runAttempt(request, paths, attempt, context) {
       `${classification.message.replace(/; the Codex process tree was stopped$/, "")}; ${outcome.teardown.survivors.length} process(es) of this run could not be stopped: ${outcome.teardown.survivors.join(", ")}`
     );
   } else if (outcome.teardown?.unverified) {
-    classification.message = compact(
-      `${classification.message.replace(/; the Codex process tree was stopped$/, "")}; the stop of the Codex process tree could not be verified (no process table)`
-    );
+    const why = outcome.teardown.possibleLeftovers?.length
+      ? `processes ${outcome.teardown.possibleLeftovers.join(", ")} may be left over from it (their ancestry cannot be proven, so they were not stopped)`
+      : "the stop of the Codex process tree could not be verified (no process table)";
+    classification.message = compact(`${classification.message.replace(/; the Codex process tree was stopped$/, "")}; ${why}`);
   }
   return { done: false, classification, envelope: failureEnvelope(request, context.runId, state, classification, provenance) };
 }
@@ -2158,6 +2477,9 @@ export async function superviseRun(runId) {
     }
   }, TIMING.aliveMs);
   let envelope;
+  // Windows: joining a Job Object before anything is spawned lets the kernel, not PID
+  // bookkeeping, say which processes belong to this run (see "process-tree teardown").
+  let job = process.platform === "win32" && process.env.ULTRACODEX_NO_JOB !== "1" ? startWindowsJob() : null;
   try {
     const clock = makeClock(request);
     const check = () => {
@@ -2183,7 +2505,18 @@ export async function superviseRun(runId) {
       tracked: new Map(), // Windows: pid -> creation time of every descendant seen (identity-checked)
       codexVersion: probeCodexVersion(launcher),
       windowsSandbox: request.hermetic ? readUserWindowsSandbox() : null,
+      job: null,
     };
+    if (job) {
+      if (await job.ready) {
+        context.job = job;
+        log("process tree: Job Object");
+      } else {
+        log(`process tree: no Job Object (${job.reason ?? "unavailable"}); identity-checked fallback`);
+        job.close();
+        job = null;
+      }
+    }
     if (catalog?.models?.length && !catalog.models.some((item) => item.slug === request.model)) {
       envelope = failureEnvelope(request, runId, "failed", {
         kind: "model",
@@ -2229,6 +2562,7 @@ export async function superviseRun(runId) {
     });
   } finally {
     clearInterval(beat);
+    job?.close();
     try {
       slot?.release();
     } catch {
@@ -2257,6 +2591,7 @@ function print(value, pretty = false) {
 // the whole decoded body.
 export const PAGED_THRESHOLD = 24_000;
 export const PAGE_CHARS = 10_000;
+export const MAX_PAGES = 400; // 4 MB of page data: far beyond any real result; the helper refuses more
 
 export function pageBody(envelope) {
   return JSON.stringify(envelope.result !== undefined && envelope.result !== null ? { result: envelope.result } : { text: envelope.text ?? "" });
@@ -2270,8 +2605,8 @@ export function compactEnvelope(envelope) {
   if (envelope.ok !== true || JSON.stringify(envelope).length <= PAGED_THRESHOLD) return envelope;
   const data = pageData(envelope);
   const pages = Math.ceil(data.length / PAGE_CHARS);
-  const hashes = Array.from({ length: pages }, (_, index) => fnv1a(data.slice(index * PAGE_CHARS, (index + 1) * PAGE_CHARS)));
-  const compact = { ...envelope, paged: { pages, chars: data.length, enc: "pct", hashes } };
+  const hashes = pages <= MAX_PAGES ? Array.from({ length: pages }, (_, index) => fnv1a(data.slice(index * PAGE_CHARS, (index + 1) * PAGE_CHARS))) : [];
+  const compact = { ...envelope, paged: { pages, chars: data.length, enc: "pct", hashes, ...(pages > MAX_PAGES ? { tooLarge: true } : {}) } };
   delete compact.result;
   delete compact.text;
   return compact;
@@ -2295,7 +2630,7 @@ export function cmdPage(runId, pageText, { pretty = false } = {}) {
   }
   const data = pageData(envelope);
   const pages = Math.ceil(data.length / PAGE_CHARS);
-  if (!Number.isInteger(page) || page < 1 || page > pages) throw new UsageError(`page must be 1..${pages}`);
+  if (!Number.isInteger(page) || page < 1 || page > Math.min(pages, MAX_PAGES)) throw new UsageError(`page must be 1..${Math.min(pages, MAX_PAGES)}`);
   print({ ultracodex: 1, runId, page, pages, data: data.slice((page - 1) * PAGE_CHARS, page * PAGE_CHARS) }, pretty);
   return 0;
 }
@@ -2325,12 +2660,14 @@ async function readInput(source) {
   return readBoundedFile(source, MAX_TASK_BYTES + MAX_SCHEMA_BYTES + 64 * 1024, "request");
 }
 
+// { raw, requestDigest }: a framed request must be signed (see framedToRaw); a JSON
+// request from the conversation is trusted as it is.
 async function loadRawRequest(options) {
-  if (options.framed) return framedToRaw(parseFramed(await readInput(options.framed)));
+  if (options.framed) return framedToRaw(parseFramed(await readInput(options.framed)), { key: ensureKey() });
   if (!options.request) throw new UsageError("--request FILE|- or --framed FILE|- is required");
   const text = await readInput(options.request);
   try {
-    return JSON.parse(text);
+    return { raw: JSON.parse(text), requestDigest: null };
   } catch (error) {
     throw new RequestError("invalid_request", `request is not valid JSON: ${error.message}`);
   }
@@ -2364,15 +2701,15 @@ function persistRun(request) {
 }
 
 export async function cmdStart(options) {
-  let raw;
+  let loaded;
   try {
-    raw = await loadRawRequest(options);
+    loaded = await loadRawRequest(options);
   } catch (error) {
     if (error instanceof UsageError) throw error;
     print(rejection(error.kind ?? "invalid_request", error.message), options.pretty);
     return 1;
   }
-  return startFromRaw(raw, options);
+  return startFromRaw(loaded.raw, options, { requestDigest: loaded.requestDigest });
 }
 
 export const INBOX_ID_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
@@ -2460,28 +2797,71 @@ export async function cmdPart(uploadArg, indexText, totalText, hashText, options
   }
   const framed = Array.from({ length: total }, (_, part) => readTextSafe(path.join(claimed, `part-${part + 1}`)) ?? "").join("\n");
   fs.rmSync(claimed, { recursive: true, force: true });
-  let raw;
+  let loaded;
   try {
-    raw = framedToRaw(parseFramed(framed, { encoded: true }));
+    loaded = framedToRaw(parseFramed(framed, { encoded: true }), { key: ensureKey() });
   } catch (error) {
     keepRejected(`${uploadId}-frame`, framed);
     print(rejection(error.kind ?? "relay_corruption", error.message, { upload: uploadId }), options.pretty);
     return 1;
   }
-  return startFromRaw(raw, options);
+  return startFromRaw(loaded.raw, options, { requestDigest: loaded.requestDigest });
 }
 
-async function startFromRaw(raw, options) {
+// The line `start` prints for a run, also used when a signed request is uploaded again.
+function startedLine(runId, request, state) {
+  return {
+    ultracodex: 1,
+    runnerVersion: RUNNER_VERSION,
+    ok: null,
+    state: state === "starting" ? "queued" : state ?? "queued",
+    runId,
+    label: request.label,
+    model: request.model,
+    effort: request.effort,
+    tier: request.tier,
+    kind: request.kind,
+    timeoutSec: request.timeoutSec,
+    next: `wait ${runId}`,
+  };
+}
+
+async function startFromRaw(raw, options, { requestDigest = null } = {}) {
   let request;
   try {
-    request = validateRequest(raw, { catalog: loadCatalog() });
+    request = validateRequest(raw, { catalog: loadCatalog(), requestDigest });
   } catch (error) {
     print(rejection(error.kind ?? "invalid_request", error.message), options.pretty);
     return 1;
   }
   const { runId, paths } = persistRun(request);
+  if (requestDigest && request.nonce) {
+    // One run per signed request: a second upload (a retrying relay, or a hijacked one
+    // trying to multiply runs) joins the run the first one started.
+    const marker = path.join(ucxHome(), "nonces", request.nonce);
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    try {
+      fs.writeFileSync(marker, runId, { flag: "wx" });
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      fs.rmSync(paths.dir, { recursive: true, force: true }); // never started
+      let existing = "";
+      for (let attempt = 0; attempt < 50 && !RUN_ID_RE.test(existing); attempt += 1) {
+        existing = (readTextSafe(marker) ?? "").trim();
+        if (!RUN_ID_RE.test(existing)) sleepSync(20);
+      }
+      if (!RUN_ID_RE.test(existing)) {
+        print(rejection("nonce_reused", "this signed request was already uploaded"), options.pretty);
+        return 1;
+      }
+      print(startedLine(existing, request, readJsonSafe(runPaths(existing).state)?.state), options.pretty);
+      return 3;
+    }
+  }
   const supervisor = spawn(process.execPath, [RUNNER_FILE, "supervise", runId], {
-    cwd: ucxHome(), // never the (possibly untrusted) repository: nothing is resolved relative to it
+    // Never the (possibly untrusted) repository, and not the home either: a process's working
+    // directory cannot be deleted on Windows, and nothing is resolved relative to it anyway.
+    cwd: path.dirname(process.execPath),
     detached: true,
     stdio: "ignore",
     windowsHide: true,
@@ -2500,24 +2880,7 @@ async function startFromRaw(raw, options) {
     print(rejection("spawn", `could not start the supervisor: ${spawnFailure.message}`, { runId }), options.pretty);
     return 1;
   }
-  const state = readJsonSafe(paths.state) ?? {};
-  print(
-    {
-      ultracodex: 1,
-      runnerVersion: RUNNER_VERSION,
-      ok: null,
-      state: state.state === "starting" ? "queued" : state.state ?? "queued",
-      runId,
-      label: request.label,
-      model: request.model,
-      effort: request.effort,
-      tier: request.tier,
-      kind: request.kind,
-      timeoutSec: request.timeoutSec,
-      next: `wait ${runId}`,
-    },
-    options.pretty
-  );
+  print(startedLine(runId, request, (readJsonSafe(paths.state) ?? {}).state), options.pretty);
   return 3;
 }
 
@@ -2671,7 +3034,7 @@ export function cmdGc({ olderThanDays = 7, pretty = false } = {}) {
     }
   }
   const inboxes = [];
-  for (const sub of ["inbox", "rejected", "relay-roles"]) {
+  for (const sub of ["inbox", "rejected", "nonces", "relay-roles"]) {
     try {
       const root = path.join(ucxHome(), sub);
       for (const name of fs.readdirSync(root)) {
@@ -2706,6 +3069,21 @@ export function cmdGc({ olderThanDays = 7, pretty = false } = {}) {
   return 0;
 }
 
+// Can this machine put a process into a Job Object (PowerShell + Add-Type)? Without it,
+// teardown uses the identity-checked fallback. Tried on a throwaway process.
+async function probeWindowsJob() {
+  const started = Date.now();
+  const dummy = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
+  const job = startWindowsJob({ pid: dummy.pid });
+  try {
+    const ok = await job.ready;
+    return ok ? { ok: true, ms: Date.now() - started } : { ok: false, reason: job.reason ?? "unavailable", fallback: "identity-checked" };
+  } finally {
+    job.close();
+    dummy.kill();
+  }
+}
+
 export async function cmdPreflight({ live = false, pretty = false } = {}) {
   const report = { ultracodex: 1, runnerVersion: RUNNER_VERSION, ok: false, modelCallMade: false, node: process.version };
   let launcher;
@@ -2733,6 +3111,7 @@ export async function cmdPreflight({ live = false, pretty = false } = {}) {
     report.catalogError = error.message;
   }
   report.windowsSandbox = process.platform === "win32" ? readUserWindowsSandbox() : null;
+  if (process.platform === "win32") report.windowsJob = await probeWindowsJob();
   report.home = ucxHome();
   report.maxConcurrent = maxConcurrent();
   report.policy = policyTable().map(({ tier, kind, model, effort, timeoutSec }) => ({ tier, kind, model, effort, timeoutSec }));
@@ -2775,7 +3154,8 @@ export async function cmdPreflight({ live = false, pretty = false } = {}) {
 export async function cmdDryRun(options) {
   let request;
   try {
-    request = validateRequest(await loadRawRequest(options), { catalog: loadCatalog() });
+    const loaded = await loadRawRequest(options);
+    request = validateRequest(loaded.raw, { catalog: loadCatalog(), requestDigest: loaded.requestDigest });
   } catch (error) {
     if (error instanceof UsageError) throw error;
     print(rejection(error.kind ?? "invalid_request", error.message), options.pretty);
@@ -2905,9 +3285,11 @@ export async function main(argv = process.argv.slice(2)) {
       case "page":
         return cmdPage(id, options.positionals[1], options);
       case "key": {
-        // keyCheck lets the helper catch a key the relay mis-copied
+        // for the Workflow helper's key agent: the key, a fresh nonce for this workflow's
+        // requests, and keyCheck, which catches a mis-copied key or nonce
         const key = ensureKey();
-        print({ ultracodex: 1, runnerVersion: RUNNER_VERSION, ok: true, key, keyCheck: fnv1a(key) }, options.pretty);
+        const nonce = randomBytes(16).toString("hex");
+        print({ ultracodex: 1, runnerVersion: RUNNER_VERSION, ok: true, key, nonce, keyCheck: fnv1a(`${key}:${nonce}`) }, options.pretty);
         return 0;
       }
       case "status":

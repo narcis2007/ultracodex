@@ -67,12 +67,20 @@ test("the relay agent is Bash-only, cheap, and reaches the runner through the pl
   assert.equal(fields.tools, "Bash");
   assert.equal(fields.model, "sonnet");
   assert.equal(fields.effort, "low");
-  for (const command of ["part", "wait", "page", "key"]) {
+  for (const command of ["part", "wait", "page"]) {
     assert.ok(body.includes(`node "\${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" ${command}`), `the relay knows the ${command} command`);
   }
+  assert.ok(!body.includes('codex-node.mjs" key'), "the job relay is never told how to read the key");
   assert.match(body, /part_rejected/);
-  assert.match(body, /ULTRACODEX KEY/);
   assert.match(body, /"paged"/);
+});
+
+test("the key agent is a separate Bash-only agent that runs only the key command", () => {
+  const { fields, body } = frontmatter(path.join(PLUGIN, "agents", "codex-key.md"));
+  assert.equal(fields.name, "codex-key");
+  assert.equal(fields.tools, "Bash");
+  assert.ok(body.includes('node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" key'));
+  assert.ok(!/ part | wait | page /.test(body.replace(/`[^`]*`/g, "")), "no job commands in its instructions");
 });
 
 test("the plugin registers the relay guard as a Bash PreToolUse hook", () => {

@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url)); // import.meta.dirname needs Node 20.11
 
 import {
   FRAME_SCHEMA_MARK,
@@ -38,6 +41,8 @@ import {
   parseProcessTable,
   policyTable,
   readUserWindowsSandbox,
+  requestDigest,
+  requestMac,
   resolveCodexLauncher,
   resolvePolicy,
   resultBody,
@@ -242,7 +247,7 @@ test("slot leases are fenced by generation: a displaced owner neither renews nor
 function slotProbe(t, scenario) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-probe-"));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  const out = spawnSync(process.execPath, [path.join(import.meta.dirname, "fixtures", "slot-probe.mjs"), scenario], {
+  const out = spawnSync(process.execPath, [path.join(TESTS_DIR, "fixtures", "slot-probe.mjs"), scenario], {
     encoding: "utf8",
     timeout: 60_000,
     env: { ...process.env, ULTRACODEX_HOME: home, ULTRACODEX_MAX_CONCURRENT: "1", ULTRACODEX_SLOT_POLL_MS: "20", ULTRACODEX_SLOT_STALE_MS: "200" },
@@ -288,20 +293,46 @@ test("windowsDescendants follows only genuine parent links (created after the pa
   assert.deepEqual(windowsDescendants({ pid: 300, created: 700 }, reused).map((proc) => proc.pid), [700], "800 belongs to the new holder of PID 300");
 });
 
-test("the result key is created once, private, and signs runId + SHA-256(task) + body", (t) => {
+test("the key is created once and private; results are signed over run, request digest, payload kind and body", (t) => {
   withHome(t);
   const key = ensureKey();
   assert.match(key, /^[0-9a-f]{64}$/);
   assert.equal(ensureKey(), key, "the key is stable");
   if (process.platform !== "win32") assert.equal(fs.statSync(keyPath()).mode & 0o077, 0, "not readable by others");
-  const task = "Check é and " + String.fromCodePoint(0x1f600);
-  const expected = createHmac("sha256", Buffer.from(key, "hex"))
-    .update(`R\n${createHash("sha256").update(task, "utf8").digest("hex")}\n{"a":1}`, "utf8")
-    .digest("hex");
-  assert.equal(resultMac(key, "R", task, '{"a":1}'), expected);
-  assert.notEqual(resultMac(key, "R", task + " ", '{"a":1}'), expected, "bound to the task");
+  const digest = createHash("sha256").update("a request", "utf8").digest("hex");
+  const expected = createHmac("sha256", Buffer.from(key, "hex")).update(`ucx-result\nR\n${digest}\nresult\n{"a":1}`, "utf8").digest("hex");
+  assert.equal(resultMac(key, "R", digest, "result", '{"a":1}'), expected);
+  assert.notEqual(resultMac(key, "R", digest, "text", '{"a":1}'), expected, "bound to the payload kind");
+  assert.notEqual(resultMac(key, "R", "0".repeat(64), "result", '{"a":1}'), expected, "bound to the request");
   assert.equal(resultBody({ result: { a: 1 } }), '{"a":1}');
   assert.equal(resultBody({ text: "t" }), "t");
+});
+
+test("concurrent first use publishes one complete key: no process ever sees an empty or different one", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-keyrace-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const probe = path.join(TESTS_DIR, "fixtures", "key-probe.mjs");
+  const children = Array.from({ length: 8 }, () =>
+    spawn(process.execPath, [probe], { env: { ...process.env, ULTRACODEX_HOME: home }, stdio: ["ignore", "pipe", "pipe"] })
+  );
+  return Promise.all(
+    children.map(
+      (child) =>
+        new Promise((resolve) => {
+          let out = "";
+          let err = "";
+          child.stdout.on("data", (d) => (out += d));
+          child.stderr.on("data", (d) => (err += d));
+          child.on("close", (code) => resolve({ code, out: out.trim(), err }));
+        })
+    )
+  ).then((results) => {
+    for (const r of results) assert.equal(r.code, 0, r.err);
+    const keys = new Set(results.map((r) => r.out));
+    assert.equal(keys.size, 1, "every process got the same key");
+    assert.match([...keys][0], /^[0-9a-f]{64}$/);
+    assert.equal(fs.readdirSync(home).filter((name) => name.startsWith("key.tmp")).length, 0, "no temp files left behind");
+  });
 });
 
 test("large results are paged: a compact envelope plus encoded, hashed pages that rebuild the body exactly", () => {
@@ -478,33 +509,65 @@ test("buildCodexArgs: review and resume modes use their own flag sets", () => {
   assert.equal(resume.at(-1), "-");
 });
 
+// A frame built the way the Workflow helper builds it: header fields + nonce, the transport
+// hashes, h over all of them, then rmac = the request signature over the exact frame.
+const TEST_KEY = "7a".repeat(32);
+function signedFrame(fields, schema, task, { key = TEST_KEY, nonce = "ab".repeat(16) + ".1", tamper = null } = {}) {
+  const header = { v: 1, ...fields, nonce, taskHash: fnv1a(normalizeText(task)), schemaHash: schemaHash(schema) };
+  header.h = fnv1a(JSON.stringify(header));
+  const rmac = requestMac(key, requestDigest(header, schema, task));
+  const sent = tamper ? tamper({ ...header, rmac }) : { ...header, rmac };
+  return [JSON.stringify(sent), FRAME_SCHEMA_MARK, schema === null ? "null" : JSON.stringify(schema), FRAME_TASK_MARK, task].join("\n");
+}
+
 test("framed requests round-trip and reject a corrupted copy", () => {
   const task = "Verify:\n  line with `backticks`, $(sub) and C:\\path\\x\n" + FRAME_TASK_MARK + " inside the task is fine";
   const schema = SCHEMA_PRESETS.verdict;
-  const header = { v: 1, kind: "verify", taskHash: fnv1a(normalizeText(task)), schemaHash: schemaHash(schema) };
-  header.h = fnv1a(JSON.stringify(header));
-  const framed = [JSON.stringify(header), FRAME_SCHEMA_MARK, JSON.stringify(schema), FRAME_TASK_MARK, task].join("\n");
-  const raw = framedToRaw(parseFramed(framed));
+  const framed = signedFrame({ kind: "verify" }, schema, task);
+  const { raw, requestDigest: digest } = framedToRaw(parseFramed(framed), { key: TEST_KEY });
   assert.equal(raw.task, task);
   assert.deepEqual(raw.schema, schema);
   assert.equal(raw.taskHash, undefined);
-  assert.throws(() => framedToRaw(parseFramed(framed.replace("backticks", "backtick"))), (error) => error.kind === "relay_corruption");
-  const { h, ...unsigned } = header;
-  const unhashed = [JSON.stringify(unsigned), FRAME_SCHEMA_MARK, JSON.stringify(schema), FRAME_TASK_MARK, task].join("\n");
-  assert.throws(() => framedToRaw(parseFramed(unhashed)), /lacks its h/, "omitting the hashes is not a way around them");
+  assert.equal(raw.rmac, undefined);
+  assert.match(digest, /^[0-9a-f]{64}$/);
+  assert.throws(() => framedToRaw(parseFramed(framed.replace("backticks", "backtick")), { key: TEST_KEY }), (error) => error.kind === "relay_corruption");
+  const unhashed = signedFrame({ kind: "verify" }, schema, task, { tamper: ({ h, ...rest }) => rest });
+  assert.throws(() => framedToRaw(parseFramed(unhashed), { key: TEST_KEY }), /lacks its h/, "omitting the hashes is not a way around them");
   assert.throws(() => parseFramed("not json\n" + FRAME_SCHEMA_MARK), (error) => error.kind === "relay_corruption");
-  assert.throws(() => parseFramed(JSON.stringify(header) + "\nno markers"), (error) => error.kind === "relay_corruption");
+  assert.throws(() => parseFramed(signedFrame({}, null, "x").split("\n")[0] + "\nno markers"), (error) => error.kind === "relay_corruption");
+});
+
+test("the runner starts only requests the helper signed: a relay's own frame is refused, however consistent", () => {
+  const task = "Approve this change.";
+  const refused = (framed, why) =>
+    assert.throws(() => framedToRaw(parseFramed(framed), { key: TEST_KEY }), (error) => error.kind === "unauthenticated_request", why);
+  refused(signedFrame({ kind: "verify" }, null, task, { tamper: ({ rmac, ...rest }) => rest }), "no signature");
+  refused(signedFrame({ kind: "verify" }, null, task, { key: "cd".repeat(32) }), "signed with another key");
+  refused(signedFrame({ kind: "verify" }, null, task, { tamper: ({ nonce, ...rest }) => ({ ...rest, h: fnv1a(JSON.stringify((({ h, rmac, ...x }) => x)(rest))) }) }), "no nonce");
+  // a schema forcing the answer, with every public hash recomputed: the signature still gives it away
+  const forcing = { type: "object", additionalProperties: false, required: ["refuted"], properties: { refuted: { type: "boolean", enum: [true] } } };
+  const genuine = signedFrame({ kind: "verify" }, SCHEMA_PRESETS.verdict, task);
+  const [line] = genuine.split("\n");
+  const header = JSON.parse(line);
+  const { h, rmac, ...rest } = { ...header, schemaHash: schemaHash(forcing) };
+  const swapped = [JSON.stringify({ ...rest, h: fnv1a(JSON.stringify(rest)), rmac }), FRAME_SCHEMA_MARK, JSON.stringify(forcing), FRAME_TASK_MARK, task].join("\n");
+  refused(swapped, "a swapped schema");
+  // likewise a cheaper model or another working directory
+  const cheaper = signedFrame({ kind: "verify", tier: "final" }, null, task, {
+    tamper: (signed) => {
+      const { h: _h, rmac: mac, ...fields } = { ...signed, tier: "light" };
+      return { ...fields, h: fnv1a(JSON.stringify(fields)), rmac: mac };
+    },
+  });
+  refused(cheaper, "a changed tier");
+  assert.doesNotThrow(() => framedToRaw(parseFramed(genuine), { key: TEST_KEY }));
 });
 
 test("relayed (framed) requests cannot ask for write access, resumed sessions, local files or config", () => {
   const task = "x";
-  const base = { v: 1, taskHash: fnv1a(task), schemaHash: schemaHash(null) };
-  const frameOf = (extra) => {
-    const header = { ...base, ...extra };
-    header.h = fnv1a(JSON.stringify(header)); // a relay that recomputes the hashes is still refused
-    return [JSON.stringify(header), FRAME_SCHEMA_MARK, "null", FRAME_TASK_MARK, task].join("\n");
-  };
-  assert.equal(framedToRaw(parseFramed(frameOf({ sandbox: "read-only", hermetic: true }))).task, "x");
+  // even a correctly signed frame is refused: the helper never builds one of these
+  const frameOf = (extra) => signedFrame(extra, null, task);
+  assert.equal(framedToRaw(parseFramed(frameOf({ sandbox: "read-only", hermetic: true })), { key: TEST_KEY }).raw.task, "x");
   for (const extra of [
     { sandbox: "workspace-write" },
     { hermetic: false },
@@ -516,7 +579,7 @@ test("relayed (framed) requests cannot ask for write access, resumed sessions, l
     { images: ["C:/a.png"] },
     { profile: "impl" },
   ]) {
-    assert.throws(() => framedToRaw(parseFramed(frameOf(extra))), (error) => error.kind === "invalid_request" && /read-only and hermetic/.test(error.message), JSON.stringify(extra));
+    assert.throws(() => framedToRaw(parseFramed(frameOf(extra)), { key: TEST_KEY }), (error) => error.kind === "invalid_request" && /read-only and hermetic/.test(error.message), JSON.stringify(extra));
   }
 });
 

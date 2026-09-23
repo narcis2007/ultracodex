@@ -79,6 +79,31 @@ review):
   replies are validated before they reach another relay's prompt; workflow nodes get a 15-minute
   orphan window; the user's Windows sandbox is read from any TOML form of `[windows]`.
 
+**Round 4 — after the astra@max final gate of round 3** (code + security lenses: 21 findings,
+20 confirmed by Claude triage, "do not ship"):
+- Windows teardown on a **Job Object**: the supervisor joins a fresh job before it spawns
+  Codex, and stopping terminates exactly the job's members through handles checked to be in
+  the job — an orphan whose parent exited is stopped too, and no PID lookup can reach another
+  session's process. Fallback without a job: kills only through handles pinned before the
+  identity check, attributes children only through pinned parents, reports what it cannot
+  prove (`possibleLeftovers`) instead of killing it. The dead-parent ancestry inference and
+  bare-PID `taskkill` are gone. `preflight` reports `windowsJob`.
+- **Signed requests**: the helper signs every request (`rmac` over the exact header — model,
+  effort, tier, cwd, schema preset, nonce — the schema and the task); the runner starts no
+  relayed job without it, and each nonce starts one run. This closes the path where a hijacked
+  relay started a job of its own asking Codex to read the key and sign a forgery, and the
+  schema/model/cwd swaps behind public checksums.
+- Results are signed over the run, the full request digest and the payload kind: no replay of
+  an older run of the same task, no result/text type confusion returning unsigned text.
+- The key comes from a separate `ultracodex:codex-key` agent type; the guard gives job relays
+  no way to read it (roles are decided by agent type, not by a relay's first command).
+- Fail closed: a failed escalation leaves contested findings unresolved (needs-info) and the
+  review incomplete; a failed final gate marks cross-review incomplete; page counts are
+  bounded before anything is allocated; a node can no longer throw into the workflow.
+- Lease release and reclaim move only the caller's own (or the judged-stale) generation, never
+  another owner's slot; the key is published atomically (temp file + hard link); supervisors
+  never work inside the home; `fast: true` puts a workflow's astra nodes on the priority tier.
+
 ## 0.2.1 — 2026-07-10 (fork)
 
 Correctness fixes from a cross-model review; runtime self-test.

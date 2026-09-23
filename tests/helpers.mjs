@@ -13,7 +13,37 @@ export const FAKE_CODEX = path.join(ROOT, "tests", "fixtures", "fake-codex.mjs")
 
 export function makeHome(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-test-"));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  // a supervisor (or its job helper) may still be exiting when a test ends: retry briefly
+  t.after(async () => {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      try {
+        fs.rmSync(home, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        if (!["EPERM", "EBUSY", "ENOTEMPTY"].includes(error.code)) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
+    try {
+      fs.rmSync(home, { recursive: true, force: true });
+    } catch (error) {
+      const left = [];
+      const walk = (dir) => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          left.push(path.relative(home, full));
+          if (entry.isDirectory()) walk(full);
+        }
+      };
+      try {
+        walk(home);
+      } catch {
+        // partially gone
+      }
+      error.message += ` — still present: ${left.join(", ") || "(only the directory itself)"}`;
+      throw error;
+    }
+  });
   return home;
 }
 

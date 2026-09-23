@@ -108,11 +108,12 @@ Presets: `verdict`, `score`, `review`, `implement`.
 
 What the helper guarantees (keep it intact):
 
-1. **Relay, not solver — and signed.** Each node runs through the `ultracodex:codex-relay`
-   agent (Bash only, confined by the plugin's relay guard to the runner's own commands).
-   Every result is signed by the runner (HMAC under a per-machine key, bound to the task);
-   unsigned or foreign results are refused (`unauthenticated_result`, `relay_mismatch`,
-   `no_provenance`), so a relay prompt-injected by reviewed content cannot fake a verdict.
+1. **Relay, not solver — and signed both ways.** Each node runs through the
+   `ultracodex:codex-relay` agent (Bash only, confined by the plugin's relay guard to the
+   runner's own commands). The helper signs every request (the runner starts nothing a relay
+   composed itself) and accepts only results the runner signed for that very request; the
+   key comes from a separate `ultracodex:codex-key` agent, so no job relay ever holds it. A
+   relay prompt-injected by reviewed content cannot fake, replay or retarget a verdict.
 2. **Byte-exact transport, both ways.** Requests are normalized, percent-encoded (no quote,
    backslash or control character reaches a Bash command), sent in ≤1.6 KB parts with per-part
    hashes (the Windows command line breaks near 8 KB) and verified by the runner; results come
@@ -120,8 +121,9 @@ What the helper guarantees (keep it intact):
    a rejected relay call is a failed node, never a vanished one.
 3. **Nothing blocks.** Codex runs detached under the runner's supervisor, which owns the
    deadline (model × effort × kind, scaled for batches) and tears down only the process tree
-   it started. Every `wait` returns within two minutes. A workflow node nobody polls for
-   15 min gets its run torn down (`abandoned`).
+   it started (on Windows: exactly the members of the run's Job Object). Every `wait` returns
+   within two minutes. A workflow node nobody polls for 15 min gets its run torn down
+   (`abandoned`).
 4. **Capped.** 4 Codex jobs per workflow (astra counts 2) and 4 machine-wide by default.
 5. **Fail closed.** Partition with `ucxPartition`; a dead node is `unverified`; return
    `status: 'incomplete'` when a required node failed.

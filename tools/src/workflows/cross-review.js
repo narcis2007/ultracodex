@@ -1,7 +1,7 @@
 export const meta = {
   name: 'cross-review',
   description: 'Claude finds issues per dimension, Codex (GPT) adversarially verifies each against the code (sol@xhigh, then one astra@max gate on the confirmed high/critical ones), Claude writes the report. Fails closed.',
-  whenToUse: 'Review a change with a second model family refuting the findings. args: { target, cwd, dimensions, verifyTier: daily|final, finalGate, context, lessons, batch }',
+  whenToUse: 'Review a change with a second model family refuting the findings. args: { target, cwd, dimensions, verifyTier: daily|final, finalGate, fast, context, lessons, batch }',
   phases: [
     { title: 'Find', detail: 'one Claude finder per dimension' },
     { title: 'Verify', detail: 'Codex refutes each finding (sol@xhigh, or astra@max when verifyTier is final)' },
@@ -22,6 +22,8 @@ const VERIFY_TIER = A.verifyTier === 'final' ? 'final' : 'daily'
 // Cascade, astra last: sol verifies everything; astra re-checks only what would block a
 // merge (confirmed high/critical), all in one run. Off with finalGate: false.
 const FINAL_GATE = VERIFY_TIER === 'daily' && A.finalGate !== false
+// fast: true → the Fast service tier for the astra nodes only (more usage, less waiting)
+const FAST = A.fast === true ? { serviceTier: 'priority' } : {}
 const GATE_SEVERITIES = ['critical', 'high']
 const BATCH = A.batch !== false
 const CONTEXT = A.context ? '\nCONTEXT FROM THE OWNER:\n' + A.context : ''
@@ -68,7 +70,7 @@ const results = await pipeline(
       if (BATCH) {
         const batch = await codexBatchNode(VERIFY_INSTRUCTION,
           findings.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, detail: f.detail, failure_scenario: f.failure_scenario })),
-          { tier: VERIFY_TIER, kind: 'verify', cwd: CWD || undefined, label: 'codex:' + d, phase: 'Verify' })
+          { tier: VERIFY_TIER, kind: 'verify', cwd: CWD || undefined, label: 'codex:' + d, phase: 'Verify', ...(VERIFY_TIER === 'final' ? FAST : {}) })
         return {
           dimension: d, failed: null,
           findings: findings.map(f => ({
@@ -81,7 +83,7 @@ const results = await pipeline(
       }
       const verified = await parallel(findings.map(f => () =>
         codexNode(VERIFY_INSTRUCTION + '\nFINDING (JSON):\n' + JSON.stringify(f),
-          { schemaPreset: 'verdict', tier: VERIFY_TIER, kind: 'verify', cwd: CWD || undefined, label: 'codex:' + f.id, phase: 'Verify' })
+          { schemaPreset: 'verdict', tier: VERIFY_TIER, kind: 'verify', cwd: CWD || undefined, label: 'codex:' + f.id, phase: 'Verify', ...(VERIFY_TIER === 'final' ? FAST : {}) })
           .then(v => ({ ...f, verdict: v }))))
       return { dimension: d, failed: null, findings: findings.map((f, i) => verified[i] || { ...f, verdict: ucxError('stage_failed', 'verification of ' + f.id + ' failed') }) }
     } catch (e) {
@@ -101,7 +103,7 @@ if (part.unverified.length) log('⚠ ' + part.unverified.length + '/' + all.leng
 
 // Final gate: every confirmed high/critical finding gets astra's verdict too. Agreement
 // keeps it confirmed; an astra refutation makes it DISPUTED (the owner decides, it is never
-// silently dropped); a gate that fails leaves sol's verdict standing, marked as not gated.
+// silently dropped); a gate that fails leaves sol's verdict standing, marked, and the review incomplete.
 let confirmed = part.confirmed
 const disputed = []
 const gate = { ran: false, checked: 0, upheld: 0, disputed: 0, failed: 0 }
@@ -110,9 +112,14 @@ if (gated.length) {
   phase('Final gate')
   gate.ran = true
   gate.checked = gated.length
-  const batch = await codexBatchNode(VERIFY_INSTRUCTION + '\nA first verifier could not refute these; they would block a merge. Be the final, strictest check.',
-    gated.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, detail: f.detail, failure_scenario: f.failure_scenario })),
-    { tier: 'final', kind: 'verify', cwd: CWD || undefined, label: 'codex:final-gate', phase: 'Final gate' })
+  let batch
+  try {
+    batch = await codexBatchNode(VERIFY_INSTRUCTION + '\nA first verifier could not refute these; they would block a merge. Be the final, strictest check.',
+      gated.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, detail: f.detail, failure_scenario: f.failure_scenario })),
+      { tier: 'final', kind: 'verify', cwd: CWD || undefined, label: 'codex:final-gate', phase: 'Final gate', ...FAST })
+  } catch (e) {
+    batch = ucxError('stage_failed', 'the final gate failed: ' + String((e && e.message) || e))
+  }
   const gateOf = f => isCodexError(batch) ? batch
     : batch.ambiguous.includes(f.id) ? ucxError('ambiguous_verdict', 'astra answered ' + f.id + ' more than once')
       : (batch.byId.get(f.id) || ucxError('missing_from_batch', 'astra returned no verdict for ' + f.id))
@@ -124,13 +131,14 @@ if (gated.length) {
     gate.upheld++
     return { ...f, finalGate: v }
   }).filter(Boolean)
-  if (gate.failed) log('⚠ the astra final gate could not check ' + gate.failed + '/' + gated.length + ' findings — sol\'s verdict stands for them')
+  if (gate.failed) log('⚠ the astra final gate could not check ' + gate.failed + '/' + gated.length + ' findings — they stay confirmed on sol\'s verdict and the review is INCOMPLETE')
   if (gate.disputed) log('⚠ ' + gate.disputed + ' finding(s) DISPUTED: sol confirmed, astra refuted')
 }
 
 phase('Synthesize')
 const report = await agent(`Write a code-review report for ${TARGET}${WHERE}.
 ${failedDims.length ? 'At the very top, state that these dimensions were NOT reviewed (their finder failed): ' + JSON.stringify(failedDims.map(x => ({ dimension: x.dimension, why: x.failed }))) : ''}
+${gate.failed ? 'At the top, state that the gpt-6-astra final gate FAILED for ' + gate.failed + ' finding(s) (those with finalGate.error): they are confirmed by gpt-6-sol only, and the review is incomplete.' : ''}
 CONFIRMED findings (a second model family could not refute them; finalGate, when present, is gpt-6-astra's verdict on top of gpt-6-sol's) — rank by severity, give file:line, the failure scenario and a fix:
 ${JSON.stringify(confirmed)}
 ${disputed.length ? 'DISPUTED findings (gpt-6-sol confirmed them, the gpt-6-astra final gate refuted them — present both reasonings and say the owner must decide):\n' + JSON.stringify(disputed.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, severity: f.severity, sol: f.verdict.reasoning, astra: f.finalGate.reasoning }))) : ''}
@@ -139,7 +147,8 @@ ${JSON.stringify(part.unverified.map(f => ({ id: f.id, title: f.title, file: f.f
 REFUTED count: ${part.refuted.length} (list their titles briefly at the end).`, { label: 'synthesize', phase: 'Synthesize' })
 
 return {
-  status: failedDims.length || part.status === 'incomplete' ? 'incomplete' : 'complete',
+  // an enabled final gate that could not check every blocking finding leaves the review incomplete
+  status: failedDims.length || part.status === 'incomplete' || gate.failed ? 'incomplete' : 'complete',
   failedDimensions: failedDims.map(x => ({ dimension: x.dimension, why: x.failed })),
   report,
   confirmed,

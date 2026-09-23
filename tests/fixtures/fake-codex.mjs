@@ -115,10 +115,25 @@ if (apiError) {
 const stderrText = directive("STDERR");
 if (stderrText) process.stderr.write(stderrText.replace(/\\n/g, "\n") + "\n");
 
+// Children behave like a native codex.exe's: on Windows they are not in this process's
+// own libuv job (which would kill them with it), so only the runner's teardown can stop
+// them. They end by themselves after two minutes, so a failing test never leaks for long.
+const onWindows = process.platform === "win32";
+const LINGER = "setTimeout(() => {}, 120000)";
 const pidFile = directive("SPAWN_CHILD");
 if (pidFile) {
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const child = spawn(process.execPath, ["-e", LINGER], { stdio: "ignore", detached: onWindows });
+  if (onWindows) child.unref();
   fs.writeFileSync(pidFile, String(child.pid));
+}
+
+// A shell that starts a background process and exits at once: the survivor's parent is
+// gone, the case a snapshot of the tree can never attribute.
+const orphanFile = directive("SPAWN_ORPHAN");
+if (orphanFile) {
+  const shell = `const { spawn } = require("child_process"); const g = spawn(process.execPath, ["-e", ${JSON.stringify(LINGER)}], { stdio: "ignore", detached: true }); require("fs").writeFileSync(${JSON.stringify(orphanFile)}, String(g.pid)); g.unref(); setTimeout(() => process.exit(0), 300);`;
+  const intermediate = spawn(process.execPath, ["-e", shell], { stdio: "ignore", detached: onWindows });
+  if (onWindows) intermediate.unref();
 }
 
 if (directive("IGNORE_TERM") === "1") process.on("SIGTERM", () => {});

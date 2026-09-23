@@ -66,7 +66,9 @@ implementations 30–60 min. Override with `timeoutSec` when a job legitimately 
 ## Speed tier
 
 The catalog offers a "Fast" service tier (astra 2× speed with more usage consumed, sol/luna
-1.5×). Pass `serviceTier: 'priority'` only for an urgent final gate; it is off by default.
+1.5×). Pass `serviceTier: 'priority'` (a request field, or a `codexNode` option) only for an
+urgent final gate; it is off by default. The shipped workflows take `fast: true`, which puts
+only their astra nodes on it.
 
 ## Checking the catalog
 
