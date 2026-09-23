@@ -84,7 +84,7 @@ function receive(prompt) {
     }
   }
   const framed = parts.map((part) => part.join("\n")).join("\n");
-  const raw = framedToRaw(parseFramed(framed));
+  const raw = framedToRaw(parseFramed(framed, { encoded: true }));
   return { request: validateRequest(raw, { catalog: CATALOG }), parts: parts.length, delimiter };
 }
 

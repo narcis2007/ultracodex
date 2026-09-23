@@ -319,12 +319,16 @@ test("framed requests round-trip and reject a corrupted copy", () => {
   const task = "Verify:\n  line with `backticks`, $(sub) and C:\\path\\x\n" + FRAME_TASK_MARK + " inside the task is fine";
   const schema = SCHEMA_PRESETS.verdict;
   const header = { v: 1, kind: "verify", taskHash: fnv1a(normalizeText(task)), schemaHash: schemaHash(schema) };
+  header.h = fnv1a(JSON.stringify(header));
   const framed = [JSON.stringify(header), FRAME_SCHEMA_MARK, JSON.stringify(schema), FRAME_TASK_MARK, task].join("\n");
   const raw = framedToRaw(parseFramed(framed));
   assert.equal(raw.task, task);
   assert.deepEqual(raw.schema, schema);
   assert.equal(raw.taskHash, undefined);
   assert.throws(() => framedToRaw(parseFramed(framed.replace("backticks", "backtick"))), (error) => error.kind === "relay_corruption");
+  const { h, ...unsigned } = header;
+  const unhashed = [JSON.stringify(unsigned), FRAME_SCHEMA_MARK, JSON.stringify(schema), FRAME_TASK_MARK, task].join("\n");
+  assert.throws(() => framedToRaw(parseFramed(unhashed)), /lacks its h/, "omitting the hashes is not a way around them");
   assert.throws(() => parseFramed("not json\n" + FRAME_SCHEMA_MARK), (error) => error.kind === "relay_corruption");
   assert.throws(() => parseFramed(JSON.stringify(header) + "\nno markers"), (error) => error.kind === "relay_corruption");
 });
@@ -332,7 +336,11 @@ test("framed requests round-trip and reject a corrupted copy", () => {
 test("relayed (framed) requests cannot ask for write access, resumed sessions, local files or config", () => {
   const task = "x";
   const base = { v: 1, taskHash: fnv1a(task), schemaHash: schemaHash(null) };
-  const frameOf = (extra) => [JSON.stringify({ ...base, ...extra }), FRAME_SCHEMA_MARK, "null", FRAME_TASK_MARK, task].join("\n");
+  const frameOf = (extra) => {
+    const header = { ...base, ...extra };
+    header.h = fnv1a(JSON.stringify(header)); // a relay that recomputes the hashes is still refused
+    return [JSON.stringify(header), FRAME_SCHEMA_MARK, "null", FRAME_TASK_MARK, task].join("\n");
+  };
   assert.equal(framedToRaw(parseFramed(frameOf({ sandbox: "read-only", hermetic: true }))).task, "x");
   for (const extra of [
     { sandbox: "workspace-write" },

@@ -220,7 +220,8 @@ function codexNode(task, opts = {}) {
 
   const frame = [JSON.stringify(header), '---ULTRACODEX-SCHEMA---', schema ? JSON.stringify(schema) : 'null',
     '---ULTRACODEX-TASK---', text].join('\n')
-  const lines = ['UCXF1', ...ucxEncode(frame).split('\n').flatMap(ucxWrap)]
+  // No separate marker line: relays tended to drop it. `part` uploads are always encoded.
+  const lines = ucxEncode(frame).split('\n').flatMap(ucxWrap)
   const parts = ucxParts(lines)
   const delim = ucxDelimiter(lines)
   const relayLabel = label || 'codex'
@@ -321,10 +322,14 @@ Rules the helper already enforces — do not work around them:
   Sonnet at low effort). It uploads the request, polls, and returns the runner's JSON line. A
   result without a Codex thread id and token usage is rejected (`no_provenance`), so a relay that
   "answers" by itself cannot pass as Codex.
-- **Byte-exact or rejected.** The request is normalized, percent-encoded (no quote, backslash or
-  control character reaches the relay's Bash command), split into ≤2.4 KB parts (the Windows
-  command line breaks near 8 KB) and hash-checked by the runner. A corrupted copy is rejected
-  (`relay_corruption`) and retried once with a stronger relay.
+- **Byte-exact both ways or rejected.** The request is normalized, percent-encoded (no quote,
+  backslash or control character reaches the relay's Bash command), split into ≤1.6 KB parts with
+  per-part hashes (the Windows command line breaks near 8 KB) and verified by the runner; the
+  runner allocates the upload id. The result comes back with a `resultHash` and the request's
+  `taskHash`: a garbled result is fetched again, a result for another request is refused
+  (`relay_mismatch`).
+- **Nothing vanishes.** A rejected relay call is a `relay_failed` node; the shipped workflows
+  reconcile every requested dimension, lens, finding and candidate, and report what failed.
 - **No slot is held by a blocked call.** Codex runs detached under the runner's supervisor, which
   owns the deadline and stops only the process tree it started. Each `wait` returns within two
   minutes, so the relay never hits the Bash timeout; if the relay stops polling for five minutes

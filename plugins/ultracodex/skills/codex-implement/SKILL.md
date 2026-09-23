@@ -71,7 +71,9 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" wait <runId> --max-wait 9000
 ```
 
 `attached: false` lets the run continue while you do other work; the deadline (sol@max ≈ 90 min,
-astra@max ≈ 135 min) still applies. The background `wait` notifies you when it finishes;
+astra@max ≈ 135 min) still applies. Implementation runs are **never retried automatically**
+(a replay could apply its changes twice): after a transient failure, inspect the worktree and
+resume the session or start a new brief deliberately. The background `wait` notifies you when it finishes;
 `status <runId>` shows progress at any time. Keep at most one or two implementation runs at once
 on this machine, and do not run heavy builds in parallel with them.
 

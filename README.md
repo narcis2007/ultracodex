@@ -89,6 +89,10 @@ Workflow script ──agent({agentType:'ultracodex:codex-relay'})──▶ relay
   MCP servers); the Windows sandbox setting is carried over.
 - **Own processes only.** The supervisor stops only the tree it started (deadline, cancel, or a
   relay that stopped polling). It never touches other Codex sessions.
+- **A confined relay.** A plugin hook lets the relay agent run exactly the runner's `part` and
+  `wait` commands (without permission prompts) and denies anything else, so reviewed content
+  that tries to hijack the relay gets nowhere. Workflow nodes are read-only and hermetic by
+  construction, and writing tasks are never retried automatically.
 
 ## Development
 

@@ -72,6 +72,15 @@ test("the relay agent is Bash-only, cheap, and reaches the runner through the pl
   assert.match(body, /part_rejected/);
 });
 
+test("the plugin registers the relay guard as a Bash PreToolUse hook", () => {
+  const hooks = readJson(path.join(PLUGIN, "hooks", "hooks.json"));
+  const entries = hooks.hooks.PreToolUse;
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].matcher, "Bash");
+  assert.equal(entries[0].hooks[0].command, 'node "${CLAUDE_PLUGIN_ROOT}/scripts/relay-guard.mjs"');
+  assert.ok(fs.existsSync(path.join(PLUGIN, "scripts", "relay-guard.mjs")));
+});
+
 test("shipped files carry no machine-specific paths", () => {
   const offenders = [];
   const walk = (dir) => {

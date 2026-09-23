@@ -166,6 +166,7 @@ test("a framed request from the relay runs; a corrupted copy is rejected before 
   const task = "Check `this` $(and) that\\n with 'quotes'";
   const schema = SCHEMA_PRESETS.verdict;
   const header = { v: 1, tier: "daily", kind: "verify", label: "framed", taskHash: fnv1a(normalizeText(task)), schemaHash: schemaHash(schema) };
+  header.h = fnv1a(JSON.stringify(header));
   const ok = await runCli(["run", "--framed", "-", "--max-wait", "20"], { env, input: frame(header, schema, task) });
   assert.equal(ok.json.state, "done");
   assert.equal(ok.json.provenance.model, "gpt-6-sol");

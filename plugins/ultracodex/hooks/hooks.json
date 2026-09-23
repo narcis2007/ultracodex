@@ -1,0 +1,11 @@
+{
+  "description": "Confines the ultracodex relay agent to the runner's part/wait commands (other agents are unaffected).",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/relay-guard.mjs\"", "timeout": 10 }]
+      }
+    ]
+  }
+}

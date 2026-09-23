@@ -85,9 +85,11 @@ What the helper guarantees (keep it intact):
 
 1. **Relay, not solver.** Each node runs through the `ultracodex:codex-relay` agent (Bash only).
    Results without a Codex thread id + token usage are rejected as `no_provenance`.
-2. **Byte-exact transport.** Requests are normalized, percent-encoded (no quote, backslash or
-   control character reaches a Bash command), sent in ≤2.4 KB parts (the Windows command line
-   breaks near 8 KB) and hash-verified by the runner; a corrupted copy is retried once.
+2. **Byte-exact transport, both ways.** Requests are normalized, percent-encoded (no quote,
+   backslash or control character reaches a Bash command), sent in ≤1.6 KB parts with per-part
+   hashes (the Windows command line breaks near 8 KB) and verified by the runner; results come
+   back with a `resultHash` and the request's `taskHash`. Corrupted copies are resent or
+   re-collected; a rejected relay call is a failed node, never a vanished one.
 3. **Nothing blocks.** Codex runs detached under the runner's supervisor, which owns the
    deadline (model × effort × kind) and tears down only the process tree it started. Every
    `wait` returns within two minutes. A relay that stops polling for 5 min gets its run torn

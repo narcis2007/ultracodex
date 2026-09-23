@@ -194,7 +194,8 @@ function codexNode(task, opts = {}) {
 
   const frame = [JSON.stringify(header), '---ULTRACODEX-SCHEMA---', schema ? JSON.stringify(schema) : 'null',
     '---ULTRACODEX-TASK---', text].join('\n')
-  const lines = ['UCXF1', ...ucxEncode(frame).split('\n').flatMap(ucxWrap)]
+  // No separate marker line: relays tended to drop it. `part` uploads are always encoded.
+  const lines = ucxEncode(frame).split('\n').flatMap(ucxWrap)
   const parts = ucxParts(lines)
   const delim = ucxDelimiter(lines)
   const relayLabel = label || 'codex'

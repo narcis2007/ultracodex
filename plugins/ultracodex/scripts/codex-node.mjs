@@ -91,6 +91,12 @@ export class RequestError extends Error {
 class UsageError extends Error {}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// Races a promise against a timer that is cleared as soon as the race settles, so a
+// finished supervisor never lingers on a pending timer.
+function withTimeout(promise, ms) {
+  let timer;
+  return Promise.race([promise, new Promise((resolve) => (timer = setTimeout(resolve, ms)))]).finally(() => clearTimeout(timer));
+}
 const nowIso = () => new Date().toISOString();
 const clamp = (value, lo, hi) => Math.min(hi, Math.max(lo, value));
 
@@ -881,11 +887,14 @@ export function unwrapEncodedFrame(lines) {
   return logical;
 }
 
-export function parseFramed(text) {
+// `encoded: true` (relay uploads) always percent-decodes; otherwise a leading FRAME_MAGIC
+// line marks an encoded frame and anything else is read as a plain frame.
+export function parseFramed(text, { encoded = false } = {}) {
   let lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
   const magicAt = lines.findIndex((line) => line.trim() !== "");
-  if (magicAt >= 0 && lines[magicAt].trim() === FRAME_MAGIC) {
-    const body = lines.slice(magicAt + 1);
+  const hasMagic = magicAt >= 0 && lines[magicAt].trim() === FRAME_MAGIC;
+  if (encoded || hasMagic) {
+    const body = hasMagic ? lines.slice(magicAt + 1) : lines;
     while (body.length && body.at(-1) === "") body.pop();
     lines = unwrapEncodedFrame(body);
   }
@@ -916,16 +925,21 @@ export function parseFramed(text) {
 }
 
 export function framedToRaw({ header, schema, task }) {
-  if (typeof header.h === "string") {
-    const { h, ...rest } = header;
-    if (fnv1a(JSON.stringify(rest)) !== h) {
-      throw new RequestError("relay_corruption", "request header differs from what the workflow sent (hash mismatch)");
+  // A frame without its integrity fields is never accepted: omitting them must not be
+  // a way around the checks.
+  for (const field of ["h", "taskHash", "schemaHash"]) {
+    if (typeof header[field] !== "string" || !/^[0-9a-f]{8}$/.test(header[field])) {
+      throw new RequestError("relay_corruption", `framed request lacks its ${field}`);
     }
   }
-  if (typeof header.taskHash === "string" && fnv1a(normalizeText(task)) !== header.taskHash) {
+  const { h, ...rest } = header;
+  if (fnv1a(JSON.stringify(rest)) !== h) {
+    throw new RequestError("relay_corruption", "request header differs from what the workflow sent (hash mismatch)");
+  }
+  if (fnv1a(normalizeText(task)) !== header.taskHash) {
     throw new RequestError("relay_corruption", "task text differs from what the workflow sent (hash mismatch)");
   }
-  if (typeof header.schemaHash === "string" && schemaHash(schema) !== header.schemaHash) {
+  if (schemaHash(schema) !== header.schemaHash) {
     throw new RequestError("relay_corruption", "schema differs from what the workflow sent (hash mismatch)");
   }
   // Framed requests come from a relaying model. Whatever it was told, it may only
@@ -1377,6 +1391,10 @@ export async function acquireSlots(weight, runId, shouldStop) {
 
 // ─── process-tree teardown ──────────────────────────────────────────────────
 
+export function windowsTaskkill(env = process.env) {
+  return path.join(env.SystemRoot || env.windir || "C:\\Windows", "System32", "taskkill.exe");
+}
+
 function groupAlive(pid) {
   try {
     process.kill(-pid, 0);
@@ -1393,7 +1411,9 @@ export async function stopOwnedTree(child, { platform = process.platform } = {})
   if (!child?.pid) return;
   if (platform === "win32") {
     if (child.exitCode === null && child.signalCode === null) {
-      spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+      // absolute path: never resolve taskkill through the current directory or PATH,
+      // where a reviewed repository could plant its own taskkill.exe
+      spawnSync(windowsTaskkill(), ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore", cwd: ucxHome() });
     }
     return;
   }
@@ -1658,7 +1678,7 @@ async function runAttempt(request, paths, attempt, context) {
       let stop = null;
       let timedOut = false;
       while (!exited) {
-        await Promise.race([exitedPromise, sleep(TIMING.pollMs)]);
+        await withTimeout(exitedPromise, TIMING.pollMs);
         if (exited) break;
         const suspendedMs = context.clock.tick();
         if (suspendedMs) {
@@ -1670,7 +1690,7 @@ async function runAttempt(request, paths, attempt, context) {
         if (timedOut || stop) {
           appendLine(paths.log, `${nowIso()} stopping codex pid ${child.pid}: ${timedOut ? "deadline" : stop}`);
           await stopOwnedTree(child);
-          await Promise.race([exitedPromise, sleep(10_000)]); // a tree that survives taskkill/SIGKILL is reported, not awaited forever
+          await withTimeout(exitedPromise, 10_000); // a tree that survives taskkill/SIGKILL is reported, not awaited forever
           break;
         }
       }
@@ -2009,7 +2029,7 @@ export async function cmdPart(uploadArg, indexText, totalText, hashText, options
   fs.rmSync(claimed, { recursive: true, force: true });
   let raw;
   try {
-    raw = framedToRaw(parseFramed(framed));
+    raw = framedToRaw(parseFramed(framed, { encoded: true }));
   } catch (error) {
     keepRejected(`${uploadId}-frame`, framed);
     print(rejection(error.kind ?? "relay_corruption", error.message, { upload: uploadId }), options.pretty);
@@ -2028,6 +2048,7 @@ async function startFromRaw(raw, options) {
   }
   const { runId, paths } = persistRun(request);
   const supervisor = spawn(process.execPath, [RUNNER_FILE, "supervise", runId], {
+    cwd: ucxHome(), // never the (possibly untrusted) repository: nothing is resolved relative to it
     detached: true,
     stdio: "ignore",
     windowsHide: true,
@@ -2253,11 +2274,11 @@ export function cmdGc({ olderThanDays = 7, pretty = false } = {}) {
   return 0;
 }
 
-export async function cmdPreflight({ live = false, pretty = false, codexPath = null } = {}) {
+export async function cmdPreflight({ live = false, pretty = false } = {}) {
   const report = { ultracodex: 1, runnerVersion: RUNNER_VERSION, ok: false, modelCallMade: false, node: process.version };
   let launcher;
   try {
-    launcher = resolveCodexLauncher({ explicitPath: codexPath ?? undefined });
+    launcher = resolveCodexLauncher();
   } catch (error) {
     report.error = { kind: "cli_not_found", message: error.message };
     print(report, pretty);
@@ -2330,7 +2351,7 @@ export async function cmdDryRun(options) {
   }
   let launcher = null;
   try {
-    launcher = resolveCodexLauncher({ explicitPath: options.codexPath ?? undefined });
+    launcher = resolveCodexLauncher();
   } catch (error) {
     launcher = { displayPath: null, source: `unresolved: ${error.message}` };
   }
@@ -2390,7 +2411,6 @@ function parseCli(argv) {
     request: null,
     framed: null,
     maxWait: null,
-    codexPath: null,
     schema: null,
     olderThanDays: null,
   };
@@ -2398,7 +2418,6 @@ function parseCli(argv) {
     "--request": "request",
     "--framed": "framed",
     "--max-wait": "maxWait",
-    "--codex-path": "codexPath",
     "--schema": "schema",
     "--older-than-days": "olderThanDays",
   };
@@ -2429,7 +2448,6 @@ export async function main(argv = process.argv.slice(2)) {
   let options;
   try {
     options = parseCli(argv);
-    if (options.codexPath) process.env.ULTRACODEX_CODEX_PATH = options.codexPath;
     const id = options.positionals[0];
     switch (options.command) {
       case "help":

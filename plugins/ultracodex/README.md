@@ -8,6 +8,8 @@ Codex (GPT-6 via `codex exec`) inside Claude Code.
   (adversarial review with triage), `codex-implement` (delegate to Codex in a worktree, verify).
 - **Agent**: `codex-relay` — internal relay for Workflow nodes.
 - **Runner**: `scripts/codex-node.mjs` — run `node scripts/codex-node.mjs help`.
+- **Hook**: `hooks/hooks.json` → `scripts/relay-guard.mjs` — confines the relay agent to the runner's
+  `part`/`wait` commands (no effect on other agents).
 
 Tier policy: `light` → gpt-6-luna@max · `daily` → gpt-6-sol (xhigh verify / max) ·
 `final` → gpt-6-astra@max. See `skills/codex-workflow/references/model-policy.md`.

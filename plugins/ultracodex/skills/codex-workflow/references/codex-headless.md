@@ -13,7 +13,7 @@ shell. Every command prints one JSON line tagged `{"ultracodex":1,...}`; exit co
 | --- | --- |
 | `start --request FILE\|-` | validate a JSON request, persist it, hand it to a detached supervisor; prints `runId` |
 | `start --framed FILE\|-` | same, from a framed request (header line / schema / task) |
-| `part INBOX K N` | relay upload: part K of N of an encoded frame on stdin; the last part starts the run |
+| `part new 1 N HASH` · `part UPLOAD K N HASH` | relay upload: part 1 opens an upload (the runner allocates its id), parts 2..N go to it; a part whose hash differs is refused (`part_rejected`); the last part starts the run |
 | `wait RUN_ID [--max-wait SEC]` | poll up to 110 s (default); prints the final envelope or the running state; refreshes the heartbeat |
 | `run --request FILE` | start + one wait |
 | `status [RUN_ID] [--all]` · `result RUN_ID` | inspect runs (never refresh the heartbeat) |
@@ -26,13 +26,16 @@ Request fields (unknown fields are rejected): `task` or `taskFile`; `schema` / `
 `schemaPreset` (`verdict`, `score`, `review`, `implement`); `cwd`; `sandbox` (`read-only` default,
 `workspace-write`); `tier` (`light`/`daily`/`final`); `kind` (`verify`/`ask`/`review`/`implement`);
 `model`, `effort` (overrides); `hermetic` (default true); `network` (workspace-write only);
-`timeoutSec`; `maxAttempts` (default 2); `attached` (default true — torn down when nobody polls
+`timeoutSec`; `maxAttempts` (default 2 for read-only work, **1 for writing tasks** — workspace-write
+or resume — which may only retry with `replaySafe: true`, since a replay could apply effects
+twice); `attached` (default true — torn down when nobody polls
 for `orphanAfterSec`, default 300); `ephemeral` (default: true except implement/resume);
 `label`; `meta` (echoed back); `serviceTier` (`priority` = Fast); `addDirs`; `images`;
 `profile`; `review: {base|commit|uncommitted, title}`; `resume: {sessionId}`.
 
-Envelope: `ok: true` + `result` (schema) or `text`, and `provenance` {threadId, model, effort,
-tier, mode, sandbox, hermetic, usage, durationMs, attempts, codexVersion, launcher, taskHash}.
+Envelope: `ok: true` + `result` (schema) or `text`, `resultHash` (FNV-1a of the result, so a
+relay's transcription can be verified), and `provenance` {threadId, model, effort, tier, mode,
+sandbox, hermetic, usage, durationMs, attempts, codexVersion, launcher, taskHash}.
 Failures: `ok: false`, `state` (`failed`, `timeout`, `cancelled`, `abandoned`, `rejected`,
 `lost`) and `error` {kind, retryable, message}.
 
@@ -47,6 +50,23 @@ runner refuses `workspace-write`, `hermetic: false`, `network`, `resume`, `taskF
 `addDirs`, `images` and `profile` from a relay, even with valid hashes. Suspend-aware: after a
 sleep the supervisor extends the deadline by the time asleep and pauses abandonment for one
 `orphanAfterSec`; `wait` declares `lost` only after watching the supervisor stay silent.
+
+### The relay guard (plugin hook)
+
+`hooks/hooks.json` registers `scripts/relay-guard.mjs` as a PreToolUse hook. It ignores every
+tool call except those from the `ultracodex:codex-relay` agent (hook input `agent_type`), and
+for the relay it allows exactly two command shapes without a permission prompt —
+`node "<plugin>/scripts/codex-node.mjs" part (new|ucx-…) K N HASH <<'UCX_P…' … UCX_P…` with a
+quote- and backslash-free body, and `… wait <runId>` — and denies everything else. A relay
+that was prompt-injected by reviewed content therefore cannot run other commands, pick another
+executable, or compute the hashes a fabricated result would need. Residual risk: with hooks
+disabled (`disableAllHooks`) the relay keeps its plain Bash tool; results are still bound to
+the helper's own `taskHash` and must carry a matching `resultHash`.
+
+The runner also never resolves executables through the current directory: `taskkill` is called
+by its System32 path and supervisors run with `~/.ultracodex` as their working directory.
+There is no command-line option to replace the Codex binary (only the operator's
+`ULTRACODEX_CODEX_PATH`).
 
 ### Why a supervisor
 

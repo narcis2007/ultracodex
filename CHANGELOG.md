@@ -37,6 +37,21 @@ loop-until-dry.
 
 **Changed**: GPT-5.6 guidance replaced by GPT-6; manifest and marketplace point at this fork.
 
+**Hardened after a final-gate review** (gpt-6-astra@max through the plugin's own
+`codex-review` workflow — code, domain and security lenses — plus an independent Claude
+review):
+- relay guard hook: the relay agent may run only the runner's `part`/`wait` commands;
+- no `--codex-path` CLI option; `taskkill` by absolute path; supervisors never run in the
+  reviewed repository's directory;
+- relayed requests are read-only and hermetic and must carry all their hashes; results carry
+  `resultHash` and are bound to the request's `taskHash`;
+- nothing vanishes: rejected relay/finder/triage/generation calls are failures, and the
+  workflows reconcile every requested dimension, lens, finding and candidate;
+- ambiguous batch answers are unverified; writing tasks are never retried automatically;
+- owner-fenced slot leases with atomic reclaim; cancellation checked before slots and before
+  every spawn; awaited process-tree teardown; runner-allocated upload ids; suspend-aware
+  deadlines and heartbeats.
+
 ## 0.2.1 — 2026-07-10 (fork)
 
 Correctness fixes from a cross-model review; runtime self-test.
