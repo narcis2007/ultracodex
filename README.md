@@ -195,7 +195,7 @@ the default `revalidate: true` the node returns a parsed object; with
 contract:
 
 ```
-codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidate=true, phase, label })
+codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidate=true, phase, label, timeoutMs=1200000 })
   → Promise<parsedObject>   // revalidate:true (default)
   → Promise<string>         // revalidate:false — you JSON.parse it
   → { _codex_error: true }  // on failure
@@ -234,6 +234,12 @@ in [`codex-headless.md`](./plugins/ultracodex/skills/codex-workflow/references/c
 - **Keep codex nodes short.** Each holds a Workflow concurrency slot
   (`min(16, cores−2)`) for Codex's entire runtime while the wrapper idles on a
   blocking Bash call. Read-only verify/judge/small-gen only.
+- **Timeouts must match the effort.** Runtime scales steeply with tier × effort
+  — measured on real tasks, `gpt-5.6-sol` ran ~8 min at `max` and ~14–17 min at
+  `xhigh`/`ultra`. The helper runs every codex node as a background Bash call
+  with a watchdog deadline (`timeoutMs`, default 20 min; `ultra` nodes get 30);
+  a foreground Bash call — 10-minute cap, 2-minute default — would kill
+  high-effort runs mid-flight and fake a `_codex_error`.
 - **Escalate long work.** Minutes-to-hours, parallel, or resumable Codex jobs are
   **not** Pattern A — use a background worker pool or a single-shot handoff
   (described in the skill), never a long node inside a Workflow.

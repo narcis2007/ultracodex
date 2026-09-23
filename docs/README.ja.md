@@ -192,7 +192,7 @@ Workflow スクリプトの JS 本体には **ファイルシステムへのア�
 その契約は次のとおり。
 
 ```
-codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidate=true, phase, label })
+codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidate=true, phase, label, timeoutMs=1200000 })
   → Promise<parsedObject>   // revalidate:true (default)
   → Promise<string>         // revalidate:false — you JSON.parse it
   → { _codex_error: true }  // on failure
@@ -231,6 +231,11 @@ codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidat
 - **codex ノードは短く保つ。** 各ノードは、ラッパーがブロッキングする Bash 呼び出しでアイドル状態に
   なっている間、Codex の全実行時間にわたって Workflow の並行スロット（`min(16, cores−2)`）を 1 つ
   占有する。read-only の verify / judge / 小規模生成のみに使うこと。
+- **タイムアウトは effort に合わせる。** 実行時間は tier × effort に応じて急激に伸びる —
+  実タスクの実測では `gpt-5.6-sol` は `max` で約 8 分、`xhigh`/`ultra` で約 14–17 分かかった。
+  ヘルパーはすべての codex ノードを、ウォッチドッグ期限付きのバックグラウンド Bash 呼び出しとして
+  実行する（`timeoutMs` デフォルト 20 分、`ultra` ノードは 30 分）。フォアグラウンドの Bash 呼び出し
+  （上限 10 分、デフォルト 2 分）では実行途中で kill され、偽の `_codex_error` になってしまう。
 - **長い作業はエスカレートする。** 数分から数時間に及ぶ、並列、あるいは再開可能な Codex ジョブは
   Pattern A では **ない**。バックグラウンドのワーカープール、または単発のハンドオフ（スキル内で説明）を
   使うこと。Workflow 内の長いノードは決して使わない。

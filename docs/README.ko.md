@@ -195,7 +195,7 @@ Workflow 스크립트의 JS 본문에는 **파일시스템 접근 권한이 없�
 텍스트를 중계한다. 계약(contract)은 다음과 같다.
 
 ```
-codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidate=true, phase, label })
+codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidate=true, phase, label, timeoutMs=1200000 })
   → Promise<parsedObject>   // revalidate:true (default)
   → Promise<string>         // revalidate:false — you JSON.parse it
   → { _codex_error: true }  // on failure
@@ -235,6 +235,12 @@ codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidat
 - **codex 노드를 짧게 유지하라.** 각 노드는 Codex의 전체 실행 시간 동안 Workflow
   동시성 슬롯(`min(16, cores−2)`) 하나를 점유하며, 그 사이 래퍼는 블로킹 Bash
   호출에서 유휴 상태로 대기한다. read-only 검증/심사/소규모 생성에만 쓰라.
+- **타임아웃은 effort에 맞춰라.** 실행 시간은 tier × effort에 따라 가파르게
+  늘어난다 — 실제 작업 실측 기준 `gpt-5.6-sol`은 `max`에서 약 8분,
+  `xhigh`/`ultra`에서 약 14–17분이 걸렸다. 헬퍼는 모든 codex 노드를 워치독
+  데드라인이 달린 백그라운드 Bash 호출로 실행한다(`timeoutMs` 기본 20분,
+  `ultra` 노드는 30분). 포그라운드 Bash 호출(상한 10분, 기본 2분)이면 실행
+  도중에 죽어 가짜 `_codex_error`가 된다.
 - **긴 작업은 에스컬레이션하라.** 수 분에서 수 시간이 걸리거나, 병렬이거나, 재개
   가능한 Codex 작업은 Pattern A가 **아니다** — 백그라운드 워커 풀이나 단발성
   핸드오프(스킬에 설명되어 있음)를 쓰고, Workflow 내부에 긴 노드를 두지 말라.

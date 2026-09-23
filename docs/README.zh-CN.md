@@ -175,7 +175,7 @@ true 时用于 `agent()` 的二次校验。在默认的 `revalidate: true` 下�
 在 `revalidate: false` 下，它转发原始 JSON 文本，由调用方自行 `JSON.parse`。契约如下：
 
 ```
-codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidate=true, phase, label })
+codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidate=true, phase, label, timeoutMs=1200000 })
   → Promise<parsedObject>   // revalidate:true (default)
   → Promise<string>         // revalidate:false — you JSON.parse it
   → { _codex_error: true }  // on failure
@@ -211,6 +211,11 @@ codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidat
 - **让 codex 节点保持简短。** 在 Codex 整个运行期间，每个节点都占用一个 Workflow 并发槽
   （`min(16, cores−2)`），与此同时包装则在一次阻塞式 Bash 调用上空转。只用于 read-only 的
   verify/judge/小规模生成。
+- **超时要与 effort 匹配。** 运行时长随 tier × effort 急剧增长——在真实任务上的实测中，
+  `gpt-5.6-sol` 在 `max` 下约 8 分钟，在 `xhigh`/`ultra` 下约 14–17 分钟。helper 把每个
+  codex 节点都作为带看门狗期限的后台 Bash 调用执行（`timeoutMs` 默认 20 分钟，`ultra` 节点为
+  30 分钟）；前台 Bash 调用（上限 10 分钟，默认 2 分钟）会在运行中途把它杀掉，伪造出一个
+  `_codex_error`。
 - **把长任务升级出去。** 耗时数分钟到数小时、需要并行或可恢复的 Codex 作业**不属于** Pattern A
   ——请使用一个后台 worker 池，或一次性的交接（handoff）（在 skill 中有说明），切勿在 Workflow
   内部放一个长节点。
