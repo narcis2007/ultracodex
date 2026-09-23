@@ -97,6 +97,7 @@ npm test           # 50+ offline tests (fake Codex CLI, stubbed workflow runtime
 npm run build      # regenerate plugins/ultracodex/workflows/*.js and the helper block in the docs
 npm run check      # build --check + tests
 npm run preflight
+npm run dev        # Claude Code with this checkout as the plugin (installed copy disabled for that session)
 ```
 
 Sources of the generated files: `tools/src/helper.js` (the `codexNode` helper) and

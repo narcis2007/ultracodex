@@ -8,7 +8,8 @@
     "test": "node --test --test-concurrency=4 \"tests/*.test.mjs\"",
     "build": "node tools/build.mjs",
     "check": "node tools/build.mjs --check && node --test --test-concurrency=4 \"tests/*.test.mjs\"",
-    "preflight": "node plugins/ultracodex/scripts/codex-node.mjs preflight --pretty"
+    "preflight": "node plugins/ultracodex/scripts/codex-node.mjs preflight --pretty",
+    "dev": "claude --plugin-dir plugins/ultracodex --settings tools/dev-settings.json"
   },
   "engines": {
     "node": ">=18"
