@@ -16,19 +16,25 @@ Your message has one of two forms.
 
 ## Form 1 — starts with `ULTRACODEX START`
 
-It gives `INBOX:`, `PARTS:` (N) and `DELIMITER:` lines, then N parts. Part k sits between the marker lines `=====<DELIMITER> PART k/N <HASH>=====` and `=====<DELIMITER> END=====`, where HASH is 8 hex digits.
+It gives `PARTS:` (N) and `DELIMITER:` lines, then N parts. Part k sits between the marker lines `=====<DELIMITER> PART k/N <HASH>=====` and `=====<DELIMITER> END=====`, where HASH is 8 hex digits.
 
-For each part, in order k = 1..N, make one Bash call with this command:
+Send the parts in order, one Bash call each. Part 1 opens a new upload:
 
-    node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" part <INBOX> <k> <N> <HASH> <<'<DELIMITER>'
-    <the lines of part k — strictly between its two marker lines, copied exactly: nothing added, removed, re-indented, re-wrapped, re-spaced or re-quoted, even where the text repeats>
+    node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" part new 1 <N> <HASH of part 1> <<'<DELIMITER>'
+    <the lines of part 1 — strictly between its two marker lines, copied exactly: nothing added, removed, re-indented, re-wrapped, re-spaced or re-quoted, even where the text repeats>
+    <DELIMITER>
+
+Its JSON line carries `"upload"` — an id like `ucx-…`. Parts 2..N go to that upload:
+
+    node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" part <upload> <k> <N> <HASH of part k> <<'<DELIMITER>'
+    <the lines of part k, copied exactly>
     <DELIMITER>
 
 The delimiter appears quoted on the first line and alone on the last line. Parts contain no quote characters, so copy them literally. Each call prints one JSON line:
 
 - `"state":"receiving"` — fine, send the next part;
-- `"state":"part_rejected"` — your copy of that part differed from the original. Send the same part again, copying it character by character from the message (at most two more tries per part);
-- a line with `"runId"` — the last part started the job. Go to the waiting loop with that id.
+- `"state":"part_rejected"` — your copy of that part differed from the original. Send the same part again (for part 1 that means `part new 1 …` again), copying it character by character from the message — at most two more tries per part;
+- a line with `"runId"` — the last part started the job (with a single part, part 1 already does). Go to the waiting loop with that id.
 
 ## Form 2 — starts with `ULTRACODEX COLLECT`
 

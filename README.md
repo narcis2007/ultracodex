@@ -100,6 +100,9 @@ npm run preflight
 npm run dev        # Claude Code with this checkout as the plugin (installed copy disabled for that session)
 ```
 
+Headless end-to-end runs (`claude -p --plugin-dir plugins/ultracodex --settings tools/dev-settings.json …`)
+need `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`, otherwise `claude -p` stops a workflow after 600 s.
+
 Sources of the generated files: `tools/src/helper.js` (the `codexNode` helper) and
 `tools/src/workflows/*.js`. Workflow scripts cannot import modules, so every shipped workflow
 embeds the helper; `npm run build` keeps them identical and a test fails on drift.

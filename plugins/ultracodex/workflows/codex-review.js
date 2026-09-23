@@ -33,7 +33,6 @@ const UCX_KINDS = ['verify', 'ask', 'review']
 const UCX_PRESETS = ['verdict', 'score', 'review', 'implement']
 const UCX_LINE_MAX = 400
 const UCX_PART_MAX = 1600
-let ucxCallCounter = 0
 
 // Same normalization and hash as the runner, so it can prove the relay's copy exact.
 const UCX_TRAILING_SPACE = new RegExp('[ ' + String.fromCharCode(0xa0) + ']+$', 'gm')
@@ -121,16 +120,34 @@ function ucxEnvelope(raw) {
   return null
 }
 
-function ucxUnwrap(env, raw) {
+// The result also travels back through the relay (the model transcribes the runner's
+// line); the runner's resultHash proves it arrived unchanged.
+function ucxResultIntact(env) {
+  if (!env || env.ok !== true) return true
+  if (typeof env.resultHash !== 'string') return false
+  const body = env.result !== undefined && env.result !== null ? JSON.stringify(env.result) : String(env.text ?? '')
+  return ucxHash(body) === env.resultHash
+}
+
+function ucxUnwrap(env, raw, expectedTaskHash) {
+  if (raw && typeof raw === 'object' && raw.__ucxRejected !== undefined) {
+    return ucxError('relay_failed', 'the relay agent call failed: ' + raw.__ucxRejected)
+  }
   if (!env) {
     return raw == null
       ? ucxError('relay_failed', 'the relay agent returned nothing')
       : ucxError('relay_no_envelope', 'relay reply carried no runner line: ' + String(raw).slice(0, 200))
   }
+  if (env.ok === true && !ucxResultIntact(env)) {
+    return ucxError('relay_corruption', 'the result changed on its way back through the relay (hash mismatch)', env.runId, true)
+  }
   if (env.ok === true) {
     const p = env.provenance || {}
     if (!p.threadId || !(p.usage && p.usage.output_tokens > 0)) {
       return ucxError('no_provenance', 'result has no Codex thread id / token usage — not trusted', env.runId)
+    }
+    if (expectedTaskHash && p.taskHash !== expectedTaskHash) {
+      return ucxError('relay_mismatch', 'the result belongs to a different request (taskHash ' + p.taskHash + ')', env.runId)
     }
     const prov = { runId: env.runId, threadId: p.threadId, model: p.model, effort: p.effort, tier: p.tier,
       usage: p.usage, durationMs: p.durationMs, attempts: p.attempts, codexVersion: p.codexVersion }
@@ -184,21 +201,27 @@ function codexNode(task, opts = {}) {
   const lines = ['UCXF1', ...ucxEncode(frame).split('\n').flatMap(ucxWrap)]
   const parts = ucxParts(lines)
   const delim = ucxDelimiter(lines)
-  const inbox = 'ucx-' + ucxHash(frame) + '-' + (++ucxCallCounter)
   const relayLabel = label || 'codex'
   const partHashes = parts.map(p => ucxHash(p.join('\n')))        // the runner refuses a part that differs
-  const startPrompt = inboxId => [
-    'ULTRACODEX START', 'INBOX: ' + inboxId, 'PARTS: ' + parts.length, 'DELIMITER: ' + delim,
-    'For k = 1..' + parts.length + ' run: node <runner> part ' + inboxId + ' k ' + parts.length + ' <hash of part k>' +
-      " <<'" + delim + "' + part k lines + " + delim + ' — resend a part the runner answers with part_rejected.',
+  // The runner allocates the upload id on part 1 ("part new"), so identical requests from
+  // different workflows or sessions can never share (or clear) each other's upload.
+  const startPrompt = [
+    'ULTRACODEX START', 'PARTS: ' + parts.length, 'DELIMITER: ' + delim,
+    'Part 1: node <runner> part new 1 ' + parts.length + ' <hash of part 1> — it prints the upload id.' +
+      ' Parts k = 2..' + parts.length + ': node <runner> part <upload id> k ' + parts.length + ' <hash of part k>.' +
+      " Each with <<'" + delim + "' + the part lines + " + delim + '. Resend a part the runner answers with part_rejected.',
     ...parts.flatMap((p, i) => ['=====' + delim + ' PART ' + (i + 1) + '/' + parts.length + ' ' + partHashes[i] + '=====', ...p, '=====' + delim + ' END=====']),
   ].join('\n')
   const weight = (model || UCX_TIER_MODEL[tier]) === 'gpt-6-astra' ? 2 : 1
+  // agent() may reject (runtime error, exhausted budget): that is a failed node, never a vanished one.
+  const call = async (prompt, callOpts) => {
+    try { return await agent(prompt, callOpts) } catch (e) { return { __ucxRejected: String((e && e.message) || e) } }
+  }
 
   return ucxGate(async () => {
     let raw = null, env = null
     for (let attempt = 0; attempt < 2; attempt++) {                // a corrupted copy is retried once, by a stronger relay
-      raw = await agent(startPrompt(attempt ? inbox + '-r' : inbox), {
+      raw = await call(startPrompt, {
         agentType: UCX_RELAY, label: relayLabel + (attempt ? ':retry' : ''), phase, ...(attempt ? { model: 'opus' } : { effort: 'low' }),
       })
       env = ucxEnvelope(raw)
@@ -209,10 +232,17 @@ function codexNode(task, opts = {}) {
     // The relay stopped while the run is still going: a collector resumes polling
     // (the supervisor tears the run down if nobody polls for orphanAfterSec).
     for (let round = 0; env && env.ok === null && env.runId && round < 3; round++) {
-      raw = await agent('ULTRACODEX COLLECT\nRUN_ID: ' + env.runId, { agentType: UCX_RELAY, label: relayLabel + ':collect', phase, effort: 'low' })
+      raw = await call('ULTRACODEX COLLECT\nRUN_ID: ' + env.runId, { agentType: UCX_RELAY, label: relayLabel + ':collect', phase, effort: 'low' })
       env = ucxEnvelope(raw)
     }
-    return ucxUnwrap(env, raw)
+    // A result garbled on the way back is fetched again (it is stored by the runner).
+    for (let round = 0; env && env.ok === true && env.runId && !ucxResultIntact(env) && round < 2; round++) {
+      raw = await call('ULTRACODEX COLLECT\nRUN_ID: ' + env.runId, {
+        agentType: UCX_RELAY, label: relayLabel + ':recollect', phase, ...(round ? { model: 'opus' } : { effort: 'low' }),
+      })
+      env = ucxEnvelope(raw)
+    }
+    return ucxUnwrap(env, raw, header.taskHash)
   }, weight)
 }
 
@@ -232,13 +262,16 @@ function codexBatchNode(instruction, items, opts = {}) {
   const expected = new Set(ids)
   const task = instruction + '\nReturn EXACTLY one entry per input id in "results" — same ids, no extras, no omissions.\nINPUT ITEMS (JSON):\n' + JSON.stringify(items)
   return codexNode(task, { schema: UCX_BATCH_VERDICTS, ...opts }).then(res => {
-    if (isCodexError(res)) return { ...ucxError(res ? res.kind : 'relay_failed', res ? res.message : ''), missing: ids }
+    if (isCodexError(res)) return { ...ucxError(res ? res.kind : 'relay_failed', res ? res.message : ''), missing: ids, byId: new Map(), ambiguous: [], complete: false }
     const out = Array.isArray(res.results) ? res.results : []
-    const got = new Set(out.map(r => String(r.id)))
-    const missing = ids.filter(id => !got.has(id))
-    const extras = out.map(r => String(r.id)).filter(id => !expected.has(id))
-    const byId = new Map(out.filter(r => expected.has(String(r.id))).map(r => [String(r.id), r]))
-    return { byId, missing, extras, complete: !missing.length && !extras.length && got.size === out.length, _codex: res._codex }
+    const count = new Map()
+    for (const r of out) count.set(String(r.id), (count.get(String(r.id)) || 0) + 1)
+    const missing = ids.filter(id => !count.has(id))
+    const extras = [...count.keys()].filter(id => !expected.has(id))
+    // An id answered twice is ambiguous: neither answer is used (never resolve by order).
+    const ambiguous = [...count].filter(([id, n]) => n > 1 && expected.has(id)).map(([id]) => id)
+    const byId = new Map(out.filter(r => expected.has(String(r.id)) && count.get(String(r.id)) === 1).map(r => [String(r.id), r]))
+    return { byId, missing, extras, ambiguous, complete: !missing.length && !extras.length && !ambiguous.length, _codex: res._codex }
   })
 }
 
@@ -300,18 +333,22 @@ const lensResults = await pipeline(
     if (isCodexError(review)) return { lens: key, error: review, findings: [] }
     const findings = (review.findings || []).map(f => ({ ...f, id: key + ':' + f.id, lens: key }))
     if (!TRIAGE) return { lens: key, verdict: review.verdict, summary: review.summary, findings }
+    // A triage that fails keeps its finding, as needs_info — it is never dropped.
+    const failedTriage = reason => ({ verdict: 'needs_info', reasoning: 'Claude triage failed (' + reason + ') — check this finding by hand', failed: true })
     const triaged = await parallel(findings.map(f => () =>
       agent(`A Codex reviewer reported this finding about ${SCOPE}${CWD ? ' in ' + CWD : ''}. Check it yourself against the code (read the file and its callers; run git if needed).
 Decide: "confirmed" (the defect is real and the failure scenario is reachable), "refuted" (it is not — explain why), or "needs_info" (it depends on something you cannot see).
 FINDING (JSON): ${JSON.stringify(f)}`, { label: 'triage:' + f.id, phase: 'Triage', schema: TRIAGE_SCHEMA })
-        .then(t => ({ ...f, triage: t || { verdict: 'needs_info', reasoning: 'triage agent returned nothing' } }))))
-    return { lens: key, verdict: review.verdict, summary: review.summary, findings: triaged.filter(Boolean) }
+        .then(t => ({ ...f, triage: t || failedTriage('no answer') }), e => ({ ...f, triage: failedTriage(String((e && e.message) || e)) }))))
+    return { lens: key, verdict: review.verdict, summary: review.summary, findings: findings.map((f, i) => triaged[i] || { ...f, triage: failedTriage('stage failed') }) }
   },
 )
 
-const lenses = lensResults.filter(Boolean)
+// Every requested lens is accounted for: a lens whose stage died is a failed lens.
+const lenses = lensKeys.map((key, i) => lensResults[i] || { lens: key, error: ucxError('stage_failed', 'the review stage for this lens failed'), findings: [] })
 const failedLenses = lenses.filter(l => l.error)
 const findings = lenses.flatMap(l => l.findings)
+const failedTriages = findings.filter(f => f.triage && f.triage.failed)
 const by = v => findings.filter(f => (TRIAGE ? f.triage && f.triage.verdict === v : v === 'confirmed'))
 const confirmed = by('confirmed'), refuted = TRIAGE ? by('refuted') : [], needsInfo = TRIAGE ? by('needs_info') : []
 if (failedLenses.length) log('⚠ ' + failedLenses.length + '/' + lensKeys.length + ' Codex lenses failed — the review is INCOMPLETE')
@@ -325,8 +362,10 @@ NEEDS-INFO findings (say what must be checked): ${JSON.stringify(needsInfo)}
 REFUTED by triage (one line each, with the reason): ${JSON.stringify(refuted.map(f => ({ id: f.id, title: f.title, why: f.triage.reasoning })))}
 End with a one-line overall verdict: ship / ship after fixes / do not ship.`, { label: 'report', phase: 'Report' })
 
+if (failedTriages.length) log('⚠ ' + failedTriages.length + ' findings could not be triaged — kept as needs-info')
+
 return {
-  status: failedLenses.length ? 'incomplete' : 'complete',
+  status: failedLenses.length || failedTriages.length ? 'incomplete' : 'complete',
   tier: TIER,
   report,
   lenses: lenses.map(l => ({ lens: l.lens, verdict: l.verdict || null, error: l.error ? l.error.kind : null })),

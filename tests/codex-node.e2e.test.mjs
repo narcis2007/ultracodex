@@ -42,6 +42,7 @@ test("a run without a schema returns text", async (t) => {
   assert.equal(final.ok, true);
   assert.equal(final.text, "plain words");
   assert.equal(final.result, undefined);
+  assert.equal(final.resultHash, fnv1a("plain words"), "text results carry a hash for the return trip too");
 });
 
 test("the prompt Codex receives is the normalized task, via stdin", async (t) => {
@@ -203,26 +204,62 @@ test("an encoded frame uploaded in parts (out of order) starts once the last par
   const lines = [FRAME_MAGIC, ...encoded];
   const parts = [lines.slice(0, 2), lines.slice(2, 4), lines.slice(4)].map((part) => part.join("\n") + "\n");
   assert.ok(parts.every((part) => !part.includes("'") && !part.includes(bs)), "parts are quote- and backslash-free");
-  const inbox = "ucx-test-inbox-1";
   const hashOf = (index) => fnv1a(parts[index].slice(0, -1));
-  const wrong = await runCli(["part", inbox, "3", "3", "00000000"], { env, input: parts[2] });
-  assert.equal(wrong.json.state, "part_rejected");
-  assert.equal(wrong.json.error.kind, "relay_corruption");
-  assert.equal(fs.existsSync(path.join(home, "inbox", inbox, "part-3")), false, "a rejected part is not stored");
+  const wrongFirst = await runCli(["part", "new", "1", "3", "00000000"], { env, input: parts[0] });
+  assert.equal(wrongFirst.json.state, "part_rejected");
+  assert.equal(wrongFirst.json.upload, null, "a rejected first part opens no upload");
   assert.equal(fs.readdirSync(path.join(home, "rejected")).length, 1, "the rejected copy is kept for diagnosis");
-  const third = await runCli(["part", inbox, "3", "3", hashOf(2)], { env, input: parts[2] });
+  const first = await runCli(["part", "new", "1", "3", hashOf(0)], { env, input: parts[0] });
+  assert.equal(first.json.state, "receiving");
+  const upload = first.json.upload;
+  assert.match(upload, /^ucx-[0-9a-f]{12}$/, "the runner allocates the upload id");
+  const wrong = await runCli(["part", upload, "3", "3", "00000000"], { env, input: parts[2] });
+  assert.equal(wrong.json.state, "part_rejected");
+  assert.equal(fs.existsSync(path.join(home, "inbox", upload, "part-3")), false, "a rejected part is not stored");
+  const third = await runCli(["part", upload, "3", "3", hashOf(2)], { env, input: parts[2] });
   assert.equal(third.json.state, "receiving");
   assert.equal(third.code, 3);
-  await runCli(["part", inbox, "1", "3", hashOf(0)], { env, input: parts[0] });
-  const last = await runCli(["part", inbox, "2", "3", hashOf(1)], { env, input: parts[1] });
+  const last = await runCli(["part", upload, "2", "3", hashOf(1)], { env, input: parts[1] });
   assert.equal(last.code, 3, last.stdout);
   assert.ok(last.json.runId, "the last part starts the run");
   const done = await runCli(["wait", last.json.runId, "--max-wait", "20"], { env });
   assert.equal(done.json.state, "done");
   assert.equal(done.json.provenance.taskHash, fnv1a(normalizeText(task)));
-  assert.equal(fs.existsSync(path.join(home, "inbox", inbox)), false, "the inbox is cleared after assembly");
-  const bad = await runCli(["part", "ucx-test-inbox-2", "1", "1"], { env, input: parts.join("").replace("tail line", "tail lime") });
-  assert.equal(bad.json.error.kind, "relay_corruption");
+  assert.equal(done.json.resultHash, fnv1a(JSON.stringify(done.json.result)));
+  assert.equal(fs.existsSync(path.join(home, "inbox", upload)), false, "the upload is cleared after assembly");
+  const unknown = await runCli(["part", "ucx-000000000000", "2", "3", hashOf(1)], { env, input: parts[1] });
+  assert.equal(unknown.json.error.kind, "unknown_upload", "parts only go into an upload the runner opened");
+  const whole = parts.join("").replace("tail line", "tail lime");
+  const bad = await runCli(["part", "new", "1", "1", fnv1a(whole.slice(0, -1))], { env, input: whole });
+  assert.equal(bad.json.error.kind, "relay_corruption", "a consistent but altered frame fails the frame hashes");
+});
+
+test("a run cancelled while queued never starts Codex", async (t) => {
+  const home = makeHome(t);
+  const argvLog = path.join(home, "argv.jsonl");
+  const env = fastEnv(home, { ULTRACODEX_MAX_CONCURRENT: "1", FAKE_CODEX_ARGV_LOG: argvLog });
+  const first = await runCli(["start", "--request", writeRequest(home, { task: "first\nFAKE_SLEEP_MS=2500" })], { env });
+  assert.ok(await eventually(async () => (await runCli(["status", first.json.runId], { env })).json.runs[0].state === "running"));
+  const second = await runCli(["start", "--request", writeRequest(home, { task: "second" })], { env });
+  const cancelled = await runCli(["cancel", second.json.runId], { env });
+  assert.equal(cancelled.json.state, "cancelled");
+  await runCli(["wait", first.json.runId, "--max-wait", "20"], { env });
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.equal(fs.readFileSync(argvLog, "utf8").trim().split("\n").length, 1, "only the first run ever spawned codex");
+});
+
+test("a failure after spawn stops the run's own tree; a failed state write does not end the run", async (t) => {
+  const home = makeHome(t);
+  const pidFile = path.join(home, "grandchild.pid");
+  const { final } = await startAndWait(fastEnv(home, { ULTRACODEX_TEST_FAULT: "post-spawn" }), { task: `x\nFAKE_SLEEP_MS=30000\nFAKE_SPAWN_CHILD=${pidFile}` }, { home });
+  assert.equal(final.ok, false);
+  assert.equal(final.error.kind, "execution");
+  if (fs.existsSync(pidFile)) {
+    const grandchild = Number(fs.readFileSync(pidFile, "utf8"));
+    assert.ok(await eventually(() => !pidAlive(grandchild)), "nothing the run started is left running");
+  }
+  const { final: survived } = await startAndWait(fastEnv(home, { ULTRACODEX_TEST_FAULT: "state-write" }), { task: "y" }, { home });
+  assert.equal(survived.ok, true);
 });
 
 test("invalid requests are rejected with precise kinds", async (t) => {

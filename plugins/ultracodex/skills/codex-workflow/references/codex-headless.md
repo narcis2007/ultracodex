@@ -129,6 +129,15 @@ MCP OAuth refresh noise filtered out.
 | `relay_corruption` | helper retries once | relay altered the upload (hash mismatch) |
 | `supervisor_lost` | no | supervisor died; Codex may still run — **not** stopped automatically, ask the owner |
 
+## Headless (`claude -p`) sessions
+
+`claude -p` waits for background tasks — a running Workflow included — for at most 600 s,
+then terminates them ("Background tasks still running after 600s; terminating"). The relays
+die with it, the heartbeat stops, and attached Codex runs are torn down as `abandoned`. For
+headless automation that runs Codex workflows, set `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`.
+A run whose relay died can be rescued within `orphanAfterSec` by polling it
+(`wait <runId>`), which is exactly what the helper's COLLECT relay does.
+
 ## Windows/Git Bash traps (why the transport looks the way it does)
 
 - The Bash tool halves backslash pairs in commands (`\\` → `\`) — never pass backslashes

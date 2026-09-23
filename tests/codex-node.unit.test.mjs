@@ -9,6 +9,7 @@ import {
   FRAME_TASK_MARK,
   POLICY,
   SCHEMA_PRESETS,
+  acquireSlots,
   buildCodexArgs,
   checkStrictSchema,
   classifyFailure,
@@ -173,6 +174,42 @@ test("validateRequest applies defaults and rejects what codex would reject later
   reject({ task: "x", review: { base: "main", commit: "abc1234" } }, "invalid_request", /exactly one/);
   reject({ task: "x", cwd: path.join(cwd, "missing") }, "invalid_request", /not a directory/);
   reject({ task: "x", timeoutSec: 99999 }, "invalid_request", /timeoutSec/);
+});
+
+test("writing tasks are never retried automatically unless declared replay-safe", (t) => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-req-"));
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  assert.equal(validateRequest({ task: "x", cwd, sandbox: "workspace-write" }, { catalog: CATALOG }).maxAttempts, 1);
+  assert.equal(validateRequest({ task: "x", cwd, resume: { sessionId: "01a0cec5-503d" } }, { catalog: CATALOG }).maxAttempts, 1);
+  assert.equal(validateRequest({ task: "x", cwd }, { catalog: CATALOG }).maxAttempts, 2, "read-only work keeps one transient retry");
+  assert.throws(() => validateRequest({ task: "x", cwd, sandbox: "workspace-write", maxAttempts: 2 }, { catalog: CATALOG }), /apply its effects twice/);
+  assert.equal(validateRequest({ task: "x", cwd, sandbox: "workspace-write", maxAttempts: 2, replaySafe: true }, { catalog: CATALOG }).maxAttempts, 2);
+});
+
+test("slot leases are fenced: a displaced owner neither renews nor releases the new owner's slot", async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-slots-"));
+  const previous = { home: process.env.ULTRACODEX_HOME, max: process.env.ULTRACODEX_MAX_CONCURRENT };
+  process.env.ULTRACODEX_HOME = home;
+  process.env.ULTRACODEX_MAX_CONCURRENT = "1";
+  t.after(() => {
+    if (previous.home === undefined) delete process.env.ULTRACODEX_HOME;
+    else process.env.ULTRACODEX_HOME = previous.home;
+    if (previous.max === undefined) delete process.env.ULTRACODEX_MAX_CONCURRENT;
+    else process.env.ULTRACODEX_MAX_CONCURRENT = previous.max;
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+  const lease = await acquireSlots(1, "run-A", () => null);
+  const ownerFile = path.join(home, "slots", "slot-0", "owner.json");
+  assert.equal(JSON.parse(fs.readFileSync(ownerFile, "utf8")).runId, "run-A");
+  // simulate B reclaiming the slot after A stalled
+  fs.writeFileSync(ownerFile, JSON.stringify({ runId: "run-B", pid: 1, beatAt: Date.now() }));
+  lease.touch();
+  assert.equal(JSON.parse(fs.readFileSync(ownerFile, "utf8")).runId, "run-B", "A must not overwrite B's lease");
+  assert.deepEqual(lease.lost().length, 1);
+  lease.release();
+  assert.ok(fs.existsSync(ownerFile), "A must not release B's slot");
+  const stopped = await acquireSlots(1, "run-C", () => "cancelled");
+  assert.equal(stopped.stopped, "cancelled", "a cancelled run never waits for or takes a slot");
 });
 
 test("without a catalog, ultra is still refused on luna", (t) => {

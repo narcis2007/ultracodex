@@ -535,6 +535,7 @@ const REQUEST_FIELDS = new Set([
   "network",
   "timeoutSec",
   "maxAttempts",
+  "replaySafe",
   "attached",
   "orphanAfterSec",
   "ephemeral",
@@ -771,6 +772,19 @@ export function validateRequest(raw, { catalog = null } = {}) {
     meta = raw.meta;
   }
 
+  // A retry replays the whole task. For a writing task (workspace-write, or a resumed
+  // session that may be writable) that can apply its effects twice, so it is never
+  // retried automatically unless the caller vouches that the task is idempotent.
+  const mutating = sandbox === "workspace-write" || mode === "resume";
+  const replaySafe = expectBoolean(raw, "replaySafe", false);
+  const maxAttempts = expectInteger(raw, "maxAttempts", 1, 4, mutating ? 1 : 2);
+  if (mutating && maxAttempts > 1 && !replaySafe) {
+    throw new RequestError(
+      "invalid_request",
+      "automatic retries of a writing task could apply its effects twice; set replaySafe: true only if the task is idempotent"
+    );
+  }
+
   const orphanFloor = Math.max(1, TIMING.minOrphanSec);
   return {
     mode,
@@ -787,7 +801,8 @@ export function validateRequest(raw, { catalog = null } = {}) {
     weight: policy.weight,
     hermetic: expectBoolean(raw, "hermetic", true),
     network: expectBoolean(raw, "network", false),
-    maxAttempts: expectInteger(raw, "maxAttempts", 1, 4, 2),
+    maxAttempts,
+    replaySafe,
     attached: expectBoolean(raw, "attached", true),
     orphanAfterSec: expectInteger(raw, "orphanAfterSec", orphanFloor, 3600, Math.max(orphanFloor, 300)),
     ephemeral: expectBoolean(raw, "ephemeral", kind !== "implement" && mode !== "resume"),
@@ -1286,6 +1301,12 @@ function slotIsStale(dir) {
   return Date.now() - Number(owner.beatAt ?? 0) > TIMING.slotStaleMs;
 }
 
+function slotOwner(dir) {
+  return readJsonSafe(path.join(dir, "owner.json"));
+}
+
+// A stale slot is reclaimed by renaming it away first: only one reclaimer can win
+// the rename, so two supervisors never both believe they hold the same slot.
 function tryTakeSlot(index, runId) {
   const dir = path.join(slotsDir(), `slot-${index}`);
   try {
@@ -1293,7 +1314,13 @@ function tryTakeSlot(index, runId) {
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
     if (!slotIsStale(dir)) return null;
-    fs.rmSync(dir, { recursive: true, force: true });
+    const tombstone = `${dir}.stale-${randomBytes(4).toString("hex")}`;
+    try {
+      fs.renameSync(dir, tombstone);
+    } catch {
+      return null; // another supervisor reclaimed it first (or it is busy on Windows)
+    }
+    fs.rmSync(tombstone, { recursive: true, force: true });
     try {
       fs.mkdirSync(dir);
     } catch {
@@ -1306,50 +1333,71 @@ function tryTakeSlot(index, runId) {
 
 // Takes `weight` slots out of ULTRACODEX_MAX_CONCURRENT (default 4) across every
 // Claude session on the machine; waits while they are busy. All-or-nothing, so two
-// heavy runs can never deadlock each holding half of what they need.
-async function acquireSlots(weight, runId, shouldStop) {
+// heavy runs can never deadlock each holding half of what they need. Renewal and
+// release are fenced by owner: a supervisor whose lease was reclaimed never
+// overwrites or deletes the new owner's slot.
+export async function acquireSlots(weight, runId, shouldStop) {
   const limit = maxConcurrent();
-  const empty = { release() {}, touch() {}, stopped: null };
+  const empty = { release() {}, touch() {}, lost: () => [], stopped: null };
   if (limit === 0) return empty;
   fs.mkdirSync(slotsDir(), { recursive: true });
   const need = Math.min(Math.max(1, weight), limit);
+  const ours = (dir) => slotOwner(dir)?.runId === runId;
+  const releaseAll = (dirs) => {
+    for (const dir of dirs) if (ours(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  };
   for (;;) {
+    const stopBefore = shouldStop();
+    if (stopBefore) return { ...empty, stopped: stopBefore };
     const taken = [];
     for (let index = 0; index < limit && taken.length < need; index += 1) {
       const dir = tryTakeSlot(index, runId);
       if (dir) taken.push(dir);
     }
     if (taken.length === need) {
+      const lost = new Set();
       return {
         stopped: null,
         touch() {
           for (const dir of taken) {
-            writeJsonAtomic(path.join(dir, "owner.json"), { runId, pid: process.pid, beatAt: Date.now() });
+            if (ours(dir)) writeJsonAtomic(path.join(dir, "owner.json"), { runId, pid: process.pid, beatAt: Date.now() });
+            else lost.add(dir);
           }
         },
         release() {
-          for (const dir of taken) fs.rmSync(dir, { recursive: true, force: true });
+          releaseAll(taken);
         },
+        lost: () => [...lost],
       };
     }
-    for (const dir of taken) fs.rmSync(dir, { recursive: true, force: true });
-    const stop = shouldStop();
-    if (stop) return { ...empty, stopped: stop };
+    releaseAll(taken);
     await sleep(TIMING.slotPollMs);
   }
 }
 
 // ─── process-tree teardown ──────────────────────────────────────────────────
 
-// Only ever called by the supervisor on the child it spawned itself (it still
-// holds the handle, so the PID cannot have been recycled).
-export function killProcessTree(child, { platform = process.platform } = {}) {
-  if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
+function groupAlive(pid) {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+// Stops the process tree this supervisor started and resolves once it is gone (or
+// the escalation window has passed). Only ever called with the supervisor's own
+// child handle, so the PID cannot have been recycled.
+export async function stopOwnedTree(child, { platform = process.platform } = {}) {
+  if (!child?.pid) return;
   if (platform === "win32") {
-    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+    if (child.exitCode === null && child.signalCode === null) {
+      spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+    }
     return;
   }
-  const signal = (name) => {
+  const signalGroup = (name) => {
     try {
       process.kill(-child.pid, name);
     } catch {
@@ -1360,8 +1408,26 @@ export function killProcessTree(child, { platform = process.platform } = {}) {
       }
     }
   };
-  signal("SIGTERM");
-  setTimeout(() => signal("SIGKILL"), TIMING.killGraceMs).unref();
+  signalGroup("SIGTERM");
+  const graceUntil = Date.now() + TIMING.killGraceMs;
+  while (Date.now() < graceUntil && groupAlive(child.pid)) await sleep(100);
+  if (groupAlive(child.pid)) {
+    signalGroup("SIGKILL");
+    const hardUntil = Date.now() + 5000;
+    while (Date.now() < hardUntil && groupAlive(child.pid)) await sleep(100);
+  }
+}
+
+// After a normal exit on POSIX, whatever is left in the child's own process group was
+// started by this run (e.g. a dev server Codex forgot): reap it. On Windows there is no
+// group to address once the root has exited.
+function reapOwnedGroup(child, { platform = process.platform } = {}) {
+  if (platform === "win32" || !child?.pid) return;
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    // nothing left
+  }
 }
 
 // ─── the supervisor ─────────────────────────────────────────────────────────
@@ -1525,6 +1591,15 @@ async function runAttempt(request, paths, attempt, context) {
   };
   const args = buildCodexArgs(request, files, { windowsSandbox: context.windowsSandbox });
   appendLine(paths.log, `${nowIso()} attempt ${attempt}: ${context.launcher.displayPath} ${args.join(" ")}`);
+  // Checked right before every spawn: a run cancelled or abandoned while it was
+  // queued or backing off never starts Codex.
+  const early = stopReason(paths, request, context.clock);
+  if (early) {
+    return {
+      done: true,
+      envelope: failureEnvelope(request, context.runId, early, classifyFailure({ cancelled: early === "cancelled", abandoned: early === "abandoned" })),
+    };
+  }
   const eventsFd = fs.openSync(files.events, "w");
   const stderrFd = fs.openSync(files.stderr, "w");
   const startedAt = Date.now();
@@ -1547,51 +1622,65 @@ async function runAttempt(request, paths, attempt, context) {
 
   let outcome = { exitCode: null, stop: null, timedOut: false };
   if (child && !spawnError) {
-    let deadlineAt = startedAt + request.timeoutSec * 1000;
-    updateState(paths, {
-      state: "running",
-      attempt,
-      codexPid: child.pid,
-      attemptStartedAt: new Date(startedAt).toISOString(),
-      deadlineAt: new Date(deadlineAt).toISOString(),
+    // Listeners first: from here on the child is owned, and every path below either
+    // waits for it or stops its tree — it is never left running unsupervised.
+    let exited = false;
+    let exitCode = null;
+    const exitedPromise = new Promise((resolve) => {
+      child.once("exit", (code) => {
+        exited = true;
+        exitCode = code;
+        resolve();
+      });
+      child.once("error", (error) => {
+        spawnError = spawnError ?? error;
+        exited = true;
+        resolve();
+      });
     });
-    child.stdin.on("error", () => {});
-    child.stdin.end(request.task ? request.task + "\n" : "");
-    outcome = await new Promise((resolve) => {
-      let done = false;
+    try {
+      let deadlineAt = startedAt + request.timeoutSec * 1000;
+      try {
+        if (process.env.ULTRACODEX_TEST_FAULT === "state-write") throw new Error("injected state-write failure");
+        updateState(paths, {
+          state: "running",
+          attempt,
+          codexPid: child.pid,
+          attemptStartedAt: new Date(startedAt).toISOString(),
+          deadlineAt: new Date(deadlineAt).toISOString(),
+        });
+      } catch (error) {
+        appendLine(paths.log, `${nowIso()} state write failed after spawn (run continues): ${error.message}`);
+      }
+      child.stdin.on("error", () => {});
+      child.stdin.end(request.task ? request.task + "\n" : "");
+      if (process.env.ULTRACODEX_TEST_FAULT === "post-spawn") throw new Error("injected post-spawn failure");
       let stop = null;
       let timedOut = false;
-      const finish = (exitCode, error) => {
-        if (done) return;
-        done = true;
-        clearInterval(timer);
-        resolve({ exitCode, stop, timedOut, error });
-      };
-      child.on("error", (error) => {
-        spawnError = error;
-        finish(null, error);
-      });
-      child.on("exit", (code) => finish(code, null));
-      const timer = setInterval(() => {
-        if (done || stop || timedOut) return;
+      while (!exited) {
+        await Promise.race([exitedPromise, sleep(TIMING.pollMs)]);
+        if (exited) break;
         const suspendedMs = context.clock.tick();
         if (suspendedMs) {
           deadlineAt += suspendedMs; // time asleep is not time worked
           appendLine(paths.log, `${nowIso()} resumed after ~${Math.round(suspendedMs / 1000)} s suspended; deadline moved`);
         }
-        if (Date.now() >= deadlineAt) {
-          timedOut = true;
-        } else {
-          stop = stopReason(paths, request, context.clock);
-        }
+        if (Date.now() >= deadlineAt) timedOut = true;
+        else stop = stopReason(paths, request, context.clock);
         if (timedOut || stop) {
           appendLine(paths.log, `${nowIso()} stopping codex pid ${child.pid}: ${timedOut ? "deadline" : stop}`);
-          killProcessTree(child);
-          // if the tree ignores the kill, still release the caller after a grace period
-          setTimeout(() => finish(null, null), TIMING.killGraceMs + 10_000).unref();
+          await stopOwnedTree(child);
+          await Promise.race([exitedPromise, sleep(10_000)]); // a tree that survives taskkill/SIGKILL is reported, not awaited forever
+          break;
         }
-      }, TIMING.pollMs);
-    });
+      }
+      if (!timedOut && !stop) reapOwnedGroup(child);
+      outcome = { exitCode, stop, timedOut };
+    } catch (error) {
+      appendLine(paths.log, `${nowIso()} supervisor error after spawn, stopping its codex tree: ${error.message}`);
+      await stopOwnedTree(child);
+      throw error;
+    }
   }
 
   const durationMs = Date.now() - startedAt;
@@ -1609,7 +1698,10 @@ async function runAttempt(request, paths, attempt, context) {
 
   if (!spawnError && !outcome.stop && !outcome.timedOut && outcome.exitCode === 0 && lastMessage) {
     if (!request.schema) {
-      return { done: true, envelope: { ...baseEnvelope(request, context.runId), ok: true, state: "done", text: lastMessage, provenance } };
+      return {
+        done: true,
+        envelope: { ...baseEnvelope(request, context.runId), ok: true, state: "done", text: lastMessage, resultHash: fnv1a(lastMessage), provenance },
+      };
     }
     let parsed;
     try {
@@ -1633,7 +1725,11 @@ async function runAttempt(request, paths, attempt, context) {
         ),
       };
     }
-    return { done: true, envelope: { ...baseEnvelope(request, context.runId), ok: true, state: "done", result: parsed, provenance } };
+    // resultHash lets the Workflow helper prove the result survived the relay's transcription.
+    return {
+      done: true,
+      envelope: { ...baseEnvelope(request, context.runId), ok: true, state: "done", result: parsed, resultHash: fnv1a(JSON.stringify(parsed)), provenance },
+    };
   }
 
   const classification = classifyFailure({
@@ -1675,41 +1771,43 @@ export async function superviseRun(runId) {
       clock.tick();
       return stopReason(paths, request, clock);
     };
-    slot = await acquireSlots(request.weight, runId, check);
-    if (slot.stopped) {
-      envelope = failureEnvelope(request, runId, slot.stopped, classifyFailure({ cancelled: slot.stopped === "cancelled", abandoned: slot.stopped === "abandoned" }));
-    } else {
-      const launcher = resolveCodexLauncher();
-      let catalog = loadCatalog();
-      if (!catalogIsFresh(catalog)) {
-        try {
-          catalog = refreshCatalog(launcher);
-        } catch (error) {
-          log(`catalog refresh failed: ${error.message}`);
-        }
+    // Blocking probes run before any slot is taken: they can stall the event loop, and
+    // a held slot must keep renewing its lease.
+    const launcher = resolveCodexLauncher();
+    let catalog = loadCatalog();
+    if (!catalogIsFresh(catalog)) {
+      try {
+        catalog = refreshCatalog(launcher);
+      } catch (error) {
+        log(`catalog refresh failed: ${error.message}`);
       }
-      if (catalog?.models?.length && !catalog.models.some((item) => item.slug === request.model)) {
-        envelope = failureEnvelope(request, runId, "failed", {
-          kind: "model",
-          retryable: false,
-          message: `model ${request.model} is not in the local Codex catalog`,
-          status: null,
-        });
-      } else if (!modelSupportsEffort(request.model, request.effort, catalog)) {
-        envelope = failureEnvelope(request, runId, "failed", {
-          kind: "effort",
-          retryable: false,
-          message: `effort ${request.effort} is not supported by ${request.model}`,
-          status: null,
-        });
+    }
+    const context = {
+      runId,
+      launcher,
+      clock,
+      codexVersion: probeCodexVersion(launcher),
+      windowsSandbox: request.hermetic ? readUserWindowsSandbox() : null,
+    };
+    if (catalog?.models?.length && !catalog.models.some((item) => item.slug === request.model)) {
+      envelope = failureEnvelope(request, runId, "failed", {
+        kind: "model",
+        retryable: false,
+        message: `model ${request.model} is not in the local Codex catalog`,
+        status: null,
+      });
+    } else if (!modelSupportsEffort(request.model, request.effort, catalog)) {
+      envelope = failureEnvelope(request, runId, "failed", {
+        kind: "effort",
+        retryable: false,
+        message: `effort ${request.effort} is not supported by ${request.model}`,
+        status: null,
+      });
+    } else {
+      slot = await acquireSlots(request.weight, runId, check);
+      if (slot.stopped) {
+        envelope = failureEnvelope(request, runId, slot.stopped, classifyFailure({ cancelled: slot.stopped === "cancelled", abandoned: slot.stopped === "abandoned" }));
       } else {
-        const context = {
-          runId,
-          launcher,
-          clock,
-          codexVersion: probeCodexVersion(launcher),
-          windowsSandbox: request.hermetic ? readUserWindowsSandbox() : null,
-        };
         for (let attempt = 1; attempt <= request.maxAttempts; attempt += 1) {
           const outcome = await runAttempt(request, paths, attempt, context);
           envelope = outcome.envelope;
@@ -1838,30 +1936,34 @@ function keepRejected(name, text) {
   }
 }
 
-// One part of an encoded frame, piped in by the relay (`part INBOX K N [HASH]`). A
-// part whose hash does not match is refused on its own (`part_rejected`) so the
-// relay resends just that part. When the last missing part arrives the frame is
-// assembled, verified and started, and this call prints the same line `start` would.
-export async function cmdPart(inboxId, indexText, totalText, hashText, options = {}) {
+// One part of an encoded frame, piped in by the relay:
+//   part new 1 N HASH      opens a fresh upload (the runner allocates its id) with part 1
+//   part UPLOAD k N HASH   adds part k to that open upload
+// A part whose hash does not match is refused on its own (`part_rejected`) so the
+// relay resends just that part. When the last missing part arrives, exactly one caller
+// claims the upload (atomic rename), assembles, verifies and starts it, and prints the
+// same line `start` would. Upload ids are never chosen by the caller, so identical
+// requests from different workflows or sessions cannot collide.
+export async function cmdPart(uploadArg, indexText, totalText, hashText, options = {}) {
   const index = Number(indexText);
   const total = Number(totalText);
-  if (!INBOX_ID_RE.test(String(inboxId ?? "")) || !Number.isInteger(total) || total < 1 || total > MAX_PARTS || !Number.isInteger(index) || index < 1 || index > total) {
-    throw new UsageError("part needs INBOX_ID INDEX TOTAL [HASH] (1 <= INDEX <= TOTAL <= 256)");
+  const opening = uploadArg === "new";
+  if ((!opening && !INBOX_ID_RE.test(String(uploadArg ?? ""))) || !Number.isInteger(total) || total < 1 || total > MAX_PARTS || !Number.isInteger(index) || index < 1 || index > total) {
+    throw new UsageError("part needs new|UPLOAD_ID INDEX TOTAL HASH (1 <= INDEX <= TOTAL <= 256)");
   }
-  if (hashText !== undefined && !/^[0-9a-f]{8}$/.test(hashText)) throw new UsageError("part HASH must be 8 hex digits");
-  const dir = path.join(ucxHome(), "inbox", inboxId);
-  fs.mkdirSync(dir, { recursive: true });
+  if (opening && index !== 1) throw new UsageError("part new opens an upload with part 1");
+  if (!/^[0-9a-f]{8}$/.test(String(hashText ?? ""))) throw new UsageError("part HASH (8 hex digits) is required");
   let text = (await readInput("-")).replace(/\r\n?/g, "\n");
   if (text.endsWith("\n")) text = text.slice(0, -1); // the heredoc adds exactly one newline
-  if (hashText !== undefined && fnv1a(text) !== hashText) {
-    keepRejected(`${inboxId}-part${index}`, text);
+  const base = { ultracodex: 1, runnerVersion: RUNNER_VERSION };
+  if (fnv1a(text) !== hashText) {
+    keepRejected(`${opening ? "new" : uploadArg}-part${index}`, text);
     print(
       {
-        ultracodex: 1,
-        runnerVersion: RUNNER_VERSION,
+        ...base,
         ok: false,
         state: "part_rejected",
-        inboxId,
+        upload: opening ? null : uploadArg,
         part: index,
         total,
         error: { kind: "relay_corruption", retryable: true, message: `part ${index}/${total} differs from what the workflow sent; resend it exactly`, status: null },
@@ -1870,23 +1972,47 @@ export async function cmdPart(inboxId, indexText, totalText, hashText, options =
     );
     return 1;
   }
-  fs.writeFileSync(path.join(dir, `part-${index}`), text);
-  const received = [];
-  for (let part = 1; part <= total; part += 1) {
-    if (isFileSync(path.join(dir, `part-${part}`))) received.push(part);
+  const inboxRoot = path.join(ucxHome(), "inbox");
+  const uploadId = opening ? `ucx-${randomBytes(6).toString("hex")}` : uploadArg;
+  const dir = path.join(inboxRoot, uploadId);
+  if (opening) {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "total"), String(total));
+  } else {
+    const recorded = Number(readTextSafe(path.join(dir, "total")));
+    if (!recorded) {
+      print(rejection("unknown_upload", `no open upload ${uploadId}; start again with: part new 1 ${total} …`, { upload: uploadId }), options.pretty);
+      return 1;
+    }
+    if (recorded !== total) {
+      print(rejection("relay_corruption", `upload ${uploadId} has ${recorded} parts, not ${total}`, { upload: uploadId }), options.pretty);
+      return 1;
+    }
   }
-  if (received.length < total) {
-    print({ ultracodex: 1, runnerVersion: RUNNER_VERSION, ok: null, state: "receiving", inboxId, received: received.length, total }, options.pretty);
+  const partFile = path.join(dir, `part-${index}`);
+  fs.writeFileSync(`${partFile}.tmp`, text);
+  fs.renameSync(`${partFile}.tmp`, partFile);
+  let received = 0;
+  for (let part = 1; part <= total; part += 1) if (isFileSync(path.join(dir, `part-${part}`))) received += 1;
+  if (received < total) {
+    print({ ...base, ok: null, state: "receiving", upload: uploadId, received, total, next: `part ${uploadId} <k> ${total} <hash>` }, options.pretty);
     return 3;
   }
-  const framed = received.map((part) => readTextSafe(path.join(dir, `part-${part}`)) ?? "").join("\n");
-  fs.rmSync(dir, { recursive: true, force: true });
+  const claimed = `${dir}.assembling-${randomBytes(3).toString("hex")}`;
+  try {
+    fs.renameSync(dir, claimed);
+  } catch {
+    print(rejection("upload_busy", `upload ${uploadId} is already being assembled`, { upload: uploadId }), options.pretty);
+    return 1;
+  }
+  const framed = Array.from({ length: total }, (_, part) => readTextSafe(path.join(claimed, `part-${part + 1}`)) ?? "").join("\n");
+  fs.rmSync(claimed, { recursive: true, force: true });
   let raw;
   try {
     raw = framedToRaw(parseFramed(framed));
   } catch (error) {
-    keepRejected(`${inboxId}-frame`, framed);
-    print(rejection(error.kind ?? "relay_corruption", error.message, { inboxId }), options.pretty);
+    keepRejected(`${uploadId}-frame`, framed);
+    print(rejection(error.kind ?? "relay_corruption", error.message, { upload: uploadId }), options.pretty);
     return 1;
   }
   return startFromRaw(raw, options);

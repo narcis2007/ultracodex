@@ -47,34 +47,48 @@ Set refuted=false only when the code confirms the issue; if you cannot confirm i
 confidence is 0..1. reasoning must cite what you read.`
 
 phase('Find')
+// Every dimension ends as { dimension, findings, failed }: a finder or stage that dies is
+// reported, never silently turned into "no findings".
 const results = await pipeline(
   DIMENSIONS,
-  d => agent(findPrompt(d), { label: 'find:' + d, phase: 'Find', schema: FINDINGS }),
+  d => agent(findPrompt(d), { label: 'find:' + d, phase: 'Find', schema: FINDINGS })
+    .then(review => review, e => ({ __failed: String((e && e.message) || e) })),
   async (review, d) => {
-    const findings = ((review && review.findings) || []).map((f, i) => ({ ...f, id: d + ':' + (f.id || i), dimension: d }))
-    if (!findings.length) return []
+    if (!review || review.__failed) return { dimension: d, findings: [], failed: review ? review.__failed : 'the finder returned nothing' }
+    const findings = (review.findings || []).map((f, i) => ({ ...f, id: d + ':' + (f.id || i), dimension: d }))
+    if (!findings.length) return { dimension: d, findings: [], failed: null }
     if (BATCH) {
       const batch = await codexBatchNode(VERIFY_INSTRUCTION,
         findings.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, detail: f.detail, failure_scenario: f.failure_scenario })),
         { tier: VERIFY_TIER, kind: 'verify', cwd: CWD || undefined, label: 'codex:' + d, phase: 'Verify' })
-      return findings.map(f => ({
-        ...f,
-        verdict: isCodexError(batch) ? batch : (batch.byId.get(f.id) || ucxError('missing_from_batch', 'Codex returned no verdict for ' + f.id)),
-      }))
+      return {
+        dimension: d, failed: null,
+        findings: findings.map(f => ({
+          ...f,
+          verdict: isCodexError(batch) ? batch
+            : batch.ambiguous.includes(f.id) ? ucxError('ambiguous_verdict', 'Codex answered ' + f.id + ' more than once')
+            : (batch.byId.get(f.id) || ucxError('missing_from_batch', 'Codex returned no verdict for ' + f.id)),
+        })),
+      }
     }
-    return parallel(findings.map(f => () =>
+    const verified = await parallel(findings.map(f => () =>
       codexNode(VERIFY_INSTRUCTION + '\nFINDING (JSON):\n' + JSON.stringify(f),
         { schemaPreset: 'verdict', tier: VERIFY_TIER, kind: 'verify', cwd: CWD || undefined, label: 'codex:' + f.id, phase: 'Verify' })
         .then(v => ({ ...f, verdict: v }))))
+    return { dimension: d, failed: null, findings: findings.map((f, i) => verified[i] || { ...f, verdict: ucxError('stage_failed', 'verification of ' + f.id + ' failed') }) }
   },
 )
 
-const all = results.flat().filter(Boolean)
+const dims = DIMENSIONS.map((d, i) => results[i] || { dimension: d, findings: [], failed: 'the review stage failed' })
+const failedDims = dims.filter(x => x.failed)
+const all = dims.flatMap(x => x.findings)
 const part = ucxPartition(all)
+if (failedDims.length) log('⚠ ' + failedDims.length + '/' + DIMENSIONS.length + ' dimensions were NOT reviewed: ' + failedDims.map(x => x.dimension).join(', '))
 if (part.unverified.length) log('⚠ ' + part.unverified.length + '/' + all.length + ' findings UNVERIFIED — the result is incomplete')
 
 phase('Synthesize')
 const report = await agent(`Write a code-review report for ${TARGET}${WHERE}.
+${failedDims.length ? 'At the very top, state that these dimensions were NOT reviewed (their finder failed): ' + JSON.stringify(failedDims.map(x => ({ dimension: x.dimension, why: x.failed }))) : ''}
 CONFIRMED findings (a second model family could not refute them) — rank by severity, give file:line, the failure scenario and a fix:
 ${JSON.stringify(part.confirmed)}
 UNVERIFIED findings (the Codex verifier failed — state this plainly at the top; they are neither confirmed nor refuted):
@@ -82,7 +96,8 @@ ${JSON.stringify(part.unverified.map(f => ({ id: f.id, title: f.title, file: f.f
 REFUTED count: ${part.refuted.length} (list their titles briefly at the end).`, { label: 'synthesize', phase: 'Synthesize' })
 
 return {
-  status: part.status,
+  status: failedDims.length || part.status === 'incomplete' ? 'incomplete' : 'complete',
+  failedDimensions: failedDims.map(x => ({ dimension: x.dimension, why: x.failed })),
   report,
   confirmed: part.confirmed,
   refuted: part.refuted.map(f => ({ id: f.id, title: f.title, reasoning: f.verdict.reasoning })),

@@ -30,18 +30,24 @@ const SCORE = {
 const task = extra => `PROBLEM:\n${A.problem}\n\n${extra}\nReturn the approach, a concrete plan, and its main risks.`
 
 phase('Generate')
-const candidates = (await parallel([
-  ...ANGLES.map(a => () => agent(task(a.prompt), { label: 'gen:' + a.key, phase: 'Generate', schema: SOLUTION })
-    .then(s => (s ? { ...s, author: 'claude:' + a.key, family: 'claude' } : null))),
-  ...(A.codexCandidate === false ? [] : [() => codexNode(task('Propose the approach you think is most robust.'),
+// Every requested candidate is accounted for; a failed generation is reported, not dropped.
+const requested = [
+  ...ANGLES.map(a => ({ author: 'claude:' + a.key, run: () => agent(task(a.prompt), { label: 'gen:' + a.key, phase: 'Generate', schema: SOLUTION })
+    .then(s => (s ? { ...s, author: 'claude:' + a.key, family: 'claude' } : { __failed: 'the generator returned nothing' }), e => ({ __failed: String((e && e.message) || e) })) })),
+  ...(A.codexCandidate === false ? [] : [{ author: 'codex', run: () => codexNode(task('Propose the approach you think is most robust.'),
     { schema: SOLUTION, tier: 'daily', kind: 'ask', cwd: CWD, label: 'gen:codex', phase: 'Generate' })
-    .then(s => (isCodexError(s) ? null : { approach: s.approach, plan: s.plan, risks: s.risks, author: 'codex', family: 'codex' }))]),
-])).filter(Boolean)
-if (!candidates.length) throw new Error('judge-panel: no candidate was generated')
+    .then(s => (isCodexError(s) ? { __failed: s ? s.kind + ': ' + s.message : 'no result' } : { approach: s.approach, plan: s.plan, risks: s.risks, author: 'codex', family: 'codex' })) }]),
+]
+const generated = await parallel(requested.map(r => r.run))
+const failedGenerations = requested.map((r, i) => ({ author: r.author, out: generated[i] }))
+  .filter(x => !x.out || x.out.__failed).map(x => ({ author: x.author, why: x.out ? x.out.__failed : 'stage failed' }))
+const candidates = generated.filter(c => c && !c.__failed)
+if (failedGenerations.length) log('⚠ candidates not generated: ' + failedGenerations.map(f => f.author + ' (' + f.why + ')').join('; '))
+if (!candidates.length) return { status: 'incomplete', final: null, winner: null, ranking: [], failedGenerations }
 
 phase('Judge')
 const judgePrompt = c => `Score this approach 0..10 for the problem (correctness, risk, cost, time to value). Be strict.\nPROBLEM:\n${A.problem}\nAPPROACH (JSON):\n${JSON.stringify({ approach: c.approach, plan: c.plan, risks: c.risks })}`
-const judged = (await parallel(candidates.map(c => () => parallel([
+const judgedRaw = (await parallel(candidates.map(c => () => parallel([
   () => agent(judgePrompt(c), { label: 'judge:claude:' + c.author, phase: 'Judge', schema: SCORE }),
   () => codexNode(judgePrompt(c), { schema: SCORE, tier: 'daily', kind: 'verify', cwd: CWD, label: 'judge:codex:' + c.author, phase: 'Judge' }),
 ]).then(([cl, cx]) => {
@@ -52,12 +58,14 @@ const judged = (await parallel(candidates.map(c => () => parallel([
   // No candidate is ranked on its own family's opinion alone.
   const crossFamily = jurors.some(j => j.family !== c.family)
   return { candidate: c, jurors, avg: crossFamily ? jurors.reduce((s, j) => s + j.score, 0) / jurors.length : null }
-})))).filter(Boolean)
+}))))
+// a candidate whose judging stage died is unranked, not forgotten
+const judged = candidates.map((c, i) => judgedRaw[i] || { candidate: c, jurors: [], avg: null })
 
 const ranked = judged.filter(j => j.avg !== null).sort((a, b) => b.avg - a.avg)
 if (!ranked.length) {
   log('no candidate received a cross-family verdict — nothing is rankable')
-  return { status: 'incomplete', final: null, ranking: judged.map(j => ({ author: j.candidate.author, jurors: j.jurors.map(x => x.family) })) }
+  return { status: 'incomplete', final: null, winner: null, failedGenerations, ranking: judged.map(j => ({ author: j.candidate.author, jurors: j.jurors.map(x => x.family) })) }
 }
 
 phase('Synthesize')
@@ -68,8 +76,10 @@ RUNNERS-UP: ${JSON.stringify(ranked.slice(1).map(j => j.candidate))}
 JURY NOTES: ${JSON.stringify(ranked.map(j => ({ author: j.candidate.author, avg: j.avg, jurors: j.jurors })))}`, { label: 'synthesize', phase: 'Synthesize' })
 
 return {
-  status: ranked.length === candidates.length ? 'complete' : 'partial',
+  status: ranked.length === candidates.length && !failedGenerations.length ? 'complete' : 'partial',
   final,
   winner: ranked[0].candidate.author,
+  failedGenerations,
+  unranked: judged.filter(j => j.avg === null).map(j => j.candidate.author),
   ranking: ranked.map(j => ({ author: j.candidate.author, avg: Math.round(j.avg * 10) / 10, jurors: j.jurors.map(x => x.family + ':' + x.score) })),
 }

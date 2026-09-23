@@ -89,13 +89,15 @@ function receive(prompt) {
 }
 
 function okEnvelope(request, result, extra = {}) {
+  const body = result === undefined ? { text: "plain text" } : { result };
   return JSON.stringify({
     ultracodex: 1,
     ok: true,
     state: "done",
     runId: "20260923T000000Z-abcdef",
-    ...(result === undefined ? { text: "plain text" } : { result }),
-    provenance: { threadId: "01a0-thread", model: request.model, effort: request.effort, tier: request.tier, usage: { output_tokens: 7 } },
+    ...body,
+    resultHash: fnv1a(result === undefined ? "plain text" : JSON.stringify(result)),
+    provenance: { threadId: "01a0-thread", model: request.model, effort: request.effort, tier: request.tier, taskHash: request.taskHash, usage: { output_tokens: 7 } },
     ...extra,
   });
 }
@@ -204,25 +206,82 @@ test("a corrupted upload is retried once by an opus relay", async () => {
 
 test("a relay that stops early is followed by a collector; missing provenance is rejected", async () => {
   const prompts = [];
+  let original = null;
   const agent = async (prompt) => {
     prompts.push(prompt);
     if (prompt.startsWith("ULTRACODEX COLLECT")) {
       assert.match(prompt, /RUN_ID: 20260923T000000Z-abcdef/);
-      return okEnvelope({ model: "gpt-6-sol", effort: "xhigh", tier: "daily" }, { refuted: false, confidence: 1, reasoning: "r" });
+      return okEnvelope(original, { refuted: false, confidence: 1, reasoning: "r" });
     }
+    original = receive(prompt).request;
     return JSON.stringify({ ultracodex: 1, ok: null, state: "running", runId: "20260923T000000Z-abcdef" });
   };
   const collected = await runHelper(["return codexNode('slow one', { schemaPreset: 'verdict' })"], agent);
   assert.equal(collected.refuted, false);
   assert.equal(prompts.length, 2);
 
-  const noProvenance = async () => JSON.stringify({ ultracodex: 1, ok: true, state: "done", runId: "r", result: { refuted: false }, provenance: {} });
+  const noProvenance = async () =>
+    JSON.stringify({ ultracodex: 1, ok: true, state: "done", runId: "r", result: { refuted: false }, resultHash: fnv1a(JSON.stringify({ refuted: false })), provenance: {} });
   const forged = await runHelper(["return codexNode('x', { schemaPreset: 'verdict' })"], noProvenance);
   assert.equal(forged._codex_error, true);
   assert.equal(forged.kind, "no_provenance");
 
   const prose = await runHelper(["return codexNode('x', { schemaPreset: 'verdict' })"], async () => "I think the claim is true.");
   assert.equal(prose.kind, "relay_no_envelope");
+});
+
+test("a result garbled on the way back is fetched again; a persistent mismatch is an error", async () => {
+  const good = { refuted: false, confidence: 0.9, reasoning: "real defect at a.ts:3" };
+  const prompts = [];
+  let original = null;
+  const garbleOnce = async (prompt) => {
+    prompts.push(prompt);
+    if (!prompt.startsWith("ULTRACODEX COLLECT")) original = receive(prompt).request;
+    const line = okEnvelope(original, good);
+    // the first transcription drops a word: the hash no longer matches
+    return prompts.length === 1 ? line.replace("real defect", "real") : line;
+  };
+  const fetched = await runHelper(["return codexNode('check', { schemaPreset: 'verdict' })"], garbleOnce);
+  assert.equal(fetched.reasoning, good.reasoning);
+  assert.match(prompts[1], /^ULTRACODEX COLLECT\nRUN_ID: /);
+
+  const alwaysGarbled = async (prompt) => {
+    if (!prompt.startsWith("ULTRACODEX COLLECT")) original = receive(prompt).request;
+    return okEnvelope(original, good).replace("real defect", "real");
+  };
+  const failed = await runHelper(["return codexNode('check', { schemaPreset: 'verdict' })"], alwaysGarbled);
+  assert.equal(failed._codex_error, true);
+  assert.equal(failed.kind, "relay_corruption");
+
+  const missingHash = async (prompt) => JSON.stringify({ ...JSON.parse(okEnvelope(receive(prompt).request, good)), resultHash: undefined });
+  const unverifiable = await runHelper(["return codexNode('check', { schemaPreset: 'verdict' })"], async (prompt) =>
+    prompt.startsWith("ULTRACODEX COLLECT") ? JSON.stringify({ ultracodex: 1, ok: true, state: "done", runId: "r", result: good, provenance: { threadId: "t", usage: { output_tokens: 1 } } }) : missingHash(prompt));
+  assert.equal(unverifiable.kind, "relay_corruption", "a result without resultHash is not trusted");
+
+  // a well-formed result for a different request (e.g. the relay collected the wrong run)
+  const foreign = async (prompt) => okEnvelope({ ...receive(prompt).request, taskHash: "deadbeef" }, good);
+  const mismatched = await runHelper(["return codexNode('check', { schemaPreset: 'verdict' })"], foreign);
+  assert.equal(mismatched.kind, "relay_mismatch");
+});
+
+test("a rejected relay call is a failed node, never a vanished one", async () => {
+  const rejecting = async () => {
+    throw new Error("budget exhausted");
+  };
+  const failed = await runHelper(["return codexNode('check', { schemaPreset: 'verdict' })"], rejecting);
+  assert.equal(failed._codex_error, true);
+  assert.equal(failed.kind, "relay_failed");
+  assert.match(failed.message, /budget exhausted/);
+});
+
+test("uploads ask the runner for a fresh upload id (no shared inboxes across workflows)", async () => {
+  let prompt = "";
+  await runHelper(["return codexNode('check', { schemaPreset: 'verdict' })"], async (p) => {
+    prompt = p;
+    return okEnvelope(receive(p).request, { refuted: true, confidence: 0.1, reasoning: "no" });
+  });
+  assert.match(prompt, /part new 1 /);
+  assert.doesNotMatch(prompt, /INBOX: /);
 });
 
 test("the helper gate keeps at most 4 Codex jobs in flight, astra counting double", async () => {
@@ -271,6 +330,66 @@ test("cross-review partitions fail-closed and keeps unverified findings visible"
   assert.deepEqual(result.refuted.map((f) => f.id), ["correctness:2"]);
   assert.deepEqual(result.unverified.map((f) => [f.id, f.error]), [["security:9", "rate_limit"]]);
   assert.ok(logs.some((line) => line.includes("UNVERIFIED")));
+});
+
+test("cross-review: an ambiguous batch answer is unverified and a dead finder makes the run incomplete", async () => {
+  const finding = (id) => ({ id, title: "t" + id, file: "a.ts", line: 3, detail: "d", failure_scenario: "s", severity: "high" });
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      return okEnvelope(request, {
+        results: [
+          { id: "correctness:1", refuted: false, confidence: 0.9, reasoning: "real" },
+          { id: "correctness:1", refuted: true, confidence: 0.9, reasoning: "not real" },
+          { id: "correctness:2", refuted: false, confidence: 0.8, reasoning: "real too" },
+        ],
+      });
+    }
+    if (opts.label === "find:correctness") return { findings: [finding("1"), finding("2")] };
+    if (opts.label === "find:security") throw new Error("finder crashed");
+    if (opts.label === "synthesize") return "REPORT";
+    return { findings: [] };
+  };
+  const { result } = await runWorkflow("cross-review", { agent, args: { dimensions: ["correctness", "security"] } });
+  assert.equal(result.status, "incomplete");
+  assert.deepEqual(result.confirmed.map((f) => f.id), ["correctness:2"]);
+  assert.deepEqual(result.unverified, [{ id: "correctness:1", title: "t1", error: "ambiguous_verdict" }]);
+  assert.deepEqual(result.failedDimensions.map((x) => x.dimension), ["security"]);
+});
+
+test("codex-review keeps a finding whose triage failed, as needs-info, and reports incomplete", async () => {
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      const f = (id) => ({ id, severity: "high", category: "c", title: "t" + id, file: "x.rs", line: 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.7 });
+      return okEnvelope(request, { verdict: "request_changes", summary: "sum", findings: [f("a")] });
+    }
+    if (opts.label?.startsWith("triage:")) throw new Error("triage agent died");
+    if (opts.label === "report") return "FINAL";
+    return null;
+  };
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"] } });
+  assert.equal(result.status, "incomplete");
+  assert.deepEqual(result.needsInfo.map((f) => f.id), ["code:a"]);
+  assert.match(result.needsInfo[0].triage.reasoning, /triage failed/);
+});
+
+test("judge-panel reports a failed Codex generation instead of hiding it", async () => {
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      if (request.label === "gen:codex") return JSON.stringify({ ultracodex: 1, ok: false, state: "failed", error: { kind: "usage_limit", message: "limit" } });
+      return okEnvelope(request, { score: 7, rationale: "ok" });
+    }
+    if (opts.label?.startsWith("gen:")) return { approach: opts.label, plan: "p", risks: "r" };
+    if (opts.label?.startsWith("judge:claude:")) return { score: 6, rationale: "ok" };
+    if (opts.label === "synthesize") return "FINAL PLAN";
+    return null;
+  };
+  const { result } = await runWorkflow("judge-panel", { agent, args: { problem: "How to X?" } });
+  assert.equal(result.status, "partial");
+  assert.deepEqual(result.failedGenerations.map((f) => f.author), ["codex"]);
+  assert.match(result.failedGenerations[0].why, /usage_limit/);
 });
 
 test("codex-review marks a failed lens as incomplete and routes findings through triage", async () => {

@@ -54,18 +54,22 @@ const lensResults = await pipeline(
     if (isCodexError(review)) return { lens: key, error: review, findings: [] }
     const findings = (review.findings || []).map(f => ({ ...f, id: key + ':' + f.id, lens: key }))
     if (!TRIAGE) return { lens: key, verdict: review.verdict, summary: review.summary, findings }
+    // A triage that fails keeps its finding, as needs_info — it is never dropped.
+    const failedTriage = reason => ({ verdict: 'needs_info', reasoning: 'Claude triage failed (' + reason + ') — check this finding by hand', failed: true })
     const triaged = await parallel(findings.map(f => () =>
       agent(`A Codex reviewer reported this finding about ${SCOPE}${CWD ? ' in ' + CWD : ''}. Check it yourself against the code (read the file and its callers; run git if needed).
 Decide: "confirmed" (the defect is real and the failure scenario is reachable), "refuted" (it is not — explain why), or "needs_info" (it depends on something you cannot see).
 FINDING (JSON): ${JSON.stringify(f)}`, { label: 'triage:' + f.id, phase: 'Triage', schema: TRIAGE_SCHEMA })
-        .then(t => ({ ...f, triage: t || { verdict: 'needs_info', reasoning: 'triage agent returned nothing' } }))))
-    return { lens: key, verdict: review.verdict, summary: review.summary, findings: triaged.filter(Boolean) }
+        .then(t => ({ ...f, triage: t || failedTriage('no answer') }), e => ({ ...f, triage: failedTriage(String((e && e.message) || e)) }))))
+    return { lens: key, verdict: review.verdict, summary: review.summary, findings: findings.map((f, i) => triaged[i] || { ...f, triage: failedTriage('stage failed') }) }
   },
 )
 
-const lenses = lensResults.filter(Boolean)
+// Every requested lens is accounted for: a lens whose stage died is a failed lens.
+const lenses = lensKeys.map((key, i) => lensResults[i] || { lens: key, error: ucxError('stage_failed', 'the review stage for this lens failed'), findings: [] })
 const failedLenses = lenses.filter(l => l.error)
 const findings = lenses.flatMap(l => l.findings)
+const failedTriages = findings.filter(f => f.triage && f.triage.failed)
 const by = v => findings.filter(f => (TRIAGE ? f.triage && f.triage.verdict === v : v === 'confirmed'))
 const confirmed = by('confirmed'), refuted = TRIAGE ? by('refuted') : [], needsInfo = TRIAGE ? by('needs_info') : []
 if (failedLenses.length) log('⚠ ' + failedLenses.length + '/' + lensKeys.length + ' Codex lenses failed — the review is INCOMPLETE')
@@ -79,8 +83,10 @@ NEEDS-INFO findings (say what must be checked): ${JSON.stringify(needsInfo)}
 REFUTED by triage (one line each, with the reason): ${JSON.stringify(refuted.map(f => ({ id: f.id, title: f.title, why: f.triage.reasoning })))}
 End with a one-line overall verdict: ship / ship after fixes / do not ship.`, { label: 'report', phase: 'Report' })
 
+if (failedTriages.length) log('⚠ ' + failedTriages.length + ' findings could not be triaged — kept as needs-info')
+
 return {
-  status: failedLenses.length ? 'incomplete' : 'complete',
+  status: failedLenses.length || failedTriages.length ? 'incomplete' : 'complete',
   tier: TIER,
   report,
   lenses: lenses.map(l => ({ lens: l.lens, verdict: l.verdict || null, error: l.error ? l.error.kind : null })),
