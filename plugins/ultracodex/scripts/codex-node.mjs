@@ -15,7 +15,7 @@
 // Exit codes: 0 done/ok, 1 failed or rejected, 2 usage error, 3 still running.
 
 import { spawn, spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -77,6 +77,7 @@ export const TIMING = Object.freeze({
   killGraceMs: envInt("ULTRACODEX_KILL_GRACE_MS", 5000),
   minOrphanSec: envInt("ULTRACODEX_MIN_ORPHAN_SEC", 60),
   minTimeoutSec: envInt("ULTRACODEX_MIN_TIMEOUT_SEC", 60),
+  treeSnapshotMs: envInt("ULTRACODEX_TREE_SNAPSHOT_MS", 60_000),
 });
 
 // ─── small utilities ────────────────────────────────────────────────────────
@@ -159,6 +160,25 @@ function writeJsonAtomic(file, value) {
       const until = Date.now() + 25;
       while (Date.now() < until) {
         // brief spin: a reader may hold the target open on Windows
+      }
+    }
+  }
+}
+
+// Windows refuses a rename for a moment when a scanner (Defender, the indexer) holds a
+// handle on something just written: EPERM/EACCES/EBUSY, measured at ~1 % of directory
+// renames. Those are retried for up to ~1 s; anything else (ENOENT: someone else moved
+// it first, EEXIST/ENOTEMPTY: the target was recreated) is thrown at once.
+function renameRetry(from, to) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (error) {
+      if (!["EPERM", "EACCES", "EBUSY"].includes(error.code) || attempt >= 40) throw error;
+      const until = Date.now() + 25;
+      while (Date.now() < until) {
+        // brief spin: callers are synchronous
       }
     }
   }
@@ -542,6 +562,7 @@ const REQUEST_FIELDS = new Set([
   "timeoutSec",
   "maxAttempts",
   "replaySafe",
+  "workItems",
   "attached",
   "orphanAfterSec",
   "ephemeral",
@@ -696,6 +717,11 @@ export function validateRequest(raw, { catalog = null } = {}) {
   const minTimeout = Math.max(1, TIMING.minTimeoutSec);
   const timeoutSec = expectInteger(raw, "timeoutSec", minTimeout, MAX_TIMEOUT_SEC, undefined);
   const policy = resolvePolicy({ tier, kind, model: raw.model, effort, timeoutSec });
+  // A batch of N items needs more time than one; scale the default deadline (x1.25 per
+  // extra 1..4 items, at most x4). An explicit timeoutSec is never changed.
+  const workItems = expectInteger(raw, "workItems", 1, 256, 1);
+  const scaledTimeoutSec =
+    timeoutSec ?? Math.min(MAX_TIMEOUT_SEC, Math.round(policy.timeoutSec * Math.min(4, 1 + (workItems - 1) * 0.25)));
 
   if (catalog?.models?.length && !catalog.models.some((item) => item.slug === policy.model)) {
     throw new RequestError(
@@ -803,7 +829,8 @@ export function validateRequest(raw, { catalog = null } = {}) {
     kind,
     model: policy.model,
     effort: policy.effort,
-    timeoutSec: policy.timeoutSec,
+    timeoutSec: scaledTimeoutSec,
+    workItems,
     weight: policy.weight,
     hermetic: expectBoolean(raw, "hermetic", true),
     network: expectBoolean(raw, "network", false),
@@ -842,32 +869,44 @@ export const FRAME_MAGIC = "UCXF1";
 export const FRAME_LINE_MAX = 400;
 export const FRAME_PART_MAX = 1600;
 
-// Code points that never travel raw: % \ ' , C0 controls except newline, DEL,
-// no-break space, zero-width spaces/joiners, line/paragraph separators, BOM.
-const FRAME_ESCAPED = new Set([
-  0x25, 0x5c, 0x27, 0x7f, 0xa0, 0x200b, 0x200c, 0x200d, 0x2028, 0x2029, 0xfeff,
-  ...Array.from({ length: 0x20 }, (_, code) => code).filter((code) => code !== 0x0a),
-]);
+// Everything a copying model could drop, reorder or misread travels escaped:
+// % \ ' , every control (Cc), format (Cf: soft hyphen, bidi controls, zero-width
+// characters, BOM, tag characters …), lone surrogate (Cs) and separator/space
+// character (Z*) except the plain space, and variation selectors.
+const INVISIBLE_RE = /[\p{Cc}\p{Cf}\p{Cs}\p{Zs}\p{Zl}\p{Zp}]/u;
+
+export function mustEscape(char) {
+  const code = char.codePointAt(0);
+  if (code === 0x0a || code === 0x20) return false;
+  if (code === 0x25 || code === 0x5c || code === 0x27) return true;
+  if ((code >= 0xfe00 && code <= 0xfe0f) || (code >= 0xe0100 && code <= 0xe01ef)) return true;
+  return INVISIBLE_RE.test(char);
+}
 
 export function encodeFrameText(text) {
   let out = "";
   for (const char of String(text)) {
+    if (!mustEscape(char)) {
+      out += char;
+      continue;
+    }
     const code = char.codePointAt(0);
-    if (!FRAME_ESCAPED.has(code)) out += char;
-    else if (code === 0x25) out += "%25";
+    if (code === 0x25) out += "%25";
     else if (code === 0x5c) out += "%5C";
     else if (code === 0x27) out += "%27";
+    else if (code > 0xffff) out += "%U" + code.toString(16).toUpperCase().padStart(6, "0");
     else out += "%u" + code.toString(16).toUpperCase().padStart(4, "0");
   }
   return out;
 }
 
 export function decodeFrameText(text) {
-  return String(text).replace(/%(25|5C|27|u[0-9A-F]{4})/g, (match, code) => {
+  return String(text).replace(/%(25|5C|27|u[0-9A-F]{4}|U[0-9A-F]{6})/g, (match, code) => {
     if (code === "25") return "%";
     if (code === "5C") return "\\";
     if (code === "27") return "'";
-    return String.fromCharCode(parseInt(code.slice(1), 16));
+    if (code[0] === "u") return String.fromCharCode(parseInt(code.slice(1), 16));
+    return String.fromCodePoint(parseInt(code.slice(1), 16));
   });
 }
 
@@ -1084,16 +1123,25 @@ export function readUserWindowsSandbox(env = process.env) {
   const home = env.CODEX_HOME ? path.resolve(env.CODEX_HOME) : path.join(os.homedir(), ".codex");
   const text = readTextSafe(path.join(home, "config.toml"));
   if (text === null) return null;
-  let inWindows = false;
+  // Accepts the TOML spellings Codex itself accepts: a [windows] table (quoted or not),
+  // a top-level dotted key windows.sandbox = "…", and an inline table windows = { sandbox = "…" }.
+  let table = null; // null = top level
   for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
+    const line = raw.replace(/\s+#.*$/, "").trim();
+    if (!line || line.startsWith("#")) continue;
+    const header = /^\[\s*("windows"|'windows'|windows)\s*\]$/.exec(line);
     if (line.startsWith("[")) {
-      inWindows = /^\[\s*windows\s*\]\s*(#.*)?$/.test(line);
+      table = header ? "windows" : "other";
       continue;
     }
-    if (inWindows) {
-      const match = /^sandbox\s*=\s*["']([A-Za-z0-9_-]+)["']/.exec(line);
+    if (table === "windows") {
+      const match = /^["']?sandbox["']?\s*=\s*["']([A-Za-z0-9_-]+)["']/.exec(line);
       if (match) return match[1];
+    } else if (table === null) {
+      const dotted = /^["']?windows["']?\s*\.\s*["']?sandbox["']?\s*=\s*["']([A-Za-z0-9_-]+)["']/.exec(line);
+      if (dotted) return dotted[1];
+      const inline = /^["']?windows["']?\s*=\s*\{[^}]*\bsandbox\s*=\s*["']([A-Za-z0-9_-]+)["']/.exec(line);
+      if (inline) return inline[1];
     }
   }
   return null;
@@ -1277,6 +1325,46 @@ export function runPaths(runId, env = process.env) {
   };
 }
 
+// ─── result authentication ──────────────────────────────────────────────────
+//
+// Every successful result carries mac = HMAC-SHA256(key, runId \n SHA-256(task) \n body)
+// under a per-machine secret. The Workflow helper fetches the key once per workflow
+// through a relay whose context holds no untrusted text, then verifies each result. A
+// relay hijacked by reviewed content can neither know the key's output for a forged
+// body nor compute an HMAC (the relay guard allows it no code), so it cannot pass off
+// its own answer as Codex's. The task is bound by SHA-256, not by the 32-bit taskHash:
+// someone who holds the key must not be able to search for a task text whose own
+// hash matches a MAC embedded in it.
+
+export function keyPath(env = process.env) {
+  return path.join(ucxHome(env), "key");
+}
+
+export function ensureKey(env = process.env) {
+  const file = keyPath(env);
+  const existing = (readTextSafe(file) ?? "").trim();
+  if (/^[0-9a-f]{64}$/.test(existing)) return existing;
+  fs.mkdirSync(ucxHome(env), { recursive: true });
+  try {
+    fs.writeFileSync(file, randomBytes(32).toString("hex"), { flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+  }
+  const settled = (readTextSafe(file) ?? "").trim(); // a concurrent creator may have won
+  if (!/^[0-9a-f]{64}$/.test(settled)) throw new Error(`cannot establish the ultracodex result key at ${file}`);
+  return settled;
+}
+
+export function resultMac(key, runId, task, body) {
+  const taskDigest = createHash("sha256").update(String(task), "utf8").digest("hex");
+  return createHmac("sha256", Buffer.from(key, "hex")).update(`${runId}\n${taskDigest}\n${body}`, "utf8").digest("hex");
+}
+
+// The exact string resultHash and mac cover: the result JSON, or the final text.
+export function resultBody(envelope) {
+  return envelope.result !== undefined && envelope.result !== null ? JSON.stringify(envelope.result) : String(envelope.text ?? "");
+}
+
 export function newRunId(date = new Date()) {
   const stamp = date.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
   return `${stamp}-${randomBytes(3).toString("hex")}`;
@@ -1303,46 +1391,125 @@ export function maxConcurrent(env = process.env) {
   return Number.isInteger(value) && value >= 0 ? value : 4;
 }
 
-function slotIsStale(dir) {
-  const owner = readJsonSafe(path.join(dir, "owner.json"));
-  if (!owner) {
-    try {
-      return Date.now() - fs.statSync(dir).mtimeMs > TIMING.slotStaleMs;
-    } catch {
-      return true;
-    }
-  }
-  return Date.now() - Number(owner.beatAt ?? 0) > TIMING.slotStaleMs;
+// Layout: slots/slot-N/ is the lease (taken with an atomic mkdir), and inside it
+// lease-<runId>/owner.json is its owner's generation. An owner only ever writes inside
+// its own generation directory, so after its lease was reclaimed its renewals fail with
+// ENOENT instead of overwriting the new owner — the displacement is noticed, never hidden.
+function leaseDir(dir, runId) {
+  return path.join(dir, `lease-${runId}`);
 }
 
 function slotOwner(dir) {
-  return readJsonSafe(path.join(dir, "owner.json"));
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return null;
+  }
+  const lease = names.find((name) => name.startsWith("lease-"));
+  if (lease) {
+    const leasePath = path.join(dir, lease);
+    return readJsonSafe(path.join(leasePath, "owner.json")) ?? { runId: lease.slice("lease-".length), pid: null, beatAt: null, partial: true, leasePath };
+  }
+  return readJsonSafe(path.join(dir, "owner.json")); // pre-0.3 layout
 }
 
-// A stale slot is reclaimed by renaming it away first: only one reclaimer can win
-// the rename, so two supervisors never both believe they hold the same slot.
-function tryTakeSlot(index, runId) {
+export function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function debrisIsOld(dir) {
+  try {
+    return Date.now() - fs.statSync(dir).mtimeMs > TIMING.slotStaleMs;
+  } catch {
+    return true;
+  }
+}
+
+// A slot is reclaimed only when its owner is provably gone: its supervisor PID is dead,
+// or the reclaimer has watched the same beatAt through a full stale window of its own
+// polls. Polls are counted, not clocks: after a suspend the owner renews within
+// aliveMs of waking, long before a waiting run could confirm it stale — so a live
+// owner never loses its slot to a laptop lid.
+function ownerGone(dir, owner, watch) {
+  // A taker between mkdir and its first write, debris — or an owner.json that could not be
+  // read this instant (Windows sharing violation). The lease directory's own mtime moves on
+  // every renewal (each writes and renames a file inside it), so a live owner is never "old".
+  if (!owner || owner.partial) return debrisIsOld(owner?.leasePath ?? dir);
+  if (owner.pid && !pidAlive(owner.pid)) return true;
+  const seen = watch.suspects.get(dir);
+  if (!seen || seen.beatAt !== owner.beatAt || seen.runId !== owner.runId) {
+    watch.suspects.set(dir, { beatAt: owner.beatAt, runId: owner.runId, firstPoll: watch.poll });
+    return false;
+  }
+  return watch.poll - seen.firstPoll >= Math.max(2, Math.ceil(TIMING.slotStaleMs / Math.max(1, TIMING.slotPollMs)));
+}
+
+const sameOwner = (a, b) => Boolean(a && b) && a.runId === b.runId && a.beatAt === b.beatAt;
+
+// Reclaiming renames the slot away first (only one reclaimer can win a rename) and then
+// checks it moved the owner it judged gone; if it moved someone's fresh slot instead,
+// it puts it back.
+function tryTakeSlot(index, runId, watch) {
   const dir = path.join(slotsDir(), `slot-${index}`);
   try {
     fs.mkdirSync(dir);
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
-    if (!slotIsStale(dir)) return null;
+    const judged = slotOwner(dir);
+    if (!ownerGone(dir, judged, watch)) return null;
     const tombstone = `${dir}.stale-${randomBytes(4).toString("hex")}`;
     try {
       fs.renameSync(dir, tombstone);
     } catch {
       return null; // another supervisor reclaimed it first (or it is busy on Windows)
     }
+    const moved = slotOwner(tombstone);
+    if (judged ? !sameOwner(moved, judged) : moved !== null) {
+      try {
+        renameRetry(tombstone, dir);
+      } catch {
+        // the rightful owner notices through lost() on its next renewal
+      }
+      return null;
+    }
     fs.rmSync(tombstone, { recursive: true, force: true });
+    watch.suspects.delete(dir);
     try {
       fs.mkdirSync(dir);
     } catch {
       return null;
     }
   }
-  writeJsonAtomic(path.join(dir, "owner.json"), { runId, pid: process.pid, beatAt: Date.now() });
+  fs.mkdirSync(leaseDir(dir, runId));
+  writeJsonAtomic(path.join(leaseDir(dir, runId), "owner.json"), { runId, pid: process.pid, beatAt: Date.now() });
   return dir;
+}
+
+// Release moves the lease away first and deletes it only if it is still ours; a lease
+// that was reclaimed meanwhile is put back for its new owner.
+function releaseSlot(dir, runId) {
+  const moved = `${dir}.released-${randomBytes(4).toString("hex")}`;
+  try {
+    renameRetry(dir, moved);
+  } catch {
+    return; // already gone (or still locked: a dead owner's slot is reclaimed at once)
+  }
+  if (isDirSync(leaseDir(moved, runId))) {
+    fs.rmSync(moved, { recursive: true, force: true });
+    return;
+  }
+  try {
+    renameRetry(moved, dir);
+  } catch {
+    // its owner notices through lost() on its next renewal
+  }
 }
 
 // Takes `weight` slots out of ULTRACODEX_MAX_CONCURRENT (default 4) across every
@@ -1356,16 +1523,17 @@ export async function acquireSlots(weight, runId, shouldStop) {
   if (limit === 0) return empty;
   fs.mkdirSync(slotsDir(), { recursive: true });
   const need = Math.min(Math.max(1, weight), limit);
-  const ours = (dir) => slotOwner(dir)?.runId === runId;
   const releaseAll = (dirs) => {
-    for (const dir of dirs) if (ours(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    for (const dir of dirs) releaseSlot(dir, runId);
   };
+  const watch = { suspects: new Map(), poll: 0 };
   for (;;) {
+    watch.poll += 1;
     const stopBefore = shouldStop();
     if (stopBefore) return { ...empty, stopped: stopBefore };
     const taken = [];
     for (let index = 0; index < limit && taken.length < need; index += 1) {
-      const dir = tryTakeSlot(index, runId);
+      const dir = tryTakeSlot(index, runId, watch);
       if (dir) taken.push(dir);
     }
     if (taken.length === need) {
@@ -1374,8 +1542,15 @@ export async function acquireSlots(weight, runId, shouldStop) {
         stopped: null,
         touch() {
           for (const dir of taken) {
-            if (ours(dir)) writeJsonAtomic(path.join(dir, "owner.json"), { runId, pid: process.pid, beatAt: Date.now() });
-            else lost.add(dir);
+            try {
+              // fails with ENOENT once the lease was reclaimed: nothing of the new owner is touched.
+              // Keeps trying after a failure: a reclaimer that moved the slot away by mistake
+              // puts it back, and a lease that stopped renewing would then really go stale.
+              writeJsonAtomic(path.join(leaseDir(dir, runId), "owner.json"), { runId, pid: process.pid, beatAt: Date.now() });
+              lost.delete(dir);
+            } catch {
+              lost.add(dir);
+            }
           }
         },
         release() {
@@ -1404,19 +1579,140 @@ function groupAlive(pid) {
   }
 }
 
-// Stops the process tree this supervisor started and resolves once it is gone (or
-// the escalation window has passed). Only ever called with the supervisor's own
-// child handle, so the PID cannot have been recycled.
-export async function stopOwnedTree(child, { platform = process.platform } = {}) {
-  if (!child?.pid) return;
-  if (platform === "win32") {
-    if (child.exitCode === null && child.signalCode === null) {
-      // absolute path: never resolve taskkill through the current directory or PATH,
-      // where a reviewed repository could plant its own taskkill.exe
-      spawnSync(windowsTaskkill(), ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore", cwd: ucxHome() });
-    }
-    return;
+export function windowsPowerShell(env = process.env) {
+  return path.join(env.SystemRoot || env.windir || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
+export function parseProcessTable(text) {
+  const rows = [];
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s*$/.exec(line);
+    if (match) rows.push({ pid: Number(match[1]), ppid: Number(match[2]), created: Number(match[3]) });
   }
+  return rows;
+}
+
+// pid, parent pid and creation time (FILETIME) of every process, or null when unavailable.
+export function windowsProcessTable() {
+  const script =
+    "Get-CimInstance Win32_Process | ForEach-Object { if ($_.CreationDate) { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $_.CreationDate.ToFileTimeUtc() } }";
+  const out = spawnSync(windowsPowerShell(), ["-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8",
+    timeout: 30_000,
+    windowsHide: true,
+    cwd: ucxHome(),
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (out.status !== 0 || !out.stdout) return null;
+  return parseProcessTable(out.stdout);
+}
+
+// Descendants of root whose parent link is genuine: a child is created after its parent,
+// so an orphan whose dead parent's PID was later reused by our root is never taken for
+// our child (taskkill /T would take it — and kill a process this run never started).
+// The other way round too: once a (dead) parent's PID belongs to a younger process, only
+// children created before that reuse can be the parent's.
+export function windowsDescendants(root, table) {
+  const byParent = new Map();
+  const byPid = new Map();
+  for (const proc of table) {
+    if (!byParent.has(proc.ppid)) byParent.set(proc.ppid, []);
+    byParent.get(proc.ppid).push(proc);
+    byPid.set(proc.pid, proc);
+  }
+  const found = [];
+  const seen = new Set([root.pid]);
+  const queue = [root];
+  while (queue.length) {
+    const parent = queue.shift();
+    const holder = byPid.get(parent.pid);
+    const reusedAt = holder && holder.created > parent.created ? holder.created : Infinity;
+    for (const proc of byParent.get(parent.pid) ?? []) {
+      if (seen.has(proc.pid) || proc.created < parent.created || proc.created >= reusedAt) continue;
+      seen.add(proc.pid);
+      found.push(proc);
+      queue.push(proc);
+    }
+  }
+  return found;
+}
+
+// The run's root as it appears in `table`: matched by the creation time recorded while we
+// held its handle, or — before any snapshot — by PID only while the child is unexited (an
+// open handle keeps Windows from reusing the PID).
+function windowsRoot(child, table, tracked) {
+  const created = tracked?.get(child.pid);
+  const alive = child.exitCode === null && child.signalCode === null;
+  return table.find((proc) => proc.pid === child.pid && (created !== undefined ? proc.created === created : alive)) ?? null;
+}
+
+// Remembers every process of the run's tree by identity (pid + creation time), so work
+// that later detaches from the tree (its parent exits) is still known at teardown.
+export function trackWindowsTree(child, tracked, table = windowsProcessTable()) {
+  if (!table) return;
+  const root = windowsRoot(child, table, tracked);
+  if (!root) return;
+  tracked.set(root.pid, root.created);
+  for (const proc of windowsDescendants(root, table)) tracked.set(proc.pid, proc.created);
+}
+
+// Kills exactly the given identities (pid + creation time) that still exist, then — since
+// a process can start a child between the snapshot and its own death — sweeps the fresh
+// table for descendants of everything it stopped (by identity) and stops those too, a few
+// rounds at most. Returns which of them survived.
+function windowsKill(targets) {
+  if (!targets.size) return { targeted: 0, survivors: [] };
+  const all = new Map(targets);
+  let pending = new Map(targets);
+  let after = null;
+  for (let round = 0; round < 3 && pending.size; round += 1) {
+    spawnSync(windowsTaskkill(), ["/F", ...[...pending.keys()].flatMap((pid) => ["/PID", String(pid)])], {
+      windowsHide: true,
+      stdio: "ignore",
+      cwd: ucxHome(),
+    });
+    after = windowsProcessTable();
+    if (!after) break;
+    const fresh = new Map();
+    for (const [pid, created] of all) {
+      if (created === null) continue; // no identity, no descendants we could vouch for
+      for (const proc of windowsDescendants({ pid, created }, after)) if (!all.has(proc.pid)) fresh.set(proc.pid, proc.created);
+    }
+    for (const [pid, created] of fresh) all.set(pid, created);
+    pending = fresh;
+  }
+  const survivors = after
+    ? [...all].filter(([pid, created]) => after.some((proc) => proc.pid === pid && (created === null || proc.created === created))).map(([pid]) => pid)
+    : [];
+  // without a fresh process table the stop cannot be confirmed: say so instead of claiming it
+  return after ? { targeted: all.size, survivors } : { targeted: all.size, survivors, unverified: true };
+}
+
+function windowsTargets(child, tracked) {
+  const table = windowsProcessTable();
+  const targets = new Map();
+  if (!table) {
+    if (child.exitCode === null && child.signalCode === null) targets.set(child.pid, null); // at least the root we hold
+    return targets;
+  }
+  const root = windowsRoot(child, table, tracked);
+  if (root) {
+    targets.set(root.pid, root.created);
+    for (const proc of windowsDescendants(root, table)) targets.set(proc.pid, proc.created);
+  }
+  for (const [pid, created] of tracked ?? []) {
+    if (table.some((proc) => proc.pid === pid && proc.created === created)) targets.set(pid, created);
+  }
+  return targets;
+}
+
+// Stops the process tree this supervisor started and resolves once it is gone (or the
+// escalation window has passed), reporting what survived. Windows: the identity-checked
+// tree plus every tracked descendant, by absolute-path taskkill (never /T). POSIX: the
+// child's own process group, SIGTERM then SIGKILL.
+export async function stopOwnedTree(child, { platform = process.platform, tracked = null } = {}) {
+  if (!child?.pid) return { targeted: 0, survivors: [] };
+  if (platform === "win32") return windowsKill(windowsTargets(child, tracked));
   const signalGroup = (name) => {
     try {
       process.kill(-child.pid, name);
@@ -1436,18 +1732,32 @@ export async function stopOwnedTree(child, { platform = process.platform } = {})
     const hardUntil = Date.now() + 5000;
     while (Date.now() < hardUntil && groupAlive(child.pid)) await sleep(100);
   }
+  return { targeted: 1, survivors: groupAlive(child.pid) ? [`process group ${child.pid}`] : [] };
 }
 
-// After a normal exit on POSIX, whatever is left in the child's own process group was
-// started by this run (e.g. a dev server Codex forgot): reap it. On Windows there is no
-// group to address once the root has exited.
-function reapOwnedGroup(child, { platform = process.platform } = {}) {
-  if (platform === "win32" || !child?.pid) return;
+// After a normal exit, whatever the run started and left behind (e.g. a dev server Codex
+// forgot) is stopped: on POSIX the child's own process group, on Windows the tracked
+// identities that still exist plus — by identity — the descendants of the (exited) root and
+// of every tracked process, which catches children started after the last snapshot.
+function reapLeftovers(child, tracked, { platform = process.platform } = {}) {
+  if (!child?.pid) return { targeted: 0, survivors: [] };
+  if (platform === "win32") {
+    if (!tracked?.size) return { targeted: 0, survivors: [] }; // the root was never identified
+    const table = windowsProcessTable();
+    if (!table) return { targeted: 0, survivors: [] };
+    const targets = new Map();
+    for (const [pid, created] of tracked) {
+      if (pid !== child.pid && table.some((proc) => proc.pid === pid && proc.created === created)) targets.set(pid, created);
+      for (const proc of windowsDescendants({ pid, created }, table)) targets.set(proc.pid, proc.created);
+    }
+    return windowsKill(targets);
+  }
   try {
     process.kill(-child.pid, "SIGKILL");
   } catch {
     // nothing left
   }
+  return { targeted: 0, survivors: [] };
 }
 
 // ─── the supervisor ─────────────────────────────────────────────────────────
@@ -1674,9 +1984,15 @@ async function runAttempt(request, paths, attempt, context) {
       }
       child.stdin.on("error", () => {});
       child.stdin.end(request.task ? request.task + "\n" : "");
-      if (process.env.ULTRACODEX_TEST_FAULT === "post-spawn") throw new Error("injected post-spawn failure");
+      const fault = /^post-spawn(?::(\d+))?$/.exec(process.env.ULTRACODEX_TEST_FAULT ?? "");
+      if (fault) {
+        if (fault[1]) await sleep(Number(fault[1])); // let the child get as far as starting its own children
+        throw new Error("injected post-spawn failure");
+      }
       let stop = null;
       let timedOut = false;
+      let teardown = null;
+      let nextSnapshotAt = Date.now() + Math.min(2000, TIMING.treeSnapshotMs);
       while (!exited) {
         await withTimeout(exitedPromise, TIMING.pollMs);
         if (exited) break;
@@ -1685,20 +2001,25 @@ async function runAttempt(request, paths, attempt, context) {
           deadlineAt += suspendedMs; // time asleep is not time worked
           appendLine(paths.log, `${nowIso()} resumed after ~${Math.round(suspendedMs / 1000)} s suspended; deadline moved`);
         }
+        if (process.platform === "win32" && Date.now() >= nextSnapshotAt) {
+          trackWindowsTree(child, context.tracked);
+          nextSnapshotAt = Date.now() + TIMING.treeSnapshotMs;
+        }
         if (Date.now() >= deadlineAt) timedOut = true;
         else stop = stopReason(paths, request, context.clock);
         if (timedOut || stop) {
           appendLine(paths.log, `${nowIso()} stopping codex pid ${child.pid}: ${timedOut ? "deadline" : stop}`);
-          await stopOwnedTree(child);
+          teardown = await stopOwnedTree(child, { tracked: context.tracked });
           await withTimeout(exitedPromise, 10_000); // a tree that survives taskkill/SIGKILL is reported, not awaited forever
           break;
         }
       }
-      if (!timedOut && !stop) reapOwnedGroup(child);
-      outcome = { exitCode, stop, timedOut };
+      if (!timedOut && !stop) teardown = reapLeftovers(child, context.tracked);
+      if (teardown?.survivors?.length) appendLine(paths.log, `${nowIso()} still running after teardown: ${teardown.survivors.join(", ")}`);
+      outcome = { exitCode, stop, timedOut, teardown };
     } catch (error) {
       appendLine(paths.log, `${nowIso()} supervisor error after spawn, stopping its codex tree: ${error.message}`);
-      await stopOwnedTree(child);
+      await stopOwnedTree(child, { tracked: context.tracked });
       throw error;
     }
   }
@@ -1715,12 +2036,21 @@ async function runAttempt(request, paths, attempt, context) {
     codexVersion: context.codexVersion,
     launcher: context.launcher.source,
   });
+  if (outcome.teardown?.targeted) provenance.teardown = outcome.teardown; // leftovers stopped after a normal exit
 
   if (!spawnError && !outcome.stop && !outcome.timedOut && outcome.exitCode === 0 && lastMessage) {
     if (!request.schema) {
       return {
         done: true,
-        envelope: { ...baseEnvelope(request, context.runId), ok: true, state: "done", text: lastMessage, resultHash: fnv1a(lastMessage), provenance },
+        envelope: {
+          ...baseEnvelope(request, context.runId),
+          ok: true,
+          state: "done",
+          text: lastMessage,
+          resultHash: fnv1a(lastMessage),
+          mac: resultMac(context.key, context.runId, request.task, lastMessage),
+          provenance,
+        },
       };
     }
     let parsed;
@@ -1748,7 +2078,15 @@ async function runAttempt(request, paths, attempt, context) {
     // resultHash lets the Workflow helper prove the result survived the relay's transcription.
     return {
       done: true,
-      envelope: { ...baseEnvelope(request, context.runId), ok: true, state: "done", result: parsed, resultHash: fnv1a(JSON.stringify(parsed)), provenance },
+      envelope: {
+        ...baseEnvelope(request, context.runId),
+        ok: true,
+        state: "done",
+        result: parsed,
+        resultHash: fnv1a(JSON.stringify(parsed)),
+        mac: resultMac(context.key, context.runId, request.task, JSON.stringify(parsed)),
+        provenance,
+      },
     };
   }
 
@@ -1764,6 +2102,17 @@ async function runAttempt(request, paths, attempt, context) {
   });
   const state = outcome.timedOut ? "timeout" : outcome.stop ?? "failed";
   provenance.stderrTail = compact(stderr.split(/\r?\n/).filter((line) => line.trim()).slice(-8).join("\n"), 1200);
+  if (outcome.teardown) provenance.teardown = outcome.teardown;
+  if (outcome.teardown?.survivors?.length) {
+    // never claim a clean stop that did not happen
+    classification.message = compact(
+      `${classification.message.replace(/; the Codex process tree was stopped$/, "")}; ${outcome.teardown.survivors.length} process(es) of this run could not be stopped: ${outcome.teardown.survivors.join(", ")}`
+    );
+  } else if (outcome.teardown?.unverified) {
+    classification.message = compact(
+      `${classification.message.replace(/; the Codex process tree was stopped$/, "")}; the stop of the Codex process tree could not be verified (no process table)`
+    );
+  }
   return { done: false, classification, envelope: failureEnvelope(request, context.runId, state, classification, provenance) };
 }
 
@@ -1776,12 +2125,27 @@ export async function superviseRun(runId) {
   writeText(paths.alive, String(Date.now()));
   updateState(paths, { state: "queued", supervisorPid: process.pid });
   let slot = null;
+  let slotLost = false;
+  let lostBeats = 0;
   const beat = setInterval(() => {
     writeText(paths.alive, String(Date.now()));
     try {
       slot?.touch();
     } catch {
       // a vanished slot is reclaimed by the next taker
+    }
+    lostBeats = slot?.lost?.().length ? lostBeats + 1 : 0;
+    if (!slotLost && lostBeats >= 2) {
+      // Another run reclaimed our lease (only possible if this supervisor stalled past the
+      // stale window); one failed renewal can be a reclaimer that put the slot back.
+      // Say so: this run now counts above the machine-wide cap.
+      slotLost = true;
+      log("slot lease lost to another run; this run continues above the machine-wide cap");
+      try {
+        updateState(paths, { slotLost: true });
+      } catch {
+        // state is informational here
+      }
     }
   }, TIMING.aliveMs);
   let envelope;
@@ -1806,6 +2170,8 @@ export async function superviseRun(runId) {
       runId,
       launcher,
       clock,
+      key: ensureKey(),
+      tracked: new Map(), // Windows: pid -> creation time of every descendant seen (identity-checked)
       codexVersion: probeCodexVersion(launcher),
       windowsSandbox: request.hermetic ? readUserWindowsSandbox() : null,
     };
@@ -1828,9 +2194,12 @@ export async function superviseRun(runId) {
       if (slot.stopped) {
         envelope = failureEnvelope(request, runId, slot.stopped, classifyFailure({ cancelled: slot.stopped === "cancelled", abandoned: slot.stopped === "abandoned" }));
       } else {
+        let spent = null; // tokens of every attempt, not only the last: what the run cost
         for (let attempt = 1; attempt <= request.maxAttempts; attempt += 1) {
           const outcome = await runAttempt(request, paths, attempt, context);
           envelope = outcome.envelope;
+          spent = addUsage(spent, envelope.provenance?.usage);
+          if (spent && envelope.provenance) envelope.provenance.usageTotal = spent;
           if (outcome.done || !outcome.classification.retryable || attempt === request.maxAttempts) break;
           log(`attempt ${attempt} failed (${outcome.classification.kind}); backing off`);
           updateState(paths, { state: "backoff", attempt });
@@ -1857,6 +2226,7 @@ export async function superviseRun(runId) {
       // slot directories are reclaimed when stale
     }
   }
+  if (slotLost) envelope.provenance = { ...(envelope.provenance ?? {}), slotLost: true };
   writeJsonAtomic(paths.result, envelope);
   updateState(paths, { state: envelope.state, finishedAt: nowIso() });
   log(`finished: ${envelope.state}${envelope.ok ? "" : ` (${envelope.error?.kind})`}`);
@@ -1866,6 +2236,49 @@ export async function superviseRun(runId) {
 
 function print(value, pretty = false) {
   process.stdout.write(JSON.stringify(value, null, pretty ? 2 : 0) + "\n");
+}
+
+// The Bash tool hands a model only a short preview of any output over ~30 000
+// characters, so a large result would never reach the Workflow. Above PAGED_THRESHOLD
+// `wait`/`result` print a compact envelope (paged: {pages, chars}) and `page RUN K`
+// prints slice K of the body; resultHash and mac still cover the whole body.
+export const PAGED_THRESHOLD = 24_000;
+export const PAGE_CHARS = 10_000;
+
+export function pageBody(envelope) {
+  return JSON.stringify(envelope.result !== undefined && envelope.result !== null ? { result: envelope.result } : { text: envelope.text ?? "" });
+}
+
+export function compactEnvelope(envelope) {
+  if (envelope.ok !== true || JSON.stringify(envelope).length <= PAGED_THRESHOLD) return envelope;
+  const body = pageBody(envelope);
+  const compact = { ...envelope, paged: { pages: Math.ceil(body.length / PAGE_CHARS), chars: body.length } };
+  delete compact.result;
+  delete compact.text;
+  return compact;
+}
+
+function printFinal(envelope, pretty) {
+  const out = pretty ? envelope : compactEnvelope(envelope);
+  // from the main conversation, the whole result is simply read from this file
+  if (out.paged && RUN_ID_RE.test(String(envelope.runId ?? ""))) out.paged = { ...out.paged, file: runPaths(envelope.runId).result };
+  print(out, pretty);
+  return envelope.ok ? 0 : 1;
+}
+
+export function cmdPage(runId, pageText, { pretty = false } = {}) {
+  if (!RUN_ID_RE.test(String(runId ?? ""))) throw new UsageError("page needs a run id");
+  const page = Number(pageText);
+  const envelope = readJsonSafe(runPaths(runId).result);
+  if (!envelope || envelope.ok !== true) {
+    print(rejection("unknown_run", `no finished result for ${runId}`, { runId }), pretty);
+    return 1;
+  }
+  const body = pageBody(envelope);
+  const pages = Math.ceil(body.length / PAGE_CHARS);
+  if (!Number.isInteger(page) || page < 1 || page > pages) throw new UsageError(`page must be 1..${pages}`);
+  print({ ultracodex: 1, runId, page, pages, data: body.slice((page - 1) * PAGE_CHARS, page * PAGE_CHARS) }, pretty);
+  return 0;
 }
 
 function rejection(kind, message, extra = {}) {
@@ -2011,7 +2424,7 @@ export async function cmdPart(uploadArg, indexText, totalText, hashText, options
   }
   const partFile = path.join(dir, `part-${index}`);
   fs.writeFileSync(`${partFile}.tmp`, text);
-  fs.renameSync(`${partFile}.tmp`, partFile);
+  renameRetry(`${partFile}.tmp`, partFile);
   let received = 0;
   for (let part = 1; part <= total; part += 1) if (isFileSync(path.join(dir, `part-${part}`))) received += 1;
   if (received < total) {
@@ -2020,7 +2433,8 @@ export async function cmdPart(uploadArg, indexText, totalText, hashText, options
   }
   const claimed = `${dir}.assembling-${randomBytes(3).toString("hex")}`;
   try {
-    fs.renameSync(dir, claimed);
+    // the directory was written a moment ago, so a scanner may still hold it: retried
+    renameRetry(dir, claimed);
   } catch {
     print(rejection("upload_busy", `upload ${uploadId} is already being assembled`, { upload: uploadId }), options.pretty);
     return 1;
@@ -2099,10 +2513,7 @@ export async function cmdWait(runId, { maxWaitSec = DEFAULT_MAX_WAIT_SEC, pretty
   let staleSince = null;
   for (;;) {
     const result = readJsonSafe(paths.result);
-    if (result) {
-      print(result, pretty);
-      return result.ok ? 0 : 1;
-    }
+    if (result) return printFinal(result, pretty);
     writeText(paths.heartbeat, String(Date.now()));
     const state = readJsonSafe(paths.state) ?? {};
     const lastSign = Math.max(readNumber(paths.alive), Date.parse(state.createdAt ?? 0) || 0);
@@ -2221,10 +2632,7 @@ export async function cmdCancel(runId, { pretty = false } = {}) {
 export function cmdResult(runId, { pretty = false } = {}) {
   if (!RUN_ID_RE.test(String(runId ?? ""))) throw new UsageError("result needs a run id");
   const result = readJsonSafe(runPaths(runId).result);
-  if (result) {
-    print(result, pretty);
-    return result.ok ? 0 : 1;
-  }
+  if (result) return printFinal(result, pretty);
   print({ ultracodex: 1, runnerVersion: RUNNER_VERSION, ok: null, ...describeRun(runId) }, pretty);
   return 3;
 }
@@ -2244,7 +2652,7 @@ export function cmdGc({ olderThanDays = 7, pretty = false } = {}) {
     }
   }
   const inboxes = [];
-  for (const sub of ["inbox", "rejected"]) {
+  for (const sub of ["inbox", "rejected", "relay-roles"]) {
     try {
       const root = path.join(ucxHome(), sub);
       for (const name of fs.readdirSync(root)) {
@@ -2262,7 +2670,12 @@ export function cmdGc({ olderThanDays = 7, pretty = false } = {}) {
   try {
     for (const name of fs.readdirSync(slotsDir())) {
       const dir = path.join(slotsDir(), name);
-      if (slotIsStale(dir)) {
+      const owner = slotOwner(dir);
+      // gc removes only provably dead leases: tombstones/debris, an owner whose PID is gone,
+      // or a lease generation nobody has renewed for a stale window.
+      const debris = name.includes(".stale-") || name.includes(".released-") || name.includes(".tmp-");
+      const dead = debris || !owner ? debrisIsOld(dir) : owner.partial ? debrisIsOld(owner.leasePath) : Boolean(owner.pid) && !pidAlive(owner.pid);
+      if (dead) {
         fs.rmSync(dir, { recursive: true, force: true });
         slots.push(name);
       }
@@ -2389,6 +2802,8 @@ function helpText() {
     "  node codex-node.mjs run (--request FILE|- | --framed FILE|-)     start + one wait",
     "  node codex-node.mjs status [RUN_ID] [--all]                      list runs",
     "  node codex-node.mjs result RUN_ID                                print the final envelope",
+    "  node codex-node.mjs page RUN_ID K                                 slice K of a large (paged) result",
+    "  node codex-node.mjs key                                          the per-machine result-MAC key (for the Workflow helper)",
     "  node codex-node.mjs cancel RUN_ID                                stop that run's own process tree",
     "  node codex-node.mjs preflight [--live]                           check CLI, auth, catalog (no model call unless --live)",
     "  node codex-node.mjs policy | models | schema PRESET              routing policy, catalog, schema presets",
@@ -2445,6 +2860,9 @@ function parseCli(argv) {
 }
 
 export async function main(argv = process.argv.slice(2)) {
+  // Absolute before anything else: supervisors run with the home as their working
+  // directory, where a relative ULTRACODEX_HOME would resolve somewhere else.
+  if (process.env.ULTRACODEX_HOME) process.env.ULTRACODEX_HOME = path.resolve(process.env.ULTRACODEX_HOME);
   let options;
   try {
     options = parseCli(argv);
@@ -2465,6 +2883,14 @@ export async function main(argv = process.argv.slice(2)) {
       }
       case "wait":
         return await cmdWait(id, { maxWaitSec: options.maxWait ?? DEFAULT_MAX_WAIT_SEC, pretty: options.pretty });
+      case "page":
+        return cmdPage(id, options.positionals[1], options);
+      case "key": {
+        // keyCheck lets the helper catch a key the relay mis-copied
+        const key = ensureKey();
+        print({ ultracodex: 1, runnerVersion: RUNNER_VERSION, ok: true, key, keyCheck: fnv1a(key) }, options.pretty);
+        return 0;
+      }
       case "status":
         return cmdStatus(id, options);
       case "result":

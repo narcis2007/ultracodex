@@ -87,17 +87,28 @@ test("an empty final message is retried once, then reported as empty_output", as
   assert.equal(final.provenance.attempts, 2);
 });
 
+// The fake Codex's own pid, from its argv log.
+function fakeCodexPids(argvLog) {
+  return fs.existsSync(argvLog) ? fs.readFileSync(argvLog, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line).pid) : [];
+}
+
 test("the deadline stops the whole Codex process tree, grandchildren included", async (t) => {
   const home = makeHome(t);
   const pidFile = path.join(home, "grandchild.pid");
+  const argvLog = path.join(home, "argv.jsonl");
   const { final } = await startAndWait(
-    fastEnv(home),
-    { task: `slow\nFAKE_SLEEP_MS=60000\nFAKE_SPAWN_CHILD=${pidFile}`, timeoutSec: 2, maxAttempts: 1 },
+    fastEnv(home, { FAKE_CODEX_ARGV_LOG: argvLog }),
+    // 4 s: long enough for the fake to start its child even on a loaded machine
+    { task: `slow\nFAKE_SLEEP_MS=60000\nFAKE_SPAWN_CHILD=${pidFile}`, timeoutSec: 4, maxAttempts: 1 },
     { home }
   );
   assert.equal(final.ok, false);
   assert.equal(final.state, "timeout");
   assert.equal(final.error.kind, "timeout");
+  const [codexPid] = fakeCodexPids(argvLog);
+  assert.ok(codexPid, "codex was started");
+  assert.ok(await eventually(() => !pidAlive(codexPid)), "codex itself must not survive the deadline");
+  assert.ok(fs.existsSync(pidFile), "the fake started its child before the deadline");
   const grandchild = Number(fs.readFileSync(pidFile, "utf8"));
   assert.ok(await eventually(() => !pidAlive(grandchild)), "the grandchild must not survive the deadline");
 });
@@ -252,13 +263,20 @@ test("a run cancelled while queued never starts Codex", async (t) => {
 test("a failure after spawn stops the run's own tree; a failed state write does not end the run", async (t) => {
   const home = makeHome(t);
   const pidFile = path.join(home, "grandchild.pid");
-  const { final } = await startAndWait(fastEnv(home, { ULTRACODEX_TEST_FAULT: "post-spawn" }), { task: `x\nFAKE_SLEEP_MS=30000\nFAKE_SPAWN_CHILD=${pidFile}` }, { home });
+  const argvLog = path.join(home, "argv.jsonl");
+  // the fault fires 2.5 s after spawn, once the fake has started its own child
+  const { final } = await startAndWait(
+    fastEnv(home, { ULTRACODEX_TEST_FAULT: "post-spawn:2500", FAKE_CODEX_ARGV_LOG: argvLog }),
+    { task: `x\nFAKE_SLEEP_MS=30000\nFAKE_SPAWN_CHILD=${pidFile}` },
+    { home }
+  );
   assert.equal(final.ok, false);
   assert.equal(final.error.kind, "execution");
-  if (fs.existsSync(pidFile)) {
-    const grandchild = Number(fs.readFileSync(pidFile, "utf8"));
-    assert.ok(await eventually(() => !pidAlive(grandchild)), "nothing the run started is left running");
-  }
+  const [codexPid] = fakeCodexPids(argvLog);
+  assert.ok(codexPid && fs.existsSync(pidFile), "codex and its child were running when the failure hit");
+  assert.ok(await eventually(() => !pidAlive(codexPid)), "codex itself is stopped");
+  const grandchild = Number(fs.readFileSync(pidFile, "utf8"));
+  assert.ok(await eventually(() => !pidAlive(grandchild)), "nothing the run started is left running");
   const { final: survived } = await startAndWait(fastEnv(home, { ULTRACODEX_TEST_FAULT: "state-write" }), { task: "y" }, { home });
   assert.equal(survived.ok, true);
 });

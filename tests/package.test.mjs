@@ -49,7 +49,7 @@ test("marketplace lists exactly this plugin from ./plugins/ultracodex", () => {
 test("every skill has name + description frontmatter and uses the substituted runner path", () => {
   const skillsDir = path.join(PLUGIN, "skills");
   const names = fs.readdirSync(skillsDir);
-  assert.deepEqual(names.sort(), ["codex-implement", "codex-review", "codex-workflow"]);
+  assert.deepEqual(names.sort(), ["codex-ask", "codex-implement", "codex-review", "codex-workflow"]);
   for (const name of names) {
     const { fields, body } = frontmatter(path.join(skillsDir, name, "SKILL.md"));
     assert.equal(fields.name, name);
@@ -67,9 +67,12 @@ test("the relay agent is Bash-only, cheap, and reaches the runner through the pl
   assert.equal(fields.tools, "Bash");
   assert.equal(fields.model, "sonnet");
   assert.equal(fields.effort, "low");
-  assert.ok(body.includes('node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" part'));
-  assert.ok(body.includes('node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" wait'));
+  for (const command of ["part", "wait", "page", "key"]) {
+    assert.ok(body.includes(`node "\${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" ${command}`), `the relay knows the ${command} command`);
+  }
   assert.match(body, /part_rejected/);
+  assert.match(body, /ULTRACODEX KEY/);
+  assert.match(body, /"paged"/);
 });
 
 test("the plugin registers the relay guard as a Bash PreToolUse hook", () => {

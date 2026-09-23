@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { createHash, createHmac } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,28 +9,42 @@ import test from "node:test";
 import {
   FRAME_SCHEMA_MARK,
   FRAME_TASK_MARK,
+  MAX_TIMEOUT_SEC,
+  PAGED_THRESHOLD,
+  PAGE_CHARS,
   POLICY,
   SCHEMA_PRESETS,
   acquireSlots,
   buildCodexArgs,
   checkStrictSchema,
   classifyFailure,
+  compactEnvelope,
   computeDeadlineSec,
+  decodeFrameText,
+  encodeFrameText,
+  ensureKey,
   fnv1a,
   framedToRaw,
+  keyPath,
   makeClock,
+  mustEscape,
   normalizeText,
+  pageBody,
   parseApiError,
   parseCatalog,
   parseFramed,
+  parseProcessTable,
   policyTable,
   readUserWindowsSandbox,
   resolveCodexLauncher,
   resolvePolicy,
+  resultBody,
+  resultMac,
   schemaHash,
   summarizeEvents,
   validateRequest,
   validateValue,
+  windowsDescendants,
 } from "../plugins/ultracodex/scripts/codex-node.mjs";
 
 const CATALOG = {
@@ -186,30 +202,166 @@ test("writing tasks are never retried automatically unless declared replay-safe"
   assert.equal(validateRequest({ task: "x", cwd, sandbox: "workspace-write", maxAttempts: 2, replaySafe: true }, { catalog: CATALOG }).maxAttempts, 2);
 });
 
-test("slot leases are fenced: a displaced owner neither renews nor releases the new owner's slot", async (t) => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-slots-"));
-  const previous = { home: process.env.ULTRACODEX_HOME, max: process.env.ULTRACODEX_MAX_CONCURRENT };
-  process.env.ULTRACODEX_HOME = home;
-  process.env.ULTRACODEX_MAX_CONCURRENT = "1";
+function withHome(t, extraEnv = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-home-"));
+  const vars = { ULTRACODEX_HOME: home, ...extraEnv };
+  const previous = Object.fromEntries(Object.keys(vars).map((name) => [name, process.env[name]]));
+  Object.assign(process.env, vars);
   t.after(() => {
-    if (previous.home === undefined) delete process.env.ULTRACODEX_HOME;
-    else process.env.ULTRACODEX_HOME = previous.home;
-    if (previous.max === undefined) delete process.env.ULTRACODEX_MAX_CONCURRENT;
-    else process.env.ULTRACODEX_MAX_CONCURRENT = previous.max;
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
     fs.rmSync(home, { recursive: true, force: true });
   });
+  return home;
+}
+
+test("slot leases are fenced by generation: a displaced owner neither renews nor releases the new owner's slot", async (t) => {
+  const home = withHome(t, { ULTRACODEX_MAX_CONCURRENT: "1" });
   const lease = await acquireSlots(1, "run-A", () => null);
-  const ownerFile = path.join(home, "slots", "slot-0", "owner.json");
-  assert.equal(JSON.parse(fs.readFileSync(ownerFile, "utf8")).runId, "run-A");
-  // simulate B reclaiming the slot after A stalled
-  fs.writeFileSync(ownerFile, JSON.stringify({ runId: "run-B", pid: 1, beatAt: Date.now() }));
+  const slot = path.join(home, "slots", "slot-0");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(slot, "lease-run-A", "owner.json"), "utf8")).runId, "run-A");
+  // simulate B reclaiming the slot after A stalled: A's generation is gone, B's is in place
+  fs.rmSync(path.join(slot, "lease-run-A"), { recursive: true, force: true });
+  fs.mkdirSync(path.join(slot, "lease-run-B"));
+  fs.writeFileSync(path.join(slot, "lease-run-B", "owner.json"), JSON.stringify({ runId: "run-B", pid: process.pid, beatAt: Date.now() }));
   lease.touch();
-  assert.equal(JSON.parse(fs.readFileSync(ownerFile, "utf8")).runId, "run-B", "A must not overwrite B's lease");
-  assert.deepEqual(lease.lost().length, 1);
+  assert.equal(fs.existsSync(path.join(slot, "lease-run-A")), false, "A must not recreate its lease inside B's slot");
+  assert.equal(lease.lost().length, 1, "A notices it was displaced");
   lease.release();
-  assert.ok(fs.existsSync(ownerFile), "A must not release B's slot");
+  assert.ok(fs.existsSync(path.join(slot, "lease-run-B", "owner.json")), "A must not release B's slot");
   const stopped = await acquireSlots(1, "run-C", () => "cancelled");
   assert.equal(stopped.stopped, "cancelled", "a cancelled run never waits for or takes a slot");
+});
+
+// Staleness is counted in the reclaimer's own polls, so the timing knobs must be set
+// before the runner module loads: run the scenario in a child process.
+function slotProbe(t, scenario) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-probe-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const out = spawnSync(process.execPath, [path.join(import.meta.dirname, "fixtures", "slot-probe.mjs"), scenario], {
+    encoding: "utf8",
+    timeout: 60_000,
+    env: { ...process.env, ULTRACODEX_HOME: home, ULTRACODEX_MAX_CONCURRENT: "1", ULTRACODEX_SLOT_POLL_MS: "20", ULTRACODEX_SLOT_STALE_MS: "200" },
+  });
+  assert.equal(out.status, 0, out.stderr);
+  return JSON.parse(out.stdout.trim().split("\n").at(-1));
+}
+
+test("a slot whose owner stopped renewing is reclaimed only after a full stale window of polls", (t) => {
+  const stale = slotProbe(t, "stale-owner");
+  assert.equal(stale.taken, true);
+  assert.ok(stale.polls >= 10, `reclaimed after ${stale.polls} polls (stale window = 10)`);
+  assert.equal(stale.newOwner, "run-Y");
+});
+
+test("a slot whose owner keeps renewing is never reclaimed, and a dead owner's slot is reclaimed at once", (t) => {
+  const live = slotProbe(t, "live-owner");
+  assert.equal(live.taken, false, "a renewing owner keeps its slot");
+  assert.equal(live.stopped, "cancelled");
+  const dead = slotProbe(t, "dead-owner");
+  assert.equal(dead.taken, true);
+  assert.ok(dead.polls <= 2, `a dead PID is reclaimed immediately (took ${dead.polls} polls)`);
+});
+
+test("an owner file that cannot be read this instant does not make a live lease look abandoned", (t) => {
+  const fresh = slotProbe(t, "partial-fresh");
+  assert.equal(fresh.taken, false, "the lease directory is still being renewed");
+  const old = slotProbe(t, "partial-old");
+  assert.equal(old.taken, true, "a lease nobody renews is debris");
+});
+
+test("windowsDescendants follows only genuine parent links (created after the parent)", () => {
+  const table = parseProcessTable(["", "  100 1 500", "200 100 600", "300 200 700", "400 100 400", "500 400 800", "garbage line", "600 300 650"].join("\r\n"));
+  assert.equal(table.length, 6);
+  const found = windowsDescendants({ pid: 100, created: 500 }, table).map((proc) => proc.pid);
+  // 400 claims parent 100 but predates it (an orphan whose dead parent's PID was reused): not ours, nor its child 500.
+  // 600 claims parent 300 but predates it the same way.
+  assert.deepEqual(found.sort(), [200, 300]);
+  // parent 300 died and its PID now belongs to a younger process (created 900): only the
+  // children created before 900 can be 300's.
+  const reused = parseProcessTable(["200 100 600", "300 1 900", "700 300 750", "800 300 950"].join("\n"));
+  assert.deepEqual(windowsDescendants({ pid: 100, created: 500 }, reused).map((proc) => proc.pid), [200]);
+  assert.deepEqual(windowsDescendants({ pid: 300, created: 700 }, reused).map((proc) => proc.pid), [700], "800 belongs to the new holder of PID 300");
+});
+
+test("the result key is created once, private, and signs runId + SHA-256(task) + body", (t) => {
+  withHome(t);
+  const key = ensureKey();
+  assert.match(key, /^[0-9a-f]{64}$/);
+  assert.equal(ensureKey(), key, "the key is stable");
+  if (process.platform !== "win32") assert.equal(fs.statSync(keyPath()).mode & 0o077, 0, "not readable by others");
+  const task = "Check é and " + String.fromCodePoint(0x1f600);
+  const expected = createHmac("sha256", Buffer.from(key, "hex"))
+    .update(`R\n${createHash("sha256").update(task, "utf8").digest("hex")}\n{"a":1}`, "utf8")
+    .digest("hex");
+  assert.equal(resultMac(key, "R", task, '{"a":1}'), expected);
+  assert.notEqual(resultMac(key, "R", task + " ", '{"a":1}'), expected, "bound to the task");
+  assert.equal(resultBody({ result: { a: 1 } }), '{"a":1}');
+  assert.equal(resultBody({ text: "t" }), "t");
+});
+
+test("large results are paged: a compact envelope plus pages that rebuild the body exactly", () => {
+  const small = { ultracodex: 1, ok: true, state: "done", runId: "R", result: { a: 1 }, resultHash: "x", mac: "m" };
+  assert.equal(compactEnvelope(small), small, "small results print whole");
+  const big = { ...small, result: { text: "q\"u\\o".repeat(8000) } };
+  const compact = compactEnvelope(big);
+  assert.equal(compact.result, undefined);
+  assert.equal(compact.mac, "m", "the signature stays on the compact envelope");
+  const body = pageBody(big);
+  assert.equal(compact.paged.pages, Math.ceil(body.length / PAGE_CHARS));
+  assert.ok(compact.paged.pages > 1);
+  assert.ok(JSON.stringify(compact).length < PAGED_THRESHOLD);
+  const pages = Array.from({ length: compact.paged.pages }, (_, i) => body.slice(i * PAGE_CHARS, (i + 1) * PAGE_CHARS));
+  assert.deepEqual(JSON.parse(pages.join("")).result, big.result);
+  for (const page of pages) assert.ok(JSON.stringify({ ultracodex: 1, runId: "20260923T000000Z-abcdef", page: 1, pages: 9, data: page }).length < 30_000, "a page line fits the Bash output limit");
+});
+
+test("readUserWindowsSandbox understands quoted tables, dotted keys and inline tables", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-codexhome-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const read = (toml) => {
+    fs.writeFileSync(path.join(home, "config.toml"), toml);
+    return readUserWindowsSandbox({ CODEX_HOME: home });
+  };
+  assert.equal(read('["windows"]\nsandbox = "elevated"\n'), "elevated");
+  assert.equal(read('model = "x"\nwindows.sandbox = "elevated"\n'), "elevated");
+  assert.equal(read('windows = { sandbox = "unelevated" }\n'), "unelevated");
+  assert.equal(read('[windows.extra]\nsandbox = "wrong"\n'), null, "a sub-table is not [windows]");
+});
+
+test("a batch of N items scales the default deadline, an explicit timeoutSec is kept", (t) => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-req-"));
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  const one = validateRequest({ task: "x", cwd, kind: "verify" }, { catalog: CATALOG });
+  const five = validateRequest({ task: "x", cwd, kind: "verify", workItems: 5 }, { catalog: CATALOG });
+  assert.equal(five.timeoutSec, Math.round(one.timeoutSec * 2));
+  const many = validateRequest({ task: "x", cwd, kind: "verify", workItems: 256 }, { catalog: CATALOG });
+  assert.equal(many.timeoutSec, Math.min(MAX_TIMEOUT_SEC, one.timeoutSec * 4), "at most x4");
+  assert.equal(validateRequest({ task: "x", cwd, workItems: 9, timeoutSec: 600 }, { catalog: CATALOG }).timeoutSec, 600);
+  assert.throws(() => validateRequest({ task: "x", cwd, workItems: 0 }, { catalog: CATALOG }), /workItems/);
+});
+
+test("the frame encoder round-trips every kind of character and leaves nothing a shell or relay could mangle", () => {
+  const specials = [0x00, 0x07, 0x09, 0x0d, 0x1b, 0x25, 0x27, 0x5c, 0x7f, 0x85, 0xa0, 0xad, 0x061c, 0x200b, 0x200e, 0x202e, 0x2028, 0x2029, 0x2066, 0x3000, 0xfe0f, 0xfeff, 0xd800, 0xdfff, 0xe0001, 0xe0100, 0x1f600, 0x10ffff];
+  let seed = 7;
+  const next = () => (seed = (seed * 1103515245 + 12345) % 2147483648);
+  for (let round = 0; round < 200; round += 1) {
+    let text = "";
+    for (let i = 0; i < 40; i += 1) {
+      const pick = next() % 3;
+      text += pick === 0 ? String.fromCodePoint(specials[next() % specials.length])
+        : pick === 1 ? " plain %5C %u0041 %25 %+ text "
+          : String.fromCodePoint(0x20 + (next() % 0x2ff));
+    }
+    const encoded = encodeFrameText(text);
+    // '%' only ever opens one of the escapes; everything else is safe as it stands
+    const rest = encoded.replace(/%(25|5C|27|u[0-9A-F]{4}|U[0-9A-F]{6})/g, "");
+    assert.equal(rest.includes("%"), false, "a bare % in the encoding");
+    for (const char of rest) assert.equal(mustEscape(char), false, `U+${char.codePointAt(0).toString(16)} left unescaped`);
+    assert.equal(decodeFrameText(encoded), text);
+  }
 });
 
 test("without a catalog, ultra is still refused on luna", (t) => {

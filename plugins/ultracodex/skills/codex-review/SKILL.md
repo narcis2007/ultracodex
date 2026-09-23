@@ -42,8 +42,11 @@ Workflow({ name: 'ultracodex:codex-review', args: {
 ```
 
 It runs one Codex review per lens (hermetic, read-only, astra ≤2 at a time), has Claude check
-every finding in the code (confirmed / refuted / needs-info) and writes the report. A lens that
-failed makes the result `incomplete` — say which lens and why.
+every finding in the code (confirmed / refuted / needs-info), sends the high/critical findings
+Claude refuted or could not settle to gpt-6-astra in one run (`escalate`, default on below the
+final tier) and writes the report. A lens that failed makes the result `incomplete` — say
+which lens and why. **Disputed** findings (Claude doubted them, astra upheld them) go to the
+owner with both reasonings. Mention `codexUsage` (runs and tokens per model) in the summary.
 
 ## 3. Or by hand (no Workflow)
 
@@ -78,8 +81,9 @@ together (the runner queues beyond its machine-wide cap).
 For every finding: open the file and the callers, and decide **confirmed** (defect real,
 failure scenario reachable), **refuted** (say why), or **needs-info** (what must be checked).
 Codex is evidence, not authority. When you and a sol review disagree on something important,
-re-check that single finding on the final tier (`tier: 'final'`, `kind: 'verify'`,
-`schemaPreset: 'verdict'`).
+re-check those findings on the final tier in **one** request (`tier: 'final'`, `kind: 'verify'`,
+the multi-claim schema from the `codex-ask` skill, `workItems: N`) — the workflow does this
+itself (`escalate`).
 
 ## 5. Report
 

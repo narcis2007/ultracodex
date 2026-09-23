@@ -17,6 +17,8 @@ shell. Every command prints one JSON line tagged `{"ultracodex":1,...}`; exit co
 | `wait RUN_ID [--max-wait SEC]` | poll up to 110 s (default); prints the final envelope or the running state; refreshes the heartbeat |
 | `run --request FILE` | start + one wait |
 | `status [RUN_ID] [--all]` · `result RUN_ID` | inspect runs (never refresh the heartbeat) |
+| `page RUN_ID K` | slice K of a large result (see "Paged results") |
+| `key` | the per-machine result key + its `keyCheck`, for the Workflow helper's KEY relay only |
 | `cancel RUN_ID` | ask that run's supervisor to stop its own process tree |
 | `preflight [--live]` | CLI, auth, catalog, policy models, home dir; `--live` = one tiny luna call |
 | `dry-run --request FILE` | show the exact codex argv, model, effort, deadline — no model call |
@@ -26,18 +28,30 @@ Request fields (unknown fields are rejected): `task` or `taskFile`; `schema` / `
 `schemaPreset` (`verdict`, `score`, `review`, `implement`); `cwd`; `sandbox` (`read-only` default,
 `workspace-write`); `tier` (`light`/`daily`/`final`); `kind` (`verify`/`ask`/`review`/`implement`);
 `model`, `effort` (overrides); `hermetic` (default true); `network` (workspace-write only);
-`timeoutSec`; `maxAttempts` (default 2 for read-only work, **1 for writing tasks** — workspace-write
+`timeoutSec` (default from the policy; scaled ×(1 + 0.25·(N−1)), at most ×4, by `workItems: N`
+for a batch); `maxAttempts` (default 2 for read-only work, **1 for writing tasks** — workspace-write
 or resume — which may only retry with `replaySafe: true`, since a replay could apply effects
 twice); `attached` (default true — torn down when nobody polls
-for `orphanAfterSec`, default 300); `ephemeral` (default: true except implement/resume);
+for `orphanAfterSec`, default 300; the Workflow helper sends 900); `ephemeral` (default: true except implement/resume);
 `label`; `meta` (echoed back); `serviceTier` (`priority` = Fast); `addDirs`; `images`;
 `profile`; `review: {base|commit|uncommitted, title}`; `resume: {sessionId}`.
 
-Envelope: `ok: true` + `result` (schema) or `text`, `resultHash` (FNV-1a of the result, so a
-relay's transcription can be verified), and `provenance` {threadId, model, effort, tier, mode,
-sandbox, hermetic, usage, durationMs, attempts, codexVersion, launcher, taskHash}.
-Failures: `ok: false`, `state` (`failed`, `timeout`, `cancelled`, `abandoned`, `rejected`,
-`lost`) and `error` {kind, retryable, message}.
+Envelope: `ok: true` + `result` (schema) or `text`, `resultHash` (FNV-1a of the body, so a
+relay's transcription can be verified), `mac` (HMAC-SHA256 under `~/.ultracodex/key` over
+`runId \n SHA-256(task) \n body` — proves this machine's runner produced it for this task), and
+`provenance` {threadId, model, effort, tier, mode, sandbox, hermetic, usage (last attempt),
+usageTotal (all attempts), durationMs, attempts, codexVersion, launcher, taskHash, teardown,
+slotLost}. Failures: `ok: false`, `state` (`failed`, `timeout`, `cancelled`, `abandoned`,
+`rejected`, `lost`) and `error` {kind, retryable, message}.
+
+### Paged results
+
+The Bash tool shows a model only a short preview of output over ~30 000 characters. Above
+24 000, `wait`/`result` print a compact envelope — no `result`/`text`, plus
+`paged: {pages, chars, file}` — and `page RUN_ID K` prints slice K (10 000 characters) of the
+body JSON. `resultHash` and `mac` still cover the whole body. From the main conversation,
+simply read `paged.file` with the Read tool; the relay fetches the pages and the helper
+stitches and verifies them.
 
 Runs live in `~/.ultracodex/runs/<runId>/` (request, task, schema, state, per-attempt
 `events.jsonl` / `stderr.log` / `last.txt`, `supervisor.log`, `result.json`). `gc` removes
@@ -55,18 +69,22 @@ sleep the supervisor extends the deadline by the time asleep and pauses abandonm
 
 `hooks/hooks.json` registers `scripts/relay-guard.mjs` as a PreToolUse hook. It ignores every
 tool call except those from the `ultracodex:codex-relay` agent (hook input `agent_type`), and
-for the relay it allows exactly two command shapes without a permission prompt —
+for the relay it allows exactly these command shapes without a permission prompt —
 `node "<plugin>/scripts/codex-node.mjs" part (new|ucx-…) K N HASH <<'UCX_P…' … UCX_P…` with a
-quote- and backslash-free body, and `… wait <runId>` — and denies everything else. A relay
-that was prompt-injected by reviewed content therefore cannot run other commands, pick another
-executable, or compute the hashes a fabricated result would need. Residual risk: with hooks
-disabled (`disableAllHooks`) the relay keeps its plain Bash tool; results are still bound to
-the helper's own `taskHash` and must carry a matching `resultHash`.
+quote- and backslash-free body, `… wait <runId>`, `… page <runId> <k>` and `… key` — and
+denies everything else. Roles are fixed by a relay's first command (recorded in
+`~/.ultracodex/relay-roles/<agent_id>`): a relay that uploaded or collected a job — and so
+had untrusted text in its prompt — can never read the key, and the key relay can never run a
+job. A relay prompt-injected by reviewed content therefore cannot run other commands, pick
+another executable, compute hashes, or sign a fabricated result. Residual risk: with hooks
+disabled (`disableAllHooks`) the relay keeps its plain Bash tool and could read the key file;
+results are then still bound to the request (`taskHash`, SHA-256 of the task in the mac) and
+must carry a matching `resultHash`.
 
-The runner also never resolves executables through the current directory: `taskkill` is called
-by its System32 path and supervisors run with `~/.ultracodex` as their working directory.
-There is no command-line option to replace the Codex binary (only the operator's
-`ULTRACODEX_CODEX_PATH`).
+The runner also never resolves executables through the current directory: `taskkill` and
+PowerShell are called by their System32 paths and supervisors run with `~/.ultracodex` as
+their working directory. There is no command-line option to replace the Codex binary (only
+the operator's `ULTRACODEX_CODEX_PATH`).
 
 ### Why a supervisor
 
@@ -75,9 +93,13 @@ There is no command-line option to replace the Codex binary (only the operator's
   subagent answers. Real Codex runs take 8–60+ minutes, so a relay must never block on `codex exec`.
 - On Windows, the Codex process is a native `codex.exe` that Git Bash cannot signal or even see
   (`pgrep` and `ps -o` do not exist there). The supervisor spawns `codex.exe` directly (resolved
-  behind the npm shim, with the same `CODEX_MANAGED_*` env the shim sets) and tears it down with
-  `taskkill /T /F` on the PID it holds — on POSIX, via the process group. It only ever stops the
-  tree it started.
+  behind the npm shim, with the same `CODEX_MANAGED_*` env the shim sets) and tracks its tree by
+  identity (PID + creation time, snapshotted every minute), so a child is only ever taken for
+  ours when it was created after its parent and before any reuse of the parent's PID. Teardown
+  is `taskkill /F /PID` on exactly those identities (never `/T`, which trusts reused parent
+  PIDs), then a re-check that also stops children started during the teardown; whatever
+  survives is reported. On POSIX: the child's process group, SIGTERM then SIGKILL. It only
+  ever stops the tree it started.
 - Detached, the run survives the relay's Bash call ending and even the relay dying; the
   heartbeat rule then cleans up attached runs.
 
@@ -147,6 +169,8 @@ MCP OAuth refresh noise filtered out.
 | `schema_mismatch` · `parse` | no | output did not match / was not JSON |
 | `invalid_request` · `execution` · `spawn` | no | inspect `supervisor.log` and `attempt-*/stderr.log` |
 | `relay_corruption` | helper retries once | relay altered the upload (hash mismatch) |
+| `upload_busy` | no | another caller is assembling that upload (rare; a scanner lock is retried first) |
+| `unauthenticated_result` · `key_unavailable` | helper re-collects once | result not signed by this runner / key could not be fetched — never trusted |
 | `supervisor_lost` | no | supervisor died; Codex may still run — **not** stopped automatically, ask the owner |
 
 ## Headless (`claude -p`) sessions
@@ -163,7 +187,10 @@ A run whose relay died can be rescued within `orphanAfterSec` by polling it
 - The Bash tool halves backslash pairs in commands (`\\` → `\`) — never pass backslashes
   through a command; the relay payload is percent-encoded.
 - Commands longer than ~7–8 KB break (`unexpected EOF while looking for matching '`): the
-  Windows command-line limit. Payloads go in ≤2.4 KB parts.
+  Windows command-line limit. Payloads go in ≤1.6 KB parts.
+- A directory (or file) written a moment ago can refuse a rename with `EPERM` while Defender
+  or the indexer holds a handle — measured at ~1 % of directory renames. The runner retries
+  those renames (slot leases, upload claims) for up to a second instead of failing the run.
 - `pgrep`, `setsid` and `ps -o` do not exist; `/proc/<pid>/winpid` maps an MSYS PID to the
   Windows PID if you ever need it.
 - `codex` in Git Bash is an sh shim → `node.exe` → native `codex.exe`; killing the shell or node

@@ -24,4 +24,5 @@ return {
   status: ok ? 'complete' : 'incomplete',
   trustworthy: ok && verdict.refuted === false,
   verdict: ok ? { refuted: verdict.refuted, confidence: verdict.confidence, reasoning: verdict.reasoning, codex: verdict._codex } : verdict,
+  codexUsage: ucxUsage(),
 }

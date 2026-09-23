@@ -25,6 +25,21 @@ Rules of thumb:
   astra@xhigh; the runner always passes model and effort explicitly, and hermetic runs ignore the
   user config anyway.
 
+## Cost playbook — maximum signal per token
+
+| situation | cheapest setup that still works |
+| --- | --- |
+| one question / one claim, from the conversation | direct runner call (`codex-ask`), no relay; tier by difficulty |
+| N findings to verify | one batch run (`codexBatchNode`), sol@xhigh; never N astra runs |
+| findings that would block a merge | the batch above, then **one** astra@max batch over the confirmed high/critical ones (`cross-review` `finalGate`) |
+| Codex found it, Claude doubts it (high/critical) | one astra batch over just those (`codex-review` `escalate`) |
+| a quick look at a small or mechanical change | `codex-review` with `tier: 'light'` (luna@max) |
+| the last gate before merge/deploy of risky code | `codex-review` `tier: 'final'` (astra per lens, ≤2 at a time) |
+
+When astra disagrees with sol or Claude, the item is **disputed**: report both reasonings and
+let the owner decide — do not re-run until the answer you want appears. Every shipped workflow
+returns `codexUsage` (runs, failed runs and tokens per model); use it to see what a run cost.
+
 ## kinds
 
 | kind | Meaning | Default deadline base |
@@ -35,7 +50,7 @@ Rules of thumb:
 | `implement` | writes code in a worktree (`sandbox: workspace-write`) — skills only, never a workflow node | 90 min |
 
 Deadline = base × model factor (luna 0.5, sol 1, astra 1.5) × effort factor (xhigh/max 1,
-ultra 1.5). Examples: luna@max verify 12.5 min · sol@xhigh verify 25 min · sol@max review
+ultra 1.5), and for a batch of N items × (1 + 0.25·(N−1)), at most ×4. Examples: luna@max verify 12.5 min · sol@xhigh verify 25 min · sol@max review
 45 min · astra@max review 67.5 min · astra@max implement 135 min. The deadline is a runaway
 guard, not an estimate: measured on this machine, astra@max review lenses take 25–35 min and
 implementations 30–60 min. Override with `timeoutSec` when a job legitimately needs more.

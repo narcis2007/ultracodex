@@ -16,11 +16,12 @@ see [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 | Component | What it is |
 | --- | --- |
-| Workflow `ultracodex:cross-review` | Claude finders per dimension → Codex refutes each finding against the code → report. Fails closed. |
-| Workflow `ultracodex:codex-review` | Codex reviews through lenses (code, domain, security, tests, performance) → Claude checks every finding in the code → report. |
+| Workflow `ultracodex:cross-review` | Claude finders per dimension → Codex (sol@xhigh, batched) refutes each finding against the code → one astra@max run re-checks the confirmed high/critical ones → report. Fails closed. |
+| Workflow `ultracodex:codex-review` | Codex reviews through lenses (code, domain, security, tests, performance) → Claude checks every finding in the code → high/critical disagreements settled by astra in one run → report. |
 | Workflow `ultracodex:crosscheck` | One Codex (astra@max) attempt to refute a load-bearing claim. |
 | Workflow `ultracodex:judge-panel` | Claude angles + a Codex candidate, a Claude+Codex jury, cross-family ranking, synthesis. |
-| Skill `codex-workflow` | How to blend Codex nodes into custom Workflow scripts (the `codexNode` helper). |
+| Skill `codex-ask` | One question or claim from the conversation, straight to the runner (no relay — the cheapest way to consult Codex). |
+| Skill `codex-workflow` | Modes and cost levers; how to blend Codex nodes into custom Workflow scripts (the `codexNode` helper). |
 | Skill `codex-review` | Standalone adversarial review of a branch / commit / uncommitted change, with triage. |
 | Skill `codex-implement` | Delegate implementation to Codex in a worktree, verify, iterate, review. |
 | Agent `codex-relay` | Internal: the Bash-only relay that runs one Codex job for a Workflow node. |
@@ -36,6 +37,11 @@ see [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 Cascade with astra last; `ultra` only on explicit request, once per run. Details:
 [model-policy.md](plugins/ultracodex/skills/codex-workflow/references/model-policy.md).
+
+Cost, in short: ask directly (`codex-ask`) when one answer is enough; batch small items into
+one run; let sol verify broadly and astra re-check only what would block a merge (the shipped
+reviews do this by default and report any astra disagreement as *disputed*); every shipped
+workflow returns `codexUsage` — runs and tokens per model.
 
 ## Requirements
 
@@ -83,21 +89,24 @@ Workflow script ──agent({agentType:'ultracodex:codex-relay'})──▶ relay
 - **Byte-exact transport.** On Windows the Bash tool halves backslashes and breaks commands over
   ~8 KB. Requests are percent-encoded (no quotes, backslashes or control characters), split into
   small parts with per-part hashes, and verified end to end.
-- **Provenance or it did not happen.** A result without a Codex thread id and token usage is
-  rejected, so a relay that "answers" by itself cannot pass for Codex.
+- **Signed results.** The runner signs every result (HMAC-SHA256 under a per-machine key, bound
+  to the SHA-256 of the task); the helper refuses anything unsigned, foreign or without a Codex
+  thread id and token usage, so a relay that "answers" by itself cannot pass for Codex. Large
+  results travel in verified pages.
 - **Hermetic by default.** Verification and review runs ignore `~/.codex/config.toml` (no user
   MCP servers); the Windows sandbox setting is carried over.
 - **Own processes only.** The supervisor stops only the tree it started (deadline, cancel, or a
   relay that stopped polling). It never touches other Codex sessions.
-- **A confined relay.** A plugin hook lets the relay agent run exactly the runner's `part` and
-  `wait` commands (without permission prompts) and denies anything else, so reviewed content
-  that tries to hijack the relay gets nowhere. Workflow nodes are read-only and hermetic by
-  construction, and writing tasks are never retried automatically.
+- **A confined relay.** A plugin hook lets the relay agent run exactly the runner's `part`,
+  `wait`, `page` and `key` commands (without permission prompts) and denies anything else; a
+  relay that has seen a job's text can never read the key. Reviewed content that tries to
+  hijack the relay gets nowhere. Workflow nodes are read-only and hermetic by construction,
+  and writing tasks are never retried automatically.
 
 ## Development
 
 ```bash
-npm test           # 50+ offline tests (fake Codex CLI, stubbed workflow runtime) — no quota
+npm test           # 90+ offline tests (fake Codex CLI, stubbed workflow runtime) — no quota
 npm run build      # regenerate plugins/ultracodex/workflows/*.js and the helper block in the docs
 npm run check      # build --check + tests
 npm run preflight

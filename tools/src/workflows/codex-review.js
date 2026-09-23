@@ -1,11 +1,12 @@
 export const meta = {
   name: 'codex-review',
-  description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude. Daily tier sol@max, final gate astra@max. Fails closed.',
-  whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: daily|final, context, lessons, triage }',
+  description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude; high/critical disagreements go to astra@max. Daily tier sol@max, final gate astra@max. Fails closed.',
+  whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: light|daily|final, context, lessons, triage, escalate }',
   phases: [
     { title: 'Review', detail: 'one Codex review per lens (read-only, hermetic)' },
     { title: 'Triage', detail: 'Claude checks each Codex finding against the code' },
-    { title: 'Report', detail: 'confirmed / refuted / needs-info / unverified' },
+    { title: 'Escalate', detail: 'astra@max settles the high/critical findings Claude refuted or could not settle, in one run' },
+    { title: 'Report', detail: 'confirmed / disputed / refuted / needs-info / unverified' },
   ],
 }
 
@@ -15,6 +16,8 @@ const A = args || {}
 const CWD = A.cwd || null
 const TIER = A.tier === 'final' ? 'final' : A.tier === 'light' ? 'light' : 'daily'
 const TRIAGE = A.triage !== false
+// Escalate disagreements, astra last (off with escalate: false; moot when astra reviewed)
+const ESCALATE = TRIAGE && TIER !== 'final' && A.escalate !== false
 const CONTEXT = A.context ? '\nWHAT THE CHANGE IS FOR / DOMAIN RULES (from the owner):\n' + A.context : ''
 const LESSONS = A.lessons ? '\nBefore reviewing, read ' + A.lessons + ' — a checklist of defect classes this project keeps producing — and check the change against every item.' : ''
 const SCOPE = A.commit
@@ -52,7 +55,9 @@ const lensResults = await pipeline(
   key => codexNode(lensTask(key), { schemaPreset: 'review', tier: TIER, kind: 'review', cwd: CWD || undefined, label: 'codex:' + key, phase: 'Review' }),
   async (review, key) => {
     if (isCodexError(review)) return { lens: key, error: review, findings: [] }
-    const findings = (review.findings || []).map(f => ({ ...f, id: key + ':' + f.id, lens: key }))
+    // Positional ids: Codex-chosen ids can collide or be empty, and must never cost a
+    // finding (or break the escalation batch). Codex's own id is kept as sourceId.
+    const findings = (review.findings || []).map((f, i) => ({ ...f, sourceId: f.id, id: key + ':' + (i + 1), lens: key }))
     if (!TRIAGE) return { lens: key, verdict: review.verdict, summary: review.summary, findings }
     // A triage that fails keeps its finding, as needs_info — it is never dropped.
     const failedTriage = reason => ({ verdict: 'needs_info', reasoning: 'Claude triage failed (' + reason + ') — check this finding by hand', failed: true })
@@ -70,17 +75,56 @@ const lenses = lensKeys.map((key, i) => lensResults[i] || { lens: key, error: uc
 const failedLenses = lenses.filter(l => l.error)
 const findings = lenses.flatMap(l => l.findings)
 const failedTriages = findings.filter(f => f.triage && f.triage.failed)
-const by = v => findings.filter(f => (TRIAGE ? f.triage && f.triage.verdict === v : v === 'confirmed'))
-const confirmed = by('confirmed'), refuted = TRIAGE ? by('refuted') : [], needsInfo = TRIAGE ? by('needs_info') : []
 if (failedLenses.length) log('⚠ ' + failedLenses.length + '/' + lensKeys.length + ' Codex lenses failed — the review is INCOMPLETE')
+
+// A high/critical Codex finding that Claude refuted or could not settle is where the two
+// families disagree on something that matters: gpt-6-astra reads the code and decides, in
+// one run. astra refuting it settles it; astra upholding it makes it DISPUTED (the owner
+// decides — never silently dropped); a failed escalation leaves Claude's triage standing.
+const escalation = { ran: false, checked: 0, upheld: 0, settled: 0, failed: 0 }
+const contested = ESCALATE
+  ? findings.filter(f => ['critical', 'high'].includes(f.severity) && f.triage && ['refuted', 'needs_info'].includes(f.triage.verdict))
+  : []
+if (contested.length) {
+  phase('Escalate')
+  escalation.ran = true
+  escalation.checked = contested.length
+  const batch = await codexBatchNode(`You are the final judge between two reviewers. Each item below is a defect a Codex reviewer reported about ${SCOPE} in your working directory; a Claude reviewer then doubted it (claude_triage says why).
+Read the cited code and its callers yourself. Set refuted=true if the defect is not real or its failure scenario is unreachable; refuted=false only when the code confirms it.
+confidence is 0..1. reasoning must cite what you read and answer the doubt.`,
+    contested.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, evidence: f.evidence, failure_scenario: f.failure_scenario, claude_triage: f.triage.reasoning })),
+    { tier: 'final', kind: 'verify', cwd: CWD || undefined, label: 'codex:escalate', phase: 'Escalate' })
+  for (const f of contested) {
+    const v = isCodexError(batch) ? batch
+      : batch.ambiguous.includes(f.id) ? ucxError('ambiguous_verdict', 'astra answered ' + f.id + ' more than once')
+        : (batch.byId.get(f.id) || ucxError('missing_from_batch', 'astra returned no verdict for ' + f.id))
+    if (isCodexError(v)) { escalation.failed++; f.escalation = { error: v.kind } }
+    else { f.escalation = v; if (v.refuted === true) escalation.settled++; else escalation.upheld++ }
+  }
+  if (escalation.failed) log('⚠ the astra escalation could not check ' + escalation.failed + '/' + contested.length + ' findings — Claude\'s triage stands for them')
+  if (escalation.upheld) log('⚠ ' + escalation.upheld + ' finding(s) DISPUTED: Claude doubted them, gpt-6-astra upheld them')
+}
+// bucket = triage verdict, moved by a successful escalation
+const bucketOf = f => {
+  const e = f.escalation
+  if (e && !e.error) return e.refuted === true ? 'refuted' : 'disputed'
+  return f.triage.verdict
+}
+// Without triage nothing is confirmed: Codex's findings are reported as untriaged.
+const by = v => (TRIAGE ? findings.filter(f => f.triage && bucketOf(f) === v) : [])
+const confirmed = by('confirmed'), refuted = by('refuted'), needsInfo = by('needs_info'), disputed = by('disputed')
+const untriaged = TRIAGE ? [] : findings
+const whyRefuted = f => (f.escalation && !f.escalation.error ? 'gpt-6-astra: ' + f.escalation.reasoning : f.triage.reasoning)
 
 phase('Report')
 const report = await agent(`Write the final review report for ${SCOPE}.
 ${failedLenses.length ? 'At the very top, state that these lenses FAILED and were not reviewed: ' + JSON.stringify(failedLenses.map(l => ({ lens: l.lens, error: l.error.kind, message: l.error.message }))) : ''}
 Per-lens Codex verdicts: ${JSON.stringify(lenses.filter(l => !l.error).map(l => ({ lens: l.lens, verdict: l.verdict, summary: l.summary })))}
 CONFIRMED findings (rank by severity; file:line, failure scenario, fix): ${JSON.stringify(confirmed)}
+${disputed.length ? 'DISPUTED findings (Claude doubted them, the gpt-6-astra escalation upheld them — present both sides and say the owner must decide): ' + JSON.stringify(disputed.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, severity: f.severity, claude: f.triage.reasoning, astra: f.escalation.reasoning }))) : ''}
+${untriaged.length ? 'UNTRIAGED Codex findings (triage was off — present them as unverified claims, not as confirmed defects): ' + JSON.stringify(untriaged) : ''}
 NEEDS-INFO findings (say what must be checked): ${JSON.stringify(needsInfo)}
-REFUTED by triage (one line each, with the reason): ${JSON.stringify(refuted.map(f => ({ id: f.id, title: f.title, why: f.triage.reasoning })))}
+REFUTED findings (one line each, with the reason): ${JSON.stringify(refuted.map(f => ({ id: f.id, title: f.title, why: whyRefuted(f) })))}
 End with a one-line overall verdict: ship / ship after fixes / do not ship.`, { label: 'report', phase: 'Report' })
 
 if (failedTriages.length) log('⚠ ' + failedTriages.length + ' findings could not be triaged — kept as needs-info')
@@ -90,6 +134,8 @@ return {
   tier: TIER,
   report,
   lenses: lenses.map(l => ({ lens: l.lens, verdict: l.verdict || null, error: l.error ? l.error.kind : null })),
-  confirmed, needsInfo,
-  refuted: refuted.map(f => ({ id: f.id, title: f.title, why: f.triage.reasoning })),
+  confirmed, disputed, needsInfo, untriaged,
+  refuted: refuted.map(f => ({ id: f.id, title: f.title, why: whyRefuted(f) })),
+  escalation: ESCALATE ? escalation : null,
+  codexUsage: ucxUsage(),
 }
