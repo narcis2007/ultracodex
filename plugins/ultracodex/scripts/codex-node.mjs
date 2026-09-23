@@ -913,6 +913,17 @@ export function framedToRaw({ header, schema, task }) {
   if (typeof header.schemaHash === "string" && schemaHash(schema) !== header.schemaHash) {
     throw new RequestError("relay_corruption", "schema differs from what the workflow sent (hash mismatch)");
   }
+  // Framed requests come from a relaying model. Whatever it was told, it may only
+  // start read-only, hermetic jobs with the task it was given inline — never a
+  // write sandbox, a resumed (possibly writable) session, local files or config.
+  const forbidden = ["taskFile", "schemaFile", "resume", "addDirs", "images", "profile", "network"].filter(
+    (key) => header[key] !== undefined && header[key] !== null && header[key] !== false
+  );
+  if (header.sandbox !== undefined && header.sandbox !== "read-only") forbidden.push("sandbox");
+  if (header.hermetic === false) forbidden.push("hermetic");
+  if (forbidden.length) {
+    throw new RequestError("invalid_request", `relayed requests are read-only and hermetic; not allowed: ${forbidden.join(", ")}`);
+  }
   const raw = { ...header, task };
   delete raw.v;
   delete raw.h;
@@ -1355,9 +1366,32 @@ export function killProcessTree(child, { platform = process.platform } = {}) {
 
 // ─── the supervisor ─────────────────────────────────────────────────────────
 
-function stopReason(paths, request) {
+// A gap this long between ticks of a 1-second loop means the machine was suspended.
+const SUSPEND_GAP_MS = 30_000;
+
+// Suspend detector: after a sleep, nobody could poll and the wall clock jumped, so
+// the missing heartbeat is not abandonment and the lost time is not work.
+export function makeClock(request) {
+  let last = Date.now();
+  let graceUntil = 0;
+  return {
+    tick() {
+      const now = Date.now();
+      const gap = now - last;
+      last = now;
+      if (gap > SUSPEND_GAP_MS) {
+        graceUntil = now + request.orphanAfterSec * 1000;
+        return gap;
+      }
+      return 0;
+    },
+    inGrace: () => Date.now() < graceUntil,
+  };
+}
+
+function stopReason(paths, request, clock = null) {
   if (fs.existsSync(paths.cancel)) return "cancelled";
-  if (request.attached) {
+  if (request.attached && !clock?.inGrace()) {
     const beat = readNumber(paths.heartbeat);
     if (beat && Date.now() - beat > request.orphanAfterSec * 1000) return "abandoned";
   }
@@ -1513,7 +1547,7 @@ async function runAttempt(request, paths, attempt, context) {
 
   let outcome = { exitCode: null, stop: null, timedOut: false };
   if (child && !spawnError) {
-    const deadlineAt = startedAt + request.timeoutSec * 1000;
+    let deadlineAt = startedAt + request.timeoutSec * 1000;
     updateState(paths, {
       state: "running",
       attempt,
@@ -1540,10 +1574,15 @@ async function runAttempt(request, paths, attempt, context) {
       child.on("exit", (code) => finish(code, null));
       const timer = setInterval(() => {
         if (done || stop || timedOut) return;
+        const suspendedMs = context.clock.tick();
+        if (suspendedMs) {
+          deadlineAt += suspendedMs; // time asleep is not time worked
+          appendLine(paths.log, `${nowIso()} resumed after ~${Math.round(suspendedMs / 1000)} s suspended; deadline moved`);
+        }
         if (Date.now() >= deadlineAt) {
           timedOut = true;
         } else {
-          stop = stopReason(paths, request);
+          stop = stopReason(paths, request, context.clock);
         }
         if (timedOut || stop) {
           appendLine(paths.log, `${nowIso()} stopping codex pid ${child.pid}: ${timedOut ? "deadline" : stop}`);
@@ -1631,7 +1670,12 @@ export async function superviseRun(runId) {
   }, TIMING.aliveMs);
   let envelope;
   try {
-    slot = await acquireSlots(request.weight, runId, () => stopReason(paths, request));
+    const clock = makeClock(request);
+    const check = () => {
+      clock.tick();
+      return stopReason(paths, request, clock);
+    };
+    slot = await acquireSlots(request.weight, runId, check);
     if (slot.stopped) {
       envelope = failureEnvelope(request, runId, slot.stopped, classifyFailure({ cancelled: slot.stopped === "cancelled", abandoned: slot.stopped === "abandoned" }));
     } else {
@@ -1662,6 +1706,7 @@ export async function superviseRun(runId) {
         const context = {
           runId,
           launcher,
+          clock,
           codexVersion: probeCodexVersion(launcher),
           windowsSandbox: request.hermetic ? readUserWindowsSandbox() : null,
         };
@@ -1671,7 +1716,7 @@ export async function superviseRun(runId) {
           if (outcome.done || !outcome.classification.retryable || attempt === request.maxAttempts) break;
           log(`attempt ${attempt} failed (${outcome.classification.kind}); backing off`);
           updateState(paths, { state: "backoff", attempt });
-          const stop = await sleepUnlessStopped(TIMING.backoffMs * attempt, () => stopReason(paths, request));
+          const stop = await sleepUnlessStopped(TIMING.backoffMs * attempt, check);
           if (stop) {
             envelope = failureEnvelope(request, runId, stop, classifyFailure({ cancelled: stop === "cancelled", abandoned: stop === "abandoned" }), envelope.provenance);
             break;
@@ -1904,6 +1949,7 @@ export async function cmdWait(runId, { maxWaitSec = DEFAULT_MAX_WAIT_SEC, pretty
     return 1;
   }
   const until = Date.now() + maxWaitSec * 1000;
+  let staleSince = null;
   for (;;) {
     const result = readJsonSafe(paths.result);
     if (result) {
@@ -1913,7 +1959,11 @@ export async function cmdWait(runId, { maxWaitSec = DEFAULT_MAX_WAIT_SEC, pretty
     writeText(paths.heartbeat, String(Date.now()));
     const state = readJsonSafe(paths.state) ?? {};
     const lastSign = Math.max(readNumber(paths.alive), Date.parse(state.createdAt ?? 0) || 0);
-    if (Date.now() - lastSign > TIMING.lostAfterMs) {
+    // Declared lost only if the supervisor stays silent while we watch — right after a
+    // suspend every timestamp is old, and the supervisor needs a moment to tick again.
+    const silent = Date.now() - lastSign > TIMING.lostAfterMs;
+    staleSince = silent ? staleSince ?? Date.now() : null;
+    if (silent && Date.now() - staleSince >= Math.min(30_000, TIMING.lostAfterMs)) {
       print(
         {
           ultracodex: 1,

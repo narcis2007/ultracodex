@@ -42,6 +42,12 @@ finished runs after 7 days. `ULTRACODEX_HOME` moves the directory; `ULTRACODEX_C
 points at a specific Codex binary; `ULTRACODEX_MAX_CONCURRENT` sets the machine-wide cap (0 =
 unlimited).
 
+Relayed requests (`part`, `start --framed`) are read-only and hermetic by construction: the
+runner refuses `workspace-write`, `hermetic: false`, `network`, `resume`, `taskFile`, `schemaFile`,
+`addDirs`, `images` and `profile` from a relay, even with valid hashes. Suspend-aware: after a
+sleep the supervisor extends the deadline by the time asleep and pauses abandonment for one
+`orphanAfterSec`; `wait` declares `lost` only after watching the supervisor stay silent.
+
 ### Why a supervisor
 
 - The Bash tool's foreground timeout is 2 min by default (10 min max). A command that hits it is

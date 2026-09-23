@@ -140,7 +140,7 @@ function ucxUnwrap(env, raw) {
 
 function codexNode(task, opts = {}) {
   const { schema = null, schemaPreset = null, tier = 'daily', kind = 'verify', model, effort, cwd, timeoutSec,
-    maxAttempts = 2, hermetic = true, orphanAfterSec, label, phase, meta } = opts
+    maxAttempts = 2, orphanAfterSec, label, phase, meta } = opts
   if (typeof task !== 'string' || !task.trim()) throw new Error('codexNode: task must be a non-empty string')
   if (!UCX_TIER_MODEL[tier]) throw new Error('codexNode: tier must be light, daily or final')
   if (!UCX_KINDS.includes(kind)) throw new Error('codexNode: kind must be verify, ask or review (implementation is not a workflow node)')
@@ -152,7 +152,8 @@ function codexNode(task, opts = {}) {
   if (timeoutSec !== undefined && !(Number.isInteger(timeoutSec) && timeoutSec >= 60)) throw new Error('codexNode: timeoutSec must be an integer >= 60')
 
   const text = ucxNormalize(task)
-  const header = { v: 1, tier, kind, sandbox: 'read-only', hermetic, maxAttempts, attached: true }
+  // Workflow nodes are read-only and hermetic by construction; the runner refuses anything else from a relay.
+  const header = { v: 1, tier, kind, sandbox: 'read-only', hermetic: true, maxAttempts, attached: true }
   if (model) header.model = model
   if (effort) header.effort = effort
   if (cwd) header.cwd = String(cwd).replace(/\\/g, '/')

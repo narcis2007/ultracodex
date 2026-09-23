@@ -15,6 +15,7 @@ import {
   computeDeadlineSec,
   fnv1a,
   framedToRaw,
+  makeClock,
   normalizeText,
   parseApiError,
   parseCatalog,
@@ -289,6 +290,44 @@ test("framed requests round-trip and reject a corrupted copy", () => {
   assert.throws(() => framedToRaw(parseFramed(framed.replace("backticks", "backtick"))), (error) => error.kind === "relay_corruption");
   assert.throws(() => parseFramed("not json\n" + FRAME_SCHEMA_MARK), (error) => error.kind === "relay_corruption");
   assert.throws(() => parseFramed(JSON.stringify(header) + "\nno markers"), (error) => error.kind === "relay_corruption");
+});
+
+test("relayed (framed) requests cannot ask for write access, resumed sessions, local files or config", () => {
+  const task = "x";
+  const base = { v: 1, taskHash: fnv1a(task), schemaHash: schemaHash(null) };
+  const frameOf = (extra) => [JSON.stringify({ ...base, ...extra }), FRAME_SCHEMA_MARK, "null", FRAME_TASK_MARK, task].join("\n");
+  assert.equal(framedToRaw(parseFramed(frameOf({ sandbox: "read-only", hermetic: true }))).task, "x");
+  for (const extra of [
+    { sandbox: "workspace-write" },
+    { hermetic: false },
+    { network: true },
+    { resume: { sessionId: "01a0cec5-503d" } },
+    { taskFile: "C:/secret.txt" },
+    { schemaFile: "C:/s.json" },
+    { addDirs: ["C:/"] },
+    { images: ["C:/a.png"] },
+    { profile: "impl" },
+  ]) {
+    assert.throws(() => framedToRaw(parseFramed(frameOf(extra))), (error) => error.kind === "invalid_request" && /read-only and hermetic/.test(error.message), JSON.stringify(extra));
+  }
+});
+
+test("the suspend detector reports the gap and suspends abandonment for a grace period", (t) => {
+  const realNow = Date.now;
+  t.after(() => {
+    Date.now = realNow;
+  });
+  let now = 1_000_000;
+  Date.now = () => now;
+  const clock = makeClock({ orphanAfterSec: 300 });
+  now += 1000;
+  assert.equal(clock.tick(), 0);
+  assert.equal(clock.inGrace(), false);
+  now += 45 * 60 * 1000; // laptop asleep for 45 minutes
+  assert.equal(clock.tick(), 45 * 60 * 1000);
+  assert.equal(clock.inGrace(), true);
+  now += 301 * 1000;
+  assert.equal(clock.inGrace(), false);
 });
 
 // Event lines captured from codex-cli 0.156.1 on 2026-09-23.
