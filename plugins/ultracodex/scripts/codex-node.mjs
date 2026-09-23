@@ -900,11 +900,20 @@ export function encodeFrameText(text) {
   return out;
 }
 
+// Page data (see "Paged results") is encoded the same way plus the double quote, so a
+// page line holds no backslash and no quote at all: its JSON needs no escaping, and a
+// copying relay has nothing to "fix". An encoded frame never contains a raw %22 (every
+// % is escaped), so decoding it here too is backward compatible.
+export function encodePageText(text) {
+  return encodeFrameText(text).replace(/"/g, "%22");
+}
+
 export function decodeFrameText(text) {
-  return String(text).replace(/%(25|5C|27|u[0-9A-F]{4}|U[0-9A-F]{6})/g, (match, code) => {
+  return String(text).replace(/%(25|5C|27|22|u[0-9A-F]{4}|U[0-9A-F]{6})/g, (match, code) => {
     if (code === "25") return "%";
     if (code === "5C") return "\\";
     if (code === "27") return "'";
+    if (code === "22") return '"';
     if (code[0] === "u") return String.fromCharCode(parseInt(code.slice(1), 16));
     return String.fromCodePoint(parseInt(code.slice(1), 16));
   });
@@ -2240,8 +2249,12 @@ function print(value, pretty = false) {
 
 // The Bash tool hands a model only a short preview of any output over ~30 000
 // characters, so a large result would never reach the Workflow. Above PAGED_THRESHOLD
-// `wait`/`result` print a compact envelope (paged: {pages, chars}) and `page RUN K`
-// prints slice K of the body; resultHash and mac still cover the whole body.
+// `wait`/`result` print a compact envelope — paged: {pages, chars, enc, hashes} — and
+// `page RUN K` prints slice K of the page data: the body JSON percent-encoded
+// (encodePageText), so a relay copies plain text instead of doubly escaped JSON (measured:
+// Sonnet dropped characters from the escaped form twice in a row). Each page has its own
+// hash, so the helper keeps the good pages of every reply; resultHash and mac still cover
+// the whole decoded body.
 export const PAGED_THRESHOLD = 24_000;
 export const PAGE_CHARS = 10_000;
 
@@ -2249,10 +2262,16 @@ export function pageBody(envelope) {
   return JSON.stringify(envelope.result !== undefined && envelope.result !== null ? { result: envelope.result } : { text: envelope.text ?? "" });
 }
 
+export function pageData(envelope) {
+  return encodePageText(pageBody(envelope));
+}
+
 export function compactEnvelope(envelope) {
   if (envelope.ok !== true || JSON.stringify(envelope).length <= PAGED_THRESHOLD) return envelope;
-  const body = pageBody(envelope);
-  const compact = { ...envelope, paged: { pages: Math.ceil(body.length / PAGE_CHARS), chars: body.length } };
+  const data = pageData(envelope);
+  const pages = Math.ceil(data.length / PAGE_CHARS);
+  const hashes = Array.from({ length: pages }, (_, index) => fnv1a(data.slice(index * PAGE_CHARS, (index + 1) * PAGE_CHARS)));
+  const compact = { ...envelope, paged: { pages, chars: data.length, enc: "pct", hashes } };
   delete compact.result;
   delete compact.text;
   return compact;
@@ -2274,10 +2293,10 @@ export function cmdPage(runId, pageText, { pretty = false } = {}) {
     print(rejection("unknown_run", `no finished result for ${runId}`, { runId }), pretty);
     return 1;
   }
-  const body = pageBody(envelope);
-  const pages = Math.ceil(body.length / PAGE_CHARS);
+  const data = pageData(envelope);
+  const pages = Math.ceil(data.length / PAGE_CHARS);
   if (!Number.isInteger(page) || page < 1 || page > pages) throw new UsageError(`page must be 1..${pages}`);
-  print({ ultracodex: 1, runId, page, pages, data: body.slice((page - 1) * PAGE_CHARS, page * PAGE_CHARS) }, pretty);
+  print({ ultracodex: 1, runId, page, pages, data: data.slice((page - 1) * PAGE_CHARS, page * PAGE_CHARS) }, pretty);
   return 0;
 }
 

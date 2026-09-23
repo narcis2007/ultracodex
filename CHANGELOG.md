@@ -59,8 +59,10 @@ review):
   and refuses unsigned results; the relay guard fixes each relay's role, so a relay that saw a
   job can never read the key. New runner commands `key` and `page`.
 - Paged results: above 24 KB, `wait`/`result` print a compact envelope and `page RUN K` serves
-  10 KB slices (the Bash tool only previews output over 30 KB); the helper stitches and
-  re-verifies them, and from the conversation the result file is simply read.
+  10 KB slices (the Bash tool only previews output over 30 KB). Page data is percent-encoded
+  (no quote or backslash to mis-copy) and hashed per page; the helper keeps verified pages
+  across re-collects, stitches and re-verifies them. From the conversation the result file
+  is simply read.
 - Windows teardown by identity (PID + creation time): no `taskkill /T` (it trusts reused
   parent PIDs), tracked descendants that detached from the tree, children started during the
   teardown, survivors reported; leftovers of a normal exit reaped.

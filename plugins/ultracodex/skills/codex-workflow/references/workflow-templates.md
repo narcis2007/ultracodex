@@ -246,7 +246,16 @@ function ucxRecordUsage(prov, failed = false) {
 }
 function ucxUsage() { return JSON.parse(JSON.stringify(ucxLedger)) }
 
-function ucxEnvelope(raw) {
+// Page data travels percent-encoded (the runner's encodePageText): %25 %5C %27 %22 %uXXXX %UXXXXXX.
+function ucxDecode(text) {
+  return String(text).replace(/%(25|5C|27|22|u[0-9A-F]{4}|U[0-9A-F]{6})/g, (m, c) =>
+    c === '25' ? '%' : c === '5C' ? String.fromCharCode(0x5c) : c === '27' ? String.fromCharCode(0x27) : c === '22' ? '"'
+      : c[0] === 'u' ? String.fromCharCode(parseInt(c.slice(1), 16)) : String.fromCodePoint(parseInt(c.slice(1), 16)))
+}
+
+// `store` ({ runId, pages }) keeps the hash-verified pages of every reply for one node, so a
+// re-collect only has to bring the pages the earlier replies got wrong.
+function ucxEnvelope(raw, store = null) {
   if (raw && typeof raw === 'object') return raw.ultracodex === 1 ? raw : null
   const lines = String(raw ?? '').split(/\r?\n/).map(l => l.trim().replace(/^`+|`+$/g, '').trim())
   const parsed = []
@@ -257,12 +266,19 @@ function ucxEnvelope(raw) {
   const env = [...parsed].reverse().find(o => o.page === undefined) || null
   if (env && env.paged) {
     // a large result arrives as a compact envelope plus `page` lines; stitch the body back
-    const pages = []
-    for (const o of parsed) if (o.page !== undefined && o.runId === env.runId && typeof o.data === 'string') pages[o.page] = o.data
-    const body = Array.from({ length: env.paged.pages }, (_, i) => pages[i + 1])
-    if (body.some(p => p === undefined)) return { ...env, __incompletePages: true }
+    const total = Number(env.paged.pages)
+    const hashes = Array.isArray(env.paged.hashes) && env.paged.hashes.length === total ? env.paged.hashes : null
+    // pages are only kept across replies when each one can be verified on its own
+    const pages = hashes && store ? (store.runId === env.runId ? store.pages : (store.runId = env.runId, store.pages = new Map())) : new Map()
+    for (const o of parsed) {
+      if (o.page === undefined || o.runId !== env.runId || typeof o.data !== 'string' || !Number.isInteger(o.page) || o.page < 1 || o.page > total) continue
+      if (!hashes || ucxHash(o.data) === hashes[o.page - 1]) pages.set(o.page, o.data)   // a garbled page is dropped
+    }
+    const body = Array.from({ length: total }, (_, i) => pages.get(i + 1))
+    if (!(total >= 1) || body.some(p => p === undefined)) return { ...env, __incompletePages: true }
     try {
-      const whole = JSON.parse(body.join(''))
+      const joined = body.join('')
+      const whole = JSON.parse(env.paged.enc === 'pct' ? ucxDecode(joined) : joined)
       const out = { ...env }
       delete out.paged
       if (whole.result !== undefined) out.result = whole.result
@@ -338,7 +354,8 @@ function ucxUnwrap(env, raw, expected = {}) {
   }
   const e = env.error || {}
   const p = env.provenance || {}
-  if (ucxRunId(env) && (p.usageTotal || p.usage)) ucxRecordUsage({ model: p.model, usage: p.usageTotal || p.usage }, true)
+  // a run stopped mid-turn (deadline, cancel) reports no tokens: still counted, as a failed run
+  if (ucxRunId(env) && p.model) ucxRecordUsage({ model: p.model, usage: p.usageTotal || p.usage || {} }, true)
   return ucxError(e.kind || 'unknown', e.message || env.state, env.runId || null, Boolean(e.retryable))
 }
 
@@ -399,11 +416,12 @@ function codexNode(task, opts = {}) {
 
   return ucxGate(async () => {
     let raw = null, env = null
+    const pageStore = { runId: null, pages: new Map() }
     for (let attempt = 0; attempt < 2; attempt++) {                // a corrupted copy is retried once, by a stronger relay
       raw = await call(startPrompt, {
         agentType: UCX_RELAY, label: relayLabel + (attempt ? ':retry' : ''), phase, ...(attempt ? { model: 'opus' } : { effort: 'low' }),
       })
-      env = ucxEnvelope(raw)
+      env = ucxEnvelope(raw, pageStore)
       const corrupted = env && env.ok === false && env.error && env.error.kind === 'relay_corruption'
       const stuck = env && env.state === 'receiving'
       if (!corrupted && !stuck) break
@@ -415,12 +433,12 @@ function codexNode(task, opts = {}) {
     // (the supervisor tears the run down if nobody polls for orphanAfterSec).
     for (let round = 0; env && env.ok === null && ucxRunId(env) && round < 3; round++) {
       raw = await collect(env.runId, 'collect', false)
-      env = ucxEnvelope(raw)
+      env = ucxEnvelope(raw, pageStore)
     }
     // A result garbled (or cut short) on the way back is fetched again: the runner keeps it.
     for (let round = 0; env && env.ok === true && ucxRunId(env) && !ucxResultIntact(env) && round < 2; round++) {
       raw = await collect(env.runId, 'recollect', round > 0)
-      env = ucxEnvelope(raw)
+      env = ucxEnvelope(raw, pageStore)
     }
     // An intact result must also carry this machine's signature. A mac mangled in
     // transcription is fetched once more; a forged one fails again and is refused.
@@ -428,7 +446,7 @@ function codexNode(task, opts = {}) {
     if (env && env.ok === true && ucxResultIntact(env)) {
       key = await ucxKey(call, phase)
       if (key && ucxRunId(env) && !ucxResultAuthentic(env, key, text)) {
-        const again = ucxEnvelope(await collect(env.runId, 'recollect', true))
+        const again = ucxEnvelope(await collect(env.runId, 'recollect', true), pageStore)
         if (again && again.ok === true && ucxResultIntact(again)) env = again
       }
     }
@@ -494,8 +512,9 @@ Rules the helper already enforces — do not work around them:
   per-part hashes (the Windows command line breaks near 8 KB) and verified by the runner; the
   runner allocates the upload id. The result comes back with a `resultHash` and the request's
   `taskHash`: a garbled result is fetched again, a result for another request is refused
-  (`relay_mismatch`). A result over ~24 KB comes back in pages (`page RUN K`) and is stitched
-  and re-verified; a missing page is fetched again (`relay_incomplete_result` if it stays missing).
+  (`relay_mismatch`). A result over ~24 KB comes back in percent-encoded, individually hashed pages
+  (`page RUN K`); good pages are kept across replies, the body is stitched and re-verified, and
+  a missing or garbled page is fetched again (`relay_incomplete_result` if it stays missing).
 - **Signed by the runner.** Every result carries `mac` = HMAC-SHA256 under a per-machine key
   (`~/.ultracodex/key`) over the run id, the SHA-256 of the task and the body. The helper fetches
   the key once per workflow through a relay that sees no untrusted text (the relay guard gives

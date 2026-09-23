@@ -16,7 +16,7 @@ import {
   fnv1a,
   framedToRaw,
   normalizeText,
-  pageBody,
+  pageData,
   PAGE_CHARS,
   parseFramed,
   resultMac,
@@ -408,32 +408,39 @@ test("the key is fetched once per workflow, re-fetched when mis-copied, and only
   assert.equal(results[1].refuted, false, "a failed fetch is not cached: the next node fetches again");
 });
 
-test("a large result arrives paged and is stitched back; a missing page is re-collected", async () => {
-  const big = { refuted: false, confidence: 0.9, reasoning: "long \"quoted\" reasoning " + "x".repeat(30_000) };
-  const pagedReply = (request, { dropPage = null } = {}) => {
+test("a large result arrives in encoded, hashed pages; good pages are kept across re-collects", async () => {
+  const bs = String.fromCharCode(0x5c);
+  const big = { refuted: false, confidence: 0.9, reasoning: ("long \"quoted\" reasoning at C:" + bs + "x" + bs + "y, ăî 100% ").repeat(1500) };
+  // garble: page number → how the relay mangles that page in this reply ('drop' or 'typo')
+  const pagedReply = (request, garble = {}) => {
     const full = okObject(request, big);
     const compact = compactEnvelope(full);
-    assert.ok(compact.paged, "the runner pages a result this large");
-    const body = pageBody(full);
-    const pages = Array.from({ length: compact.paged.pages }, (_, i) => i + 1)
-      .filter((k) => k !== dropPage)
-      .map((k) => JSON.stringify({ ultracodex: 1, runId: RUN_ID, page: k, pages: compact.paged.pages, data: body.slice((k - 1) * PAGE_CHARS, k * PAGE_CHARS) }));
+    assert.ok(compact.paged && compact.paged.pages >= 3, "the runner pages a result this large");
+    const data = pageData(full);
+    const pages = [];
+    for (let k = 1; k <= compact.paged.pages; k += 1) {
+      let slice = data.slice((k - 1) * PAGE_CHARS, k * PAGE_CHARS);
+      if (garble[k] === "drop") continue;
+      if (garble[k] === "typo") slice = slice.slice(0, 100) + slice.slice(101); // one character lost
+      pages.push(JSON.stringify({ ultracodex: 1, runId: RUN_ID, page: k, pages: compact.paged.pages, data: slice }));
+    }
     return [JSON.stringify(compact), ...pages].join("\n");
   };
   let request = null;
   const prompts = [];
+  // reply 1 loses a character of page 2, reply 2 one of page 3: together they hold every page
   const relay = async (prompt) => {
     prompts.push(prompt);
     if (!prompt.startsWith("ULTRACODEX COLLECT")) request = receive(prompt).request;
-    return pagedReply(request, { dropPage: prompts.length === 1 ? 2 : null });
+    return pagedReply(request, prompts.length === 1 ? { 2: "typo" } : { 3: "typo" });
   };
   const result = await runHelper(["return codexNode('explain at length', { schemaPreset: 'verdict' })"], relay);
   assert.equal(result.reasoning, big.reasoning);
-  assert.equal(prompts.length, 2, "the first reply lacked page 2: one re-collect");
+  assert.equal(prompts.length, 2, "one re-collect: page 2 from the second reply, page 3 from the first");
 
   const alwaysShort = async (prompt) => {
     if (!prompt.startsWith("ULTRACODEX COLLECT")) request = receive(prompt).request;
-    return pagedReply(request, { dropPage: 1 });
+    return pagedReply(request, { 1: "drop" });
   };
   const failed = await runHelper(["return codexNode('explain at length', { schemaPreset: 'verdict' })"], alwaysShort);
   assert.equal(failed.kind, "relay_incomplete_result");
@@ -456,6 +463,8 @@ test("batch nodes declare their size, workflow nodes get a 15-minute orphan wind
     const { request } = receive(prompt);
     seen.push(request);
     if (request.label === "fails") return JSON.stringify({ ultracodex: 1, ok: false, state: "timeout", runId: RUN_ID, error: { kind: "timeout", message: "deadline" }, provenance: { model: "gpt-6-luna", usageTotal: { input_tokens: 50, output_tokens: 5 } } });
+    // stopped mid-turn: Codex reported no tokens, the run still counts
+    if (request.label === "killed") return JSON.stringify({ ultracodex: 1, ok: false, state: "timeout", runId: RUN_ID, error: { kind: "timeout", message: "deadline" }, provenance: { model: "gpt-6-astra" } });
     if (request.schema?.properties?.results) return okEnvelope(request, { results: ["1", "2", "3", "4", "5"].map((id) => ({ id, refuted: true, confidence: 0.5, reasoning: "r" })) });
     return okEnvelope(request, { refuted: true, confidence: 0.5, reasoning: "r" });
   };
@@ -463,6 +472,7 @@ test("batch nodes declare their size, workflow nodes get a 15-minute orphan wind
     "await codexBatchNode('Refute each.', ['1', '2', '3', '4', '5'].map(id => ({ id, claim: 'c' + id })), { tier: 'daily' })",
     "await codexNode('one', { schemaPreset: 'verdict', tier: 'final' })",
     "await codexNode('two', { schemaPreset: 'verdict', tier: 'light', label: 'fails' })",
+    "await codexNode('three', { schemaPreset: 'verdict', tier: 'final', label: 'killed' })",
     "return ucxUsage()",
   ], agent);
   const [batch, single] = seen;
@@ -471,7 +481,7 @@ test("batch nodes declare their size, workflow nodes get a 15-minute orphan wind
   assert.ok(batch.timeoutSec > validateRequest({ task: "x", kind: "verify", tier: "daily" }, { catalog: CATALOG }).timeoutSec, "a batch gets a longer deadline");
   assert.equal(batch.orphanAfterSec, 900);
   assert.deepEqual(usage["gpt-6-sol"], { runs: 1, failed: 0, input_tokens: 100, cached_input_tokens: 0, output_tokens: 7, reasoning_output_tokens: 0 });
-  assert.equal(usage["gpt-6-astra"].runs, 1);
+  assert.deepEqual([usage["gpt-6-astra"].runs, usage["gpt-6-astra"].failed, usage["gpt-6-astra"].output_tokens], [2, 1, 7], "a run killed mid-turn counts, with no tokens");
   assert.deepEqual(usage["gpt-6-luna"], { runs: 1, failed: 1, input_tokens: 50, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0 });
 });
 

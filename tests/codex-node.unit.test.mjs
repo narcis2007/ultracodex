@@ -22,6 +22,7 @@ import {
   computeDeadlineSec,
   decodeFrameText,
   encodeFrameText,
+  encodePageText,
   ensureKey,
   fnv1a,
   framedToRaw,
@@ -30,6 +31,7 @@ import {
   mustEscape,
   normalizeText,
   pageBody,
+  pageData,
   parseApiError,
   parseCatalog,
   parseFramed,
@@ -302,20 +304,29 @@ test("the result key is created once, private, and signs runId + SHA-256(task) +
   assert.equal(resultBody({ text: "t" }), "t");
 });
 
-test("large results are paged: a compact envelope plus pages that rebuild the body exactly", () => {
+test("large results are paged: a compact envelope plus encoded, hashed pages that rebuild the body exactly", () => {
   const small = { ultracodex: 1, ok: true, state: "done", runId: "R", result: { a: 1 }, resultHash: "x", mac: "m" };
   assert.equal(compactEnvelope(small), small, "small results print whole");
-  const big = { ...small, result: { text: "q\"u\\o".repeat(8000) } };
+  const bs = String.fromCharCode(0x5c);
+  const big = { ...small, result: { text: ("q\"u" + bs + "o C:" + bs + "x ăî " + String.fromCodePoint(0x1f600) + String.fromCharCode(0x2028) + " 100% ").repeat(2000) } };
   const compact = compactEnvelope(big);
   assert.equal(compact.result, undefined);
   assert.equal(compact.mac, "m", "the signature stays on the compact envelope");
-  const body = pageBody(big);
-  assert.equal(compact.paged.pages, Math.ceil(body.length / PAGE_CHARS));
+  const data = pageData(big);
+  assert.equal(compact.paged.enc, "pct");
+  assert.equal(compact.paged.pages, Math.ceil(data.length / PAGE_CHARS));
   assert.ok(compact.paged.pages > 1);
   assert.ok(JSON.stringify(compact).length < PAGED_THRESHOLD);
-  const pages = Array.from({ length: compact.paged.pages }, (_, i) => body.slice(i * PAGE_CHARS, (i + 1) * PAGE_CHARS));
-  assert.deepEqual(JSON.parse(pages.join("")).result, big.result);
-  for (const page of pages) assert.ok(JSON.stringify({ ultracodex: 1, runId: "20260923T000000Z-abcdef", page: 1, pages: 9, data: page }).length < 30_000, "a page line fits the Bash output limit");
+  const pages = Array.from({ length: compact.paged.pages }, (_, i) => data.slice(i * PAGE_CHARS, (i + 1) * PAGE_CHARS));
+  assert.deepEqual(compact.paged.hashes, pages.map((page) => fnv1a(page)), "one hash per page");
+  assert.equal(decodeFrameText(pages.join("")), pageBody(big));
+  assert.deepEqual(JSON.parse(decodeFrameText(pages.join(""))).result, big.result);
+  for (const page of pages) {
+    assert.equal(JSON.stringify(page), '"' + page + '"', "a page needs no JSON escaping: nothing for a relay to mis-copy");
+    assert.ok(JSON.stringify({ ultracodex: 1, runId: "20260923T000000Z-abcdef", page: 1, pages: 9, data: page }).length < 30_000, "a page line fits the Bash output limit");
+  }
+  assert.equal(encodePageText('say "%22" here'), "say %22%2522%22 here", "a literal %22 survives the round trip");
+  assert.equal(decodeFrameText(encodePageText('say "%22" here')), 'say "%22" here');
 });
 
 test("readUserWindowsSandbox understands quoted tables, dotted keys and inline tables", (t) => {

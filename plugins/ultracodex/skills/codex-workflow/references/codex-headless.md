@@ -48,10 +48,13 @@ slotLost}. Failures: `ok: false`, `state` (`failed`, `timeout`, `cancelled`, `ab
 
 The Bash tool shows a model only a short preview of output over ~30 000 characters. Above
 24 000, `wait`/`result` print a compact envelope — no `result`/`text`, plus
-`paged: {pages, chars, file}` — and `page RUN_ID K` prints slice K (10 000 characters) of the
-body JSON. `resultHash` and `mac` still cover the whole body. From the main conversation,
-simply read `paged.file` with the Read tool; the relay fetches the pages and the helper
-stitches and verifies them.
+`paged: {pages, chars, enc: "pct", hashes, file}` — and `page RUN_ID K` prints slice K
+(10 000 characters) of the page data: the body JSON percent-encoded like an upload, plus `"`
+as `%22`, so a page line contains no quote and no backslash and its JSON needs no escaping.
+(Measured on the doubly escaped form: Sonnet dropped characters from a 32 KB result twice in a
+row.) Each page has its own hash, so the helper keeps the good pages of every reply and a
+re-collect only has to bring the rest; `resultHash` and `mac` still cover the whole decoded
+body. From the main conversation, simply read `paged.file` with the Read tool.
 
 Runs live in `~/.ultracodex/runs/<runId>/` (request, task, schema, state, per-attempt
 `events.jsonl` / `stderr.log` / `last.txt`, `supervisor.log`, `result.json`). `gc` removes
@@ -79,7 +82,10 @@ job. A relay prompt-injected by reviewed content therefore cannot run other comm
 another executable, compute hashes, or sign a fabricated result. Residual risk: with hooks
 disabled (`disableAllHooks`) the relay keeps its plain Bash tool and could read the key file;
 results are then still bound to the request (`taskHash`, SHA-256 of the task in the mac) and
-must carry a matching `resultHash`.
+must carry a matching `resultHash`. The signature defends against the confined relay, not
+against a Claude agent the owner lets run arbitrary Bash or Write on this machine: such an
+agent could read `~/.ultracodex/key` or plant a run file — keep workflow agents on normal
+permission prompts when they read untrusted repositories.
 
 The runner also never resolves executables through the current directory: `taskkill` and
 PowerShell are called by their System32 paths and supervisors run with `~/.ultracodex` as
