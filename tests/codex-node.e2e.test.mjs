@@ -306,6 +306,45 @@ test("a duplicate upload that loses the race joins the winner's run instead of b
   assert.equal(fs.existsSync(path.join(home, "runs")) ? fs.readdirSync(path.join(home, "runs")).length : 0, 0, "and started none of its own");
 });
 
+test("a part copied with the next part's lines after it is kept as the part it was sent as", async (t) => {
+  const home = makeHome(t);
+  const env = fastEnv(home);
+  // a long line cut mid-sentence at a part boundary: every relay ran on into the next part here
+  const task = ["first line", "x".repeat(1200) + " before a .git on either walk; measured in this session", "tail line"].join("\n");
+  const schema = SCHEMA_PRESETS.verdict;
+  const header = signedHeader(home, { kind: "verify", tier: "light", label: "overcopy" }, schema, normalizeText(task));
+  await announce(env, header, schema, normalizeText(task));
+  const encoded = encodeFrameText(frame(header, schema, normalizeText(task)))
+    .split("\n")
+    .flatMap((line) => {
+      const out = [];
+      for (let rest = line; ; rest = rest.slice(400)) {
+        if (rest.length <= 400) {
+          out.push(rest);
+          break;
+        }
+        out.push(rest.slice(0, 400) + "%+");
+      }
+      return out;
+    });
+  const lines = [FRAME_MAGIC, ...encoded];
+  const cut = lines.findIndex((line) => line.endsWith("%+") && line.includes("xxxx")) + 1; // right after a piece that ends in %+
+  const parts = [lines.slice(0, cut), lines.slice(cut)].map((part) => part.join("\n"));
+  const merged = await runCli(["part", "new", "1", "2", fnv1a(parts[0])], { env, input: parts[0] + "\n" + parts[1] + "\n" });
+  assert.equal(merged.json.state, "receiving", merged.stdout);
+  assert.equal(merged.json.trimmedLines, lines.length - cut, "the next part's lines were set aside");
+  const upload = merged.json.upload;
+  assert.equal(fs.readFileSync(path.join(home, "inbox", upload, "part-1"), "utf8"), parts[0], "part 1 holds exactly its own lines");
+  const last = await runCli(["part", upload, "2", "2", fnv1a(parts[1])], { env, input: parts[1] + "\n" });
+  assert.ok(last.json.runId, last.stdout);
+  const done = await runCli(["wait", last.json.runId, "--max-wait", "20"], { env });
+  assert.equal(done.json.state, "done");
+  assert.equal(done.json.provenance.taskHash, fnv1a(normalizeText(task)));
+  // an altered copy still never passes, prefix or not
+  const altered = await runCli(["part", "new", "1", "2", fnv1a(parts[0])], { env, input: parts[0].replace("first line", "first lime") + "\n" + parts[1] + "\n" });
+  assert.equal(altered.json.state, "part_rejected");
+});
+
 test("an encoded frame uploaded in parts (out of order) starts once the last part lands", async (t) => {
   const home = makeHome(t);
   const env = fastEnv(home);

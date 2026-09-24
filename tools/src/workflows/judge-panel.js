@@ -27,7 +27,7 @@ const SCORE = {
   type: 'object', additionalProperties: false, required: ['score', 'rationale'],
   properties: { score: { type: 'number', description: '0..10' }, rationale: { type: 'string' } },
 }
-const task = extra => `PROBLEM:\n${A.problem}\n\n${extra}\nReturn the approach, a concrete plan, and its main risks.`
+const task = extra => `PROBLEM:\n${A.problem}\n\n${extra}\nReturn the approach, a concrete plan, and its main risks.${ucxWhere(CWD)}`
 
 phase('Generate')
 // Every requested candidate is accounted for; a failed generation is reported, not dropped.

@@ -94,12 +94,14 @@ function receive(prompt) {
   const total = Number(lines.find((line) => line.startsWith("PARTS: ")).slice("PARTS: ".length));
   const parts = [];
   const hashes = [];
+  const counts = [];
   let current = null;
   for (const line of lines) {
-    const open = new RegExp(`^=====${delimiter} PART (\\d+)/(\\d+) ([0-9a-f]{8})=====$`).exec(line);
+    const open = new RegExp(`^=====${delimiter} PART (\\d+)/(\\d+) ([0-9a-f]{8}) (\\d+) LINES=====$`).exec(line);
     if (open) {
       current = [];
       hashes.push(open[3]);
+      counts.push(Number(open[4]));
       continue;
     }
     if (line === `=====${delimiter} END=====`) {
@@ -111,6 +113,7 @@ function receive(prompt) {
   }
   assert.equal(parts.length, total, "every announced part is present");
   parts.forEach((part, index) => assert.equal(fnv1a(part.join("\n")), hashes[index], `part ${index + 1} hash`));
+  parts.forEach((part, index) => assert.equal(part.length, counts[index], `part ${index + 1} announces its line count`));
   for (const part of parts) {
     const text = part.join("\n");
     assert.ok(text.length <= 1600 + 420, "a part fits comfortably in one Bash call");

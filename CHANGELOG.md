@@ -161,8 +161,18 @@ round-4 findings confirmed fixed; six new findings, one high):
 - A duplicate upload that loses a race with the winner of the same request now joins the
   winner's run (it looks for the nonce record again, `ULTRACODEX_NONCE_WAIT_MS`) instead of
   failing as `unregistered_request` or `execution`.
-- Tests: 117 offline tests, including a two-process slot race with a late claim, a junction
-  into an embedded bare repository, legacy slot debris and a late-winner upload race.
+- Relay transport: the first run of the round-6 gate failed both lenses — every relay (Sonnet,
+  and Opus on retry: five copies, byte-identical) uploaded part 2 with part 3's lines after it,
+  where a long line was cut mid-sentence at the part boundary. Reproduced with real relays
+  and the fake Codex; the runner now keeps the prefix of a part's lines that matches its hash
+  (the rest is the next part, sent next anyway; the assembled frame is verified as a whole),
+  which made the same upload go through. Part markers also state their line count (a hint:
+  it did not stop the over-copy by itself).
+- Claude stages are told where the repository is (`ucxWhere(cwd)`): they work in the session's
+  directory, and a report stage without it ran git there instead.
+- Tests: 119 offline tests, including a two-process slot race with a late claim, a junction
+  into an embedded bare repository, legacy slot debris, a late-winner upload race and a part
+  copied with the next part's lines.
 
 ## 0.2.1 — 2026-07-10 (fork)
 

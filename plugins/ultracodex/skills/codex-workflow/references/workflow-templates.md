@@ -31,7 +31,10 @@ read), `timeoutSec`, `maxAttempts`, `orphanAfterSec` (default 900), `workItems` 
 Also in the block: `codexBatchNode(instruction, items, opts)` (N small items, one Codex run,
 id integrity enforced, deadline scaled to N), `ucxPartition(items, verdictOf)` (fail-closed
 confirmed / refuted / unverified), `ucxUsage()` (tokens spent on Codex in this workflow, per
-model — return it as `codexUsage`), `isCodexError(x)` and `ucxError(kind, message)`.
+model — return it as `codexUsage`), `isCodexError(x)`, `ucxError(kind, message)`,
+`UCX_READER` (the confined agent type for Claude stages that read code) and `ucxWhere(cwd)`
+— append it to the prompt of every Claude stage that reads the repository at `cwd`: a Claude
+stage works in the session's directory, not in the workflow's `cwd`.
 
 <!-- BEGIN ULTRACODEX HELPER (generated from tools/src/helper.js) -->
 
@@ -260,6 +263,12 @@ async function ucxExpect(call, phase, digest, label) {
 // Claude stages that read reviewed code run as this confined agent type (Read, Grep, Glob,
 // read-only git): whatever the code tells them, they can neither sign nor announce a request.
 const UCX_READER = 'ultracodex:codex-reader'
+// A Claude stage works in the session's directory, not in the workflow's `cwd`: append this
+// to its prompt so it reads the right repository (measured: a report stage without it ran
+// git in the session directory and could not see the change).
+function ucxWhere(cwd) {
+  return cwd ? '\nTHE REPOSITORY is ' + cwd + ' — your own working directory may be another one, so run git there as git -C "' + cwd + '" <command> and read its files by absolute path.' : ''
+}
 
 // Only a well-formed run id is ever put into another relay's prompt: a reply is untrusted.
 const UCX_RUN_ID = /^\d{8}T\d{6}Z-[0-9a-f]{6}$/
@@ -485,7 +494,10 @@ function codexNode(task, opts = {}) {
         'Part 1: node <runner> part new 1 ' + parts.length + ' <hash of part 1> — it prints the upload id.' +
           ' Parts k = 2..' + parts.length + ': node <runner> part <upload id> k ' + parts.length + ' <hash of part k>.' +
           " Each with <<'" + delim + "' + the part lines + " + delim + '. Resend a part the runner answers with part_rejected.',
-        ...parts.flatMap((p, i) => ['=====' + delim + ' PART ' + (i + 1) + '/' + parts.length + ' ' + partHashes[i] + '=====', ...p, '=====' + delim + ' END=====']),
+        // The line count is a hint only: a part cut mid-sentence can still pull a relay on into
+        // the next part (measured: Sonnet did so even with the count), which the runner absorbs
+        // by keeping the prefix that matches the part's hash.
+        ...parts.flatMap((p, i) => ['=====' + delim + ' PART ' + (i + 1) + '/' + parts.length + ' ' + partHashes[i] + ' ' + p.length + ' LINES=====', ...p, '=====' + delim + ' END=====']),
       ].join('\n')
 
       let raw = null, env = null
@@ -583,7 +595,9 @@ Rules the helper already enforces — do not work around them:
 - **Byte-exact both ways or rejected.** The request is normalized, percent-encoded (no quote,
   backslash or control character reaches the relay's Bash command), split into ≤1.6 KB parts with
   per-part hashes (the Windows command line breaks near 8 KB) and verified by the runner; the
-  runner allocates the upload id. The result comes back with a `resultHash` and the request's
+  runner allocates the upload id, and a relay copy that runs on into the next part (measured:
+  a part cut mid-sentence pulls Sonnet and Opus alike on) keeps just the prefix that matches
+  its hash. The result comes back with a `resultHash` and the request's
   `taskHash`: a garbled result is fetched again, a result for another request is refused
   (`relay_mismatch`). A result over ~24 KB comes back in percent-encoded, individually hashed pages
   (`page RUN K`); good pages are kept across replies, the body is stitched and re-verified, and

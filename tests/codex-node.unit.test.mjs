@@ -28,6 +28,7 @@ import {
   encodePageText,
   ensureKey,
   fnv1a,
+  matchingPrefix,
   framedToRaw,
   keyPath,
   makeClock,
@@ -277,6 +278,16 @@ test("an owner file that cannot be read this instant does not make a live lease 
   assert.equal(fresh.taken, false, "the lease directory is still being renewed");
   const old = slotProbe(t, "partial-old");
   assert.equal(old.taken, true, "a lease nobody renews is debris");
+});
+
+test("a part with the next part's lines after it matches by its prefix — and only through its hash", () => {
+  const part = "alpha on either %+\n beta";
+  const next = "walk; gamma\ndelta";
+  assert.equal(matchingPrefix(part, fnv1a(part)), part);
+  assert.equal(matchingPrefix(`${part}\n${next}`, fnv1a(part)), part, "the next part's lines are set aside");
+  assert.equal(matchingPrefix(`alpha on either %+\n betx\n${next}`, fnv1a(part)), null, "an altered part never matches");
+  assert.equal(matchingPrefix(next, fnv1a(part)), null);
+  assert.equal(matchingPrefix("alpha on either %+", fnv1a(part)), null, "a part missing its last line never matches");
 });
 
 test("creation times stay exact: FILETIMEs are far beyond Number precision", () => {

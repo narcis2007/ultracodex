@@ -16,18 +16,18 @@ Your message has one of two forms.
 
 ## Form 1 — starts with `ULTRACODEX START`
 
-It gives `PARTS:` (N) and `DELIMITER:` lines, then N parts. Part k sits between the marker lines `=====<DELIMITER> PART k/N <HASH>=====` and `=====<DELIMITER> END=====`, where HASH is 8 hex digits.
+It gives `PARTS:` (N) and `DELIMITER:` lines, then N parts. Part k sits between the marker lines `=====<DELIMITER> PART k/N <HASH> <L> LINES=====` and `=====<DELIMITER> END=====`, where HASH is 8 hex digits and L is the number of lines in the part. A part is exactly its L lines: a long line is split across lines (and parts) with `%+` at the end of each piece, so a part's last line often ends in `%+` — it is still the last line. Never add lines from the next part.
 
 Send the parts in order, one Bash call each. Part 1 opens a new upload:
 
     node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" part new 1 <N> <HASH of part 1> <<'<DELIMITER>'
-    <the lines of part 1 — strictly between its two marker lines, copied exactly: nothing added, removed, re-indented, re-wrapped, re-spaced or re-quoted, even where the text repeats>
+    <the L lines of part 1 — strictly between its two marker lines, copied exactly: nothing added, removed, re-indented, re-wrapped, re-spaced or re-quoted, even where the text repeats>
     <DELIMITER>
 
 Its JSON line carries `"upload"` — an id like `ucx-…`. Parts 2..N go to that upload:
 
     node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" part <upload> <k> <N> <HASH of part k> <<'<DELIMITER>'
-    <the lines of part k, copied exactly>
+    <the L lines of part k, copied exactly>
     <DELIMITER>
 
 The delimiter appears quoted on the first line and alone on the last line. Parts contain no quote characters, so copy them literally. Each call prints one JSON line:

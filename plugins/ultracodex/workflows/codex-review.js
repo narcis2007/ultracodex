@@ -236,6 +236,12 @@ async function ucxExpect(call, phase, digest, label) {
 // Claude stages that read reviewed code run as this confined agent type (Read, Grep, Glob,
 // read-only git): whatever the code tells them, they can neither sign nor announce a request.
 const UCX_READER = 'ultracodex:codex-reader'
+// A Claude stage works in the session's directory, not in the workflow's `cwd`: append this
+// to its prompt so it reads the right repository (measured: a report stage without it ran
+// git in the session directory and could not see the change).
+function ucxWhere(cwd) {
+  return cwd ? '\nTHE REPOSITORY is ' + cwd + ' — your own working directory may be another one, so run git there as git -C "' + cwd + '" <command> and read its files by absolute path.' : ''
+}
 
 // Only a well-formed run id is ever put into another relay's prompt: a reply is untrusted.
 const UCX_RUN_ID = /^\d{8}T\d{6}Z-[0-9a-f]{6}$/
@@ -461,7 +467,10 @@ function codexNode(task, opts = {}) {
         'Part 1: node <runner> part new 1 ' + parts.length + ' <hash of part 1> — it prints the upload id.' +
           ' Parts k = 2..' + parts.length + ': node <runner> part <upload id> k ' + parts.length + ' <hash of part k>.' +
           " Each with <<'" + delim + "' + the part lines + " + delim + '. Resend a part the runner answers with part_rejected.',
-        ...parts.flatMap((p, i) => ['=====' + delim + ' PART ' + (i + 1) + '/' + parts.length + ' ' + partHashes[i] + '=====', ...p, '=====' + delim + ' END=====']),
+        // The line count is a hint only: a part cut mid-sentence can still pull a relay on into
+        // the next part (measured: Sonnet did so even with the count), which the runner absorbs
+        // by keeping the prefix that matches the part's hash.
+        ...parts.flatMap((p, i) => ['=====' + delim + ' PART ' + (i + 1) + '/' + parts.length + ' ' + partHashes[i] + ' ' + p.length + ' LINES=====', ...p, '=====' + delim + ' END=====']),
       ].join('\n')
 
       let raw = null, env = null
@@ -599,7 +608,7 @@ const lensResults = await pipeline(
     // A triage that fails keeps its finding, as needs_info — it is never dropped.
     const failedTriage = reason => ({ verdict: 'needs_info', reasoning: 'Claude triage failed (' + reason + ') — check this finding by hand', failed: true })
     const triaged = await parallel(findings.map(f => () =>
-      agent(`A Codex reviewer reported this finding about ${SCOPE}${CWD ? ' in ' + CWD : ''}. Check it yourself against the code (read the file and its callers; run git if needed).
+      agent(`A Codex reviewer reported this finding about ${SCOPE}${CWD ? ' in ' + CWD : ''}. Check it yourself against the code (read the file and its callers; run git if needed).${ucxWhere(CWD)}
 Decide: "confirmed" (the defect is real and the failure scenario is reachable), "refuted" (it is not — explain why), or "needs_info" (it depends on something you cannot see).
 FINDING (JSON): ${JSON.stringify(f)}`, { label: 'triage:' + f.id, phase: 'Triage', schema: TRIAGE_SCHEMA, agentType: UCX_READER })
         .then(t => ({ ...f, triage: t || failedTriage('no answer') }), e => ({ ...f, triage: failedTriage(String((e && e.message) || e)) }))))
@@ -662,7 +671,7 @@ const untriaged = TRIAGE ? [] : findings
 const whyRefuted = f => (f.escalation && !f.escalation.error ? 'gpt-6-astra: ' + f.escalation.reasoning : f.triage.reasoning)
 
 phase('Report')
-const report = await agent(`Write the final review report for ${SCOPE}.
+const report = await agent(`Write the final review report for ${SCOPE}${CWD ? ' in ' + CWD : ''}.${ucxWhere(CWD)}
 ${failedLenses.length ? 'At the very top, state that these lenses FAILED and were not reviewed: ' + JSON.stringify(failedLenses.map(l => ({ lens: l.lens, error: l.error.kind, message: l.error.message }))) : ''}
 Per-lens Codex verdicts: ${JSON.stringify(lenses.filter(l => !l.error).map(l => ({ lens: l.lens, verdict: l.verdict, summary: l.summary })))}
 CONFIRMED findings (rank by severity; file:line, failure scenario, fix): ${JSON.stringify(confirmed)}

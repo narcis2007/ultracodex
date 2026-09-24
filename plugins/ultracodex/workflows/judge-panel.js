@@ -235,6 +235,12 @@ async function ucxExpect(call, phase, digest, label) {
 // Claude stages that read reviewed code run as this confined agent type (Read, Grep, Glob,
 // read-only git): whatever the code tells them, they can neither sign nor announce a request.
 const UCX_READER = 'ultracodex:codex-reader'
+// A Claude stage works in the session's directory, not in the workflow's `cwd`: append this
+// to its prompt so it reads the right repository (measured: a report stage without it ran
+// git in the session directory and could not see the change).
+function ucxWhere(cwd) {
+  return cwd ? '\nTHE REPOSITORY is ' + cwd + ' — your own working directory may be another one, so run git there as git -C "' + cwd + '" <command> and read its files by absolute path.' : ''
+}
 
 // Only a well-formed run id is ever put into another relay's prompt: a reply is untrusted.
 const UCX_RUN_ID = /^\d{8}T\d{6}Z-[0-9a-f]{6}$/
@@ -460,7 +466,10 @@ function codexNode(task, opts = {}) {
         'Part 1: node <runner> part new 1 ' + parts.length + ' <hash of part 1> — it prints the upload id.' +
           ' Parts k = 2..' + parts.length + ': node <runner> part <upload id> k ' + parts.length + ' <hash of part k>.' +
           " Each with <<'" + delim + "' + the part lines + " + delim + '. Resend a part the runner answers with part_rejected.',
-        ...parts.flatMap((p, i) => ['=====' + delim + ' PART ' + (i + 1) + '/' + parts.length + ' ' + partHashes[i] + '=====', ...p, '=====' + delim + ' END=====']),
+        // The line count is a hint only: a part cut mid-sentence can still pull a relay on into
+        // the next part (measured: Sonnet did so even with the count), which the runner absorbs
+        // by keeping the prefix that matches the part's hash.
+        ...parts.flatMap((p, i) => ['=====' + delim + ' PART ' + (i + 1) + '/' + parts.length + ' ' + partHashes[i] + ' ' + p.length + ' LINES=====', ...p, '=====' + delim + ' END=====']),
       ].join('\n')
 
       let raw = null, env = null
@@ -562,7 +571,7 @@ const SCORE = {
   type: 'object', additionalProperties: false, required: ['score', 'rationale'],
   properties: { score: { type: 'number', description: '0..10' }, rationale: { type: 'string' } },
 }
-const task = extra => `PROBLEM:\n${A.problem}\n\n${extra}\nReturn the approach, a concrete plan, and its main risks.`
+const task = extra => `PROBLEM:\n${A.problem}\n\n${extra}\nReturn the approach, a concrete plan, and its main risks.${ucxWhere(CWD)}`
 
 phase('Generate')
 // Every requested candidate is accounted for; a failed generation is reported, not dropped.

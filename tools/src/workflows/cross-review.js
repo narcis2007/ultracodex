@@ -43,7 +43,7 @@ const FINDINGS = {
   } } },
 }
 
-const findPrompt = d => `Review ${TARGET}${WHERE}. Focus ONLY on this dimension: ${d}.
+const findPrompt = d => `Review ${TARGET}${WHERE}. Focus ONLY on this dimension: ${d}.${ucxWhere(CWD)}
 Scope the change with git (diff against the merge-base, status for uncommitted work), then read the surrounding code.
 Report only concrete, real issues: each with file, line, what is wrong, and a reachable failure scenario.
 Give each finding a short stable id. If there is nothing real, return an empty list — do not pad.${CONTEXT}${LESSONS}`
@@ -136,7 +136,7 @@ if (gated.length) {
 }
 
 phase('Synthesize')
-const report = await agent(`Write a code-review report for ${TARGET}${WHERE}.
+const report = await agent(`Write a code-review report for ${TARGET}${WHERE}.${ucxWhere(CWD)}
 ${failedDims.length ? 'At the very top, state that these dimensions were NOT reviewed (their finder failed): ' + JSON.stringify(failedDims.map(x => ({ dimension: x.dimension, why: x.failed }))) : ''}
 ${gate.failed ? 'At the top, state that the gpt-6-astra final gate FAILED for ' + gate.failed + ' finding(s) (those with finalGate.error): they are confirmed by gpt-6-sol only, and the review is incomplete.' : ''}
 CONFIRMED findings (a second model family could not refute them; finalGate, when present, is gpt-6-astra's verdict on top of gpt-6-sol's) — rank by severity, give file:line, the failure scenario and a fix:

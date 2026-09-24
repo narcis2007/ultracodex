@@ -2811,6 +2811,22 @@ function keepRejected(name, text) {
 // claims the upload (atomic rename), assembles, verifies and starts it, and prints the
 // same line `start` would. Upload ids are never chosen by the caller, so identical
 // requests from different workflows or sessions cannot collide.
+// The part as the workflow sent it: `received` itself, or — when a relay copied the next
+// part's lines after this one's (measured: for one task every relay, Sonnet and Opus alike,
+// did so byte for byte, five times) — the prefix of its lines that matches the hash. The rest
+// is the next part, which the relay sends next anyway. Only a hash match is accepted, and the
+// assembled frame is verified again as a whole (frame hashes, the helper's signature), so a
+// wrong cut can never start a run. null: no match.
+export function matchingPrefix(received, hash) {
+  if (fnv1a(received) === hash) return received;
+  const lines = received.split("\n");
+  for (let count = lines.length - 1; count >= 1; count -= 1) {
+    const prefix = lines.slice(0, count).join("\n");
+    if (fnv1a(prefix) === hash) return prefix;
+  }
+  return null;
+}
+
 export async function cmdPart(uploadArg, indexText, totalText, hashText, options = {}) {
   const index = Number(indexText);
   const total = Number(totalText);
@@ -2820,11 +2836,12 @@ export async function cmdPart(uploadArg, indexText, totalText, hashText, options
   }
   if (opening && index !== 1) throw new UsageError("part new opens an upload with part 1");
   if (!/^[0-9a-f]{8}$/.test(String(hashText ?? ""))) throw new UsageError("part HASH (8 hex digits) is required");
-  let text = (await readInput("-")).replace(/\r\n?/g, "\n");
-  if (text.endsWith("\n")) text = text.slice(0, -1); // the heredoc adds exactly one newline
+  let received = (await readInput("-")).replace(/\r\n?/g, "\n");
+  if (received.endsWith("\n")) received = received.slice(0, -1); // the heredoc adds exactly one newline
   const base = { ultracodex: 1, runnerVersion: RUNNER_VERSION };
-  if (fnv1a(text) !== hashText) {
-    keepRejected(`${opening ? "new" : uploadArg}-part${index}`, text);
+  const text = matchingPrefix(received, hashText);
+  if (text === null) {
+    keepRejected(`${opening ? "new" : uploadArg}-part${index}`, received);
     print(
       {
         ...base,
@@ -2856,13 +2873,15 @@ export async function cmdPart(uploadArg, indexText, totalText, hashText, options
       return 1;
     }
   }
+  if (text !== received) keepRejected(`${uploadId}-part${index}-trimmed`, received); // kept a day, for diagnosis
   const partFile = path.join(dir, `part-${index}`);
   fs.writeFileSync(`${partFile}.tmp`, text);
   renameRetry(`${partFile}.tmp`, partFile);
-  let received = 0;
-  for (let part = 1; part <= total; part += 1) if (isFileSync(path.join(dir, `part-${part}`))) received += 1;
-  if (received < total) {
-    print({ ...base, ok: null, state: "receiving", upload: uploadId, received, total, next: `part ${uploadId} <k> ${total} <hash>` }, options.pretty);
+  let count = 0;
+  for (let part = 1; part <= total; part += 1) if (isFileSync(path.join(dir, `part-${part}`))) count += 1;
+  if (count < total) {
+    const trimmed = text === received ? {} : { trimmedLines: received.split("\n").length - text.split("\n").length };
+    print({ ...base, ok: null, state: "receiving", upload: uploadId, received: count, total, ...trimmed, next: `part ${uploadId} <k> ${total} <hash>` }, options.pretty);
     return 3;
   }
   const claimed = `${dir}.assembling-${randomBytes(3).toString("hex")}`;

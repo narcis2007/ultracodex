@@ -13,7 +13,7 @@ shell. Every command prints one JSON line tagged `{"ultracodex":1,...}`; exit co
 | --- | --- |
 | `start --request FILE\|-` | validate a JSON request, persist it, hand it to a detached supervisor; prints `runId` |
 | `start --framed FILE\|-` | same, from a framed request (header line / schema / task) |
-| `part new 1 N HASH` · `part UPLOAD K N HASH` | relay upload: part 1 opens an upload (the runner allocates its id), parts 2..N go to it; a part whose hash differs is refused (`part_rejected`); the last part starts the run |
+| `part new 1 N HASH` · `part UPLOAD K N HASH` | relay upload: part 1 opens an upload (the runner allocates its id), parts 2..N go to it; a part whose hash differs is refused (`part_rejected`), but a copy that runs on into the next part's lines keeps the prefix that matches (`trimmedLines`); the last part starts the run |
 | `wait RUN_ID [--max-wait SEC]` | poll up to 110 s (default); prints the final envelope or the running state; refreshes the heartbeat |
 | `run --request FILE` | start + one wait |
 | `status [RUN_ID] [--all]` · `result RUN_ID` | inspect runs (never refresh the heartbeat) |
