@@ -1632,6 +1632,8 @@ export function evictGeneration(dir, judged) {
   // It renewed after all: straight back into the slot directory, which never left — emptied
   // a moment ago, it is fresh, so no taker claims it (a claim cannot land on it) or removes
   // it (only old empty debris is removed). Reborn whole only if the directory is gone.
+  // Known limit: a process stalled past the stale window at exactly this point can find the
+  // slot taken meanwhile; both owners then report the slot as lost (never hidden).
   try {
     renameRetry(moved, judged.leasePath);
     fs.rmSync(tomb, { recursive: true, force: true });
@@ -2038,7 +2040,7 @@ for ($round = 0; $round -lt 5 -and $want.Count -gt 0; $round++) {
   foreach ($r in $rows) { $created[[int]$r.ProcessId] = $r.CreationDate.ToFileTimeUtc() }
   foreach ($procId in @($pinned.Keys)) {
     $p = $pinned[$procId]
-    if ($created[$procId] -ne $want[$procId]) { $p.Dispose(); continue }
+    if ($created[$procId] -ne $want[$procId]) { Say ('dropped ' + $procId + ' ' + $want[$procId]); $p.Dispose(); continue }
     try { if (-not $p.HasExited) { $p.Kill() } } catch { }
     $held[$procId] = $p
     $parents[$procId] = $want[$procId]
@@ -2056,10 +2058,12 @@ Say 'done'`;
 }
 
 // Every line names an identity (PID + creation time), including the descendants the
-// script found during its rounds and those it found but never reached (`pending`, when its
-// round cap ran out), so the caller can check each against the final table.
+// script found during its rounds, those it found but never reached (`pending`, when its
+// round cap ran out) and those it set aside because the identity could not be confirmed
+// (`dropped`: gone from the snapshot, or its PID now someone else's), so the caller can
+// check each against the final table.
 function runPinnedKill(seeds, pinnedParents) {
-  if (!seeds.length && !pinnedParents.length) return { killed: [], survivors: [], pending: [], ok: true };
+  if (!seeds.length && !pinnedParents.length) return { killed: [], survivors: [], pending: [], dropped: [], ok: true };
   const out = runPowerShell(pinnedKillScript(seeds, pinnedParents));
   const lines = String(out.stdout ?? "").split(/\r?\n/).map((line) => line.trim());
   const pick = (word) =>
@@ -2069,7 +2073,7 @@ function runPinnedKill(seeds, pinnedParents) {
         const [pid, created] = line.slice(word.length + 1).split(" ");
         return [Number(pid), /^\d+$/.test(created ?? "") ? BigInt(created) : null];
       });
-  return { killed: pick("killed"), survivors: [...pick("survived"), ...pick("unpinned")], pending: pick("pending"), ok: lines.includes("done") };
+  return { killed: pick("killed"), survivors: [...pick("survived"), ...pick("unpinned")], pending: pick("pending"), dropped: pick("dropped"), ok: lines.includes("done") };
 }
 
 function windowsPinnedStop(child, tracked, { killRoot }) {
@@ -2104,7 +2108,9 @@ export function reconcilePinnedStop({ seeds, root, report, table, after, tracked
   const rootPinned = Boolean(root);
   const aimed = new Map(seeds);
   if (rootPinned) aimed.set(root.pid, root.created);
-  const found = [...report.killed, ...report.survivors, ...report.pending];
+  // A dropped identity is matched exactly (PID and creation time), so it is only ever
+  // reported: as a survivor if it is still there, and as the parent of possible leftovers.
+  const found = [...report.killed, ...report.survivors, ...report.pending, ...(report.dropped ?? [])];
   for (const [pid, created] of found) if (created !== null) aimed.set(pid, created);
   // Everything the script found is ours by identity from here on: a child one of them
   // started before it died is then reported below, never silently missed.

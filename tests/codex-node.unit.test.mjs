@@ -323,6 +323,20 @@ test("fallback teardown: whatever the kill script found — killed, surviving or
   assert.equal(clean.unverified, undefined, "a teardown that left nothing is clean");
   const capped = reconcilePinnedStop({ seeds: new Map(), root: null, report: report({ pending: [[60, 600n]] }), table, after: [], tracked: new Map(), childPid: 10 });
   assert.equal(capped.unverified, true, "a round cap that ran out is never reported as clean");
+  // 70 was found, then set aside (it exited before the snapshot) — after starting 80
+  const dropped = reconcilePinnedStop({
+    seeds: new Map([[20, 200n]]),
+    root: null,
+    report: report({ killed: [[20, 200n]], dropped: [[70, 700n]] }),
+    table,
+    after: [row(80, 70, 800)],
+    tracked: new Map([[20, 200n]]),
+    childPid: 10,
+  });
+  assert.deepEqual(dropped.possibleLeftovers, [80], "a child of a process the script set aside is reported");
+  assert.equal(dropped.unverified, true);
+  const stillThere = reconcilePinnedStop({ seeds: new Map(), root: null, report: report({ dropped: [[70, 700n]] }), table, after: [row(70, 20, 700)], tracked: new Map(), childPid: 10 });
+  assert.deepEqual(stillThere.survivors, [70], "a set-aside process that is still there, same identity, is a survivor");
 });
 
 test("creation times stay exact: FILETIMEs are far beyond Number precision", () => {

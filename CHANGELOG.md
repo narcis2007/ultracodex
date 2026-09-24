@@ -182,8 +182,10 @@ narrowed; five new findings in the new code, two high):
   a repository of its own (git needs no local `objects`/`refs` when `commondir` points
   elsewhere).
 - Slot give-back: a renewed owner's generation goes straight back into its slot directory,
-  which stays in place (fresh, so no taker touches it) — no window in which another run could
-  claim the slot.
+  which stays in place (fresh, so no taker touches it). Known limit (final gate of round 7):
+  a reclaimer or claimant stalled past the stale window at one exact moment can still end with
+  two generations in one slot; both owners then report the slot as lost, so the cap is
+  exceeded by one run, visibly.
 - Fallback teardown: processes the kill script found but never reached before its round cap
   are reported (`pending`) and reconciled; every identity it found joins the tracked set, so
   a child started by one of them is reported; a capped sweep is never reported clean. The
@@ -195,6 +197,9 @@ narrowed; five new findings in the new code, two high):
   layouts the gates found are refused, a real repository and a linked worktree still work;
   command-line configuration is protected, no repository can switch it off). The guard's
   discovery check stays as a second line of defence.
+- After the final gate of round 7 ("ship after fixes"): the fallback kill script also names
+  every identity it set aside (`dropped`), and the reconciliation reports it — as a survivor
+  if it is still there, and as the parent of possible leftovers.
 - Tests: 122 offline tests.
 
 ## 0.2.1 — 2026-07-10 (fork)
