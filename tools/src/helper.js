@@ -226,7 +226,7 @@ const UCX_READER = 'ultracodex:codex-reader'
 // to its prompt so it reads the right repository (measured: a report stage without it ran
 // git in the session directory and could not see the change).
 function ucxWhere(cwd) {
-  return cwd ? '\nTHE REPOSITORY is ' + cwd + ' — your own working directory may be another one, so run git there as git -C "' + cwd + '" <command> and read its files by absolute path.' : ''
+  return cwd ? '\nTHE REPOSITORY is ' + cwd + ' — your own working directory may be another one, so run git there as git -c safe.bareRepository=explicit -C "' + cwd + '" <command> and read its files by absolute path.' : ''
 }
 
 // Only a well-formed run id is ever put into another relay's prompt: a reply is untrusted.

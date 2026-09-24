@@ -85,6 +85,7 @@ const GIT_READ = new Set([
 // Long options (without the dashes) a reader may not use, abbreviated or not: git accepts
 // unique prefixes (`git grep --open-files=<cmd>` runs <cmd>).
 const GIT_BANNED = ["output", "ext-diff", "no-index", "contents", "open-files-in-pager", "exec", "upload-pack", "config"];
+const READER_GIT = "git -c safe.bareRepository=explicit";
 
 // The words bash would pass to git, or null when the command uses syntax that could make
 // them differ from what is checked here: unquoted globs and braces (a file named
@@ -123,12 +124,16 @@ export function checkReaderCommand(command, { env = process.env, cwd = process.c
   if (/[\n\r;&|<>`$\\~]/.test(text)) return "one git command, without pipes, redirections, substitutions, backslashes or ~";
   const words = shellWords(text);
   if (!words) return "quote patterns and paths: no unquoted * ? [ ] { } ( ) ! #, and no unterminated quote";
-  if (words[0] !== "git") return "a reader may only run read-only git commands (git [-C <repository root>] <subcommand> …)";
-  const at = words[1] === "-C" ? 3 : 1;
+  if (words[0] !== "git") return `a reader may only run read-only git commands (${READER_GIT} [-C <repository>] <subcommand> …)`;
+  // git itself then refuses any bare repository it would only have found by looking around
+  // (measured on git 2.55: an embedded one, one behind a junction, one with a commondir file) —
+  // command-line configuration is protected, so no repository can switch it off.
+  if (words[1] !== "-c" || words[2] !== "safe.bareRepository=explicit") return `every git command of a reader starts with: ${READER_GIT}`;
+  const at = words[3] === "-C" ? 5 : 3;
   const sub = words[at];
   if (!GIT_READ.has(sub)) return `git ${sub ?? "(nothing)"} is not one of the read-only commands a reader may run`;
   const home = normalizePath(env.ULTRACODEX_HOME ? path.resolve(env.ULTRACODEX_HOME) : path.join(os.homedir(), ".ultracodex")).toLowerCase();
-  for (const word of [...words.slice(1, at), ...words.slice(at + 1)]) {
+  for (const word of [...words.slice(3, at), ...words.slice(at + 1)]) {
     const lower = normalizePath(word).toLowerCase();
     if (lower.includes(".ultracodex") || lower.includes(home)) return "the runner's home is off limits";
     // Windows authenticates to the host of a network path (//host/share), handing it the
@@ -143,13 +148,13 @@ export function checkReaderCommand(command, { env = process.env, cwd = process.c
       return "-O (open in a pager), alone or bundled, is not allowed for a reader";
     }
   }
-  // Which repository git will use. A directory inside the reviewed tree can be an embedded
-  // bare repository (HEAD, objects/, refs/, config are ordinary files to commit), and git run
-  // there loads that config — whose core.fsmonitor is a program (measured). A tree checked out
-  // by git never contains a `.git` of its own, so a `.git` marks a real repository.
+  // Which repository git will use — a second line of defence behind safe.bareRepository. A
+  // directory inside the reviewed tree can hold a repository of its own (ordinary files to
+  // commit), whose config git would load. A tree checked out by git never contains a `.git`
+  // of its own, so a `.git` marks a real repository.
   let start = cwd;
-  if (at === 3) {
-    const value = words[2];
+  if (at === 5) {
+    const value = words[4];
     // No `..`: path.resolve drops `hop/..` as text, but the kernel follows `hop` first — a
     // committed symlink would put git somewhere this check never looked.
     if (value.split("/").includes("..")) return "-C may not contain .. (name the directory itself)";

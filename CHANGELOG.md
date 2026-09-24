@@ -190,6 +190,11 @@ narrowed; five new findings in the new code, two high):
   reconciliation is a pure function now, unit-tested on synthetic tables.
 - Part prefix matching is one linear pass, and parts beyond 16 KB are refused unscanned
   (rejected copies are kept bounded).
+- Every reader git command must start with `git -c safe.bareRepository=explicit`, so git
+  itself refuses a repository it would only have found implicitly (measured: all three
+  layouts the gates found are refused, a real repository and a linked worktree still work;
+  command-line configuration is protected, no repository can switch it off). The guard's
+  discovery check stays as a second line of defence.
 - Tests: 122 offline tests.
 
 ## 0.2.1 — 2026-07-10 (fork)
