@@ -29,6 +29,18 @@ Settle before starting: the repo (absolute path), the scope (`base` branch, one 
   touching security, money, concurrency, data migrations or irreversible external effects;
 - `light` → gpt-6-luna@max — a quick pass on a small or mechanical change.
 
+When the owner named no tier, pick it from the change itself — measure it first with
+`git -C "<repo>" diff --shortstat <scope>` (and `--name-only`):
+
+- **`final`** if it touches security, auth, money, concurrency, data migrations or
+  irreversible external effects, or it is the last gate before a merge/deploy — whatever its size;
+- else **`light`** if it is small (about 50 changed lines or fewer, in at most 3 files) or
+  mechanical (docs, comments, renames, formatting, config values, test scaffolding only);
+- else **`daily`**.
+
+Say which tier you picked and why in one line, so the owner can override it ("use sol",
+"use astra").
+
 Ask for (or infer) a line of **context**: what the change is for and the domain rules it must
 keep. If the project keeps a recurring-defects checklist (e.g. `REVIEW_LESSONS.md`), pass it as
 `lessons` — reviewers check every item.

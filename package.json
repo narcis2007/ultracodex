@@ -1,6 +1,6 @@
 {
   "name": "ultracodex-workspace",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "type": "module",
   "description": "Development workspace for the ultracodex Claude Code plugin (tests and build tooling; not shipped).",

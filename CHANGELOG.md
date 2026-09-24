@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 — 2026-09-24 (fork)
+
+- `codex-review` picks the tier itself when the owner names none, from the measured diff:
+  **final** (astra) for security, auth, money, concurrency, migrations, irreversible effects or
+  the last gate before merge/deploy; else **light** (luna) for small (about 50 lines, at most 3
+  files) or mechanical changes; else **daily** (sol). The pick is stated in one line so the
+  owner can override it.
+
 ## 0.3.1 — 2026-09-24 (fork)
 
 - `codex-review`: Claude's triage also rates each finding's **severity** itself — Codex tends

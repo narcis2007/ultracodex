@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "ultracodex",
   "displayName": "Ultracodex",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Use Codex (GPT-6 astra/sol/luna via codex exec) from Claude Code: cross-model review and verification workflows, implementation delegation and adversarial review skills, run by a tested runner with deadlines, process-tree teardown and provenance. Fork of KingGyuSuh/ultracodex.",
   "author": {
     "name": "Narcis Ciobotariu",
