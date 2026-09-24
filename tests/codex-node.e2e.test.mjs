@@ -174,7 +174,13 @@ test("an attached run whose caller stops polling is torn down as abandoned", asy
     { env }
   );
   const runId = started.json.runId;
-  assert.ok(await eventually(() => fs.existsSync(pidFile)), "Codex started its child before anyone stopped polling");
+  // The caller polls until Codex is up — under load the supervisor's Job Object helper can
+  // take longer than orphanAfterSec to start, and an unpolled run is (rightly) abandoned
+  // before anything is spawned — and only then stops polling.
+  assert.ok(
+    await eventually(async () => fs.existsSync(pidFile) || ((await runCli(["wait", runId, "--max-wait", "1"], { env })), fs.existsSync(pidFile)), { timeoutMs: 30_000, stepMs: 200 }),
+    "Codex started its child before anyone stopped polling"
+  );
   // `result` and `status` never refresh the heartbeat — only `wait` does.
   assert.ok(
     await eventually(async () => (await runCli(["result", runId], { env })).json.state === "abandoned", { timeoutMs: 20_000, stepMs: 500 }),
@@ -222,12 +228,22 @@ function signedHeader(home, fields, schema, task, counter = 1) {
   return { ...header, rmac: requestMac(key, requestDigest(header, schema, task)) };
 }
 
+// What the helper's key agent does before an upload: announce the request to the runner.
+async function announce(env, signed, schema, task) {
+  const { rmac, ...header } = signed;
+  const out = await runCli(["expect", requestDigest(header, schema, task)], { env });
+  assert.equal(out.json.ok, true, out.stdout);
+}
+
 test("a framed request from the relay runs; a corrupted copy is rejected before any run", async (t) => {
   const home = makeHome(t);
   const env = fastEnv(home);
   const task = "Check `this` $(and) that\\n with 'quotes'";
   const schema = SCHEMA_PRESETS.verdict;
   const header = signedHeader(home, { tier: "daily", kind: "verify", label: "framed" }, schema, task);
+  const unannounced = await runCli(["start", "--framed", "-"], { env, input: frame(header, schema, task) });
+  assert.equal(unannounced.json.error.kind, "unregistered_request", "signed but never announced: refused");
+  await announce(env, header, schema, task);
   const ok = await runCli(["run", "--framed", "-", "--max-wait", "20"], { env, input: frame(header, schema, task) });
   assert.equal(ok.json.state, "done");
   assert.equal(ok.json.provenance.model, "gpt-6-sol");
@@ -254,7 +270,9 @@ test("a signed request uploaded twice starts one run: the second upload joins th
   const argvLog = path.join(home, "argv.jsonl");
   const env = fastEnv(home, { FAKE_CODEX_ARGV_LOG: argvLog });
   const task = "once only";
-  const input = frame(signedHeader(home, { tier: "light", kind: "verify", label: "twice" }, null, task, 7), null, task);
+  const signed = signedHeader(home, { tier: "light", kind: "verify", label: "twice" }, null, task, 7);
+  await announce(env, signed, null, task);
+  const input = frame(signed, null, task);
   const first = await runCli(["start", "--framed", "-"], { env, input });
   const second = await runCli(["start", "--framed", "-"], { env, input });
   assert.equal(second.code, 3);
@@ -263,6 +281,11 @@ test("a signed request uploaded twice starts one run: the second upload joins th
   assert.equal(done.json.state, "done");
   assert.equal(fakeCodexPids(argvLog).length, 1, "Codex ran once");
   assert.equal(fs.readdirSync(path.join(home, "runs")).length, 1);
+  // once its nonce record is gone (gc), a replay finds its announcement consumed: refused
+  fs.rmSync(path.join(home, "nonces"), { recursive: true, force: true });
+  const replay = await runCli(["start", "--framed", "-"], { env, input });
+  assert.equal(replay.json.error.kind, "unregistered_request");
+  assert.equal(fs.readdirSync(path.join(home, "runs")).length, 1, "no second run");
 });
 
 test("an encoded frame uploaded in parts (out of order) starts once the last part lands", async (t) => {
@@ -272,6 +295,7 @@ test("an encoded frame uploaded in parts (out of order) starts once the last par
   const task = ["path C:" + bs + "x" + bs + "y and 50% and it's", "y".repeat(1900), "tail line"].join("\n");
   const schema = SCHEMA_PRESETS.verdict;
   const header = signedHeader(home, { kind: "verify", tier: "light", label: "parts" }, schema, normalizeText(task));
+  await announce(env, header, schema, normalizeText(task));
   const encoded = encodeFrameText(frame(header, schema, normalizeText(task)))
     .split("\n")
     .flatMap((line) => {

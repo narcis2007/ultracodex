@@ -104,6 +104,39 @@ review):
   another owner's slot; the key is published atomically (temp file + hard link); supervisors
   never work inside the home; `fast: true` puts a workflow's astra nodes on the priority tier.
 
+**Round 5 — after the astra@max final gate of round 4**:
+- **Announced requests**: a signature alone no longer starts a job. Before each upload the
+  helper announces the request's digest through the key agent (new runner command
+  `expect DIGEST`); the runner starts a relayed job only for an announced digest
+  (`unregistered_request`), consumes the announcement when the run starts and forgets unused
+  ones after a day, and keeps nonce records 7 days (`gc`). A Codex job or a Claude stage that
+  read the key — read-only still reads the whole disk — can therefore no longer start an
+  auxiliary job with it. A failed announcement fails the node (`register_failed`) before any
+  relay sees the request.
+- **Confined readers**: new agent type `ultracodex:codex-reader` (Read, Grep, Glob, and Bash
+  restricted by the guard to one read-only git command) for every shipped Claude stage that
+  reads reviewed code — cross-review finders and synthesis, codex-review triage and report,
+  judge-panel generators, Claude jurors and synthesis. The guard now judges four classes by
+  agent type: job relay, key agent (`key`, `expect`), reader, and every other subagent (only
+  the runner's `key` and `expect` are refused to them). The reader's git is checked word by
+  word as bash will pass it, against three ways measured on git 2.55 to run a program through
+  read-only git: bundled `-nO<cmd>`, abbreviated `--open-files=<cmd>`, and git inside an
+  embedded bare repository loading its `config` (`core.fsmonitor`) — `-C` must land on a
+  directory containing `.git`. Unquoted globs and network paths (NTLM) are refused too.
+- Windows teardown: process creation times (FILETIMEs, beyond a double's 2^53) are compared as
+  exact 64-bit integers — a PID reused within the same ~1.6 µs rounding step could otherwise
+  pass the identity check; the Job Object sweep repeats until a round finds no member (up to 8), so a
+  process spawned during teardown is not missed; the fallback reports survivors from the final
+  process table, not from the first attempt.
+- Slots: an old empty slot directory is taken by removing it while empty, never by moving it
+  (a move could carry off a lease created meanwhile); two leases that land in one slot are
+  resolved by run id (the larger backs out) and the one that stays reports the slot as lost.
+- A key file that exists but is not a key (an interrupted older runner) is never replaced
+  automatically — two repairers could hand out different keys; `key_invalid` names the file
+  to delete.
+- Tests: 112 offline tests, including replayed frames, unannounced frames, exact FILETIMEs,
+  double-booked slots, the reader allowlist and each measured git bypass.
+
 ## 0.2.1 — 2026-07-10 (fork)
 
 Correctness fixes from a cross-model review; runtime self-test.

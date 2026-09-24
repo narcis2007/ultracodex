@@ -19,6 +19,7 @@ shell. Every command prints one JSON line tagged `{"ultracodex":1,...}`; exit co
 | `status [RUN_ID] [--all]` · `result RUN_ID` | inspect runs (never refresh the heartbeat) |
 | `page RUN_ID K` | slice K of a large result (see "Paged results") |
 | `key` | the per-machine key, a fresh nonce and their `keyCheck` — for the Workflow helper's key agent only |
+| `expect DIGEST` | announce one relayed request by its 64-hex digest before it is uploaded — for the key agent only (see "Signed requests and results") |
 | `cancel RUN_ID` | ask that run's supervisor to stop its own process tree |
 | `preflight [--live]` | CLI, auth, catalog, policy models, home dir; `--live` = one tiny luna call |
 | `dry-run --request FILE` | show the exact codex argv, model, effort, deadline — no model call |
@@ -57,6 +58,14 @@ whose prompt carries no task text. With it the helper:
   therefore cannot start a job of its own — say, one asking Codex to read the key and sign a
   forgery — nor swap the schema, model or directory of a real one. Each nonce starts one run:
   a second upload of the same signed request joins the first run;
+- **announces every request before a relay sees it**: through the same key agent, whose
+  prompt is just `ULTRACODEX EXPECT` and the digest, the helper runs `expect <requestDigest>`.
+  The runner starts a relayed job only for an announced digest (`unregistered_request`
+  otherwise), consumes the announcement when the run starts, and forgets unused ones after a
+  day; nonce records are kept 7 days, so a replay finds its nonce's run or no announcement.
+  The key alone therefore starts nothing: a Codex job can read it (read-only still reads the
+  whole disk) and so can a reader agent's Read tool, but neither can announce — only the key
+  agent may run `expect`, and a read-only sandbox cannot write the registry;
 - **verifies every result**: `mac` = HMAC(key, `ucx-result` \n runId \n requestDigest \n kind
   \n body), kind being `result` or `text`. A result is thereby bound to the one request the
   helper made (an older run of the same task, from another workflow, does not pass) and to
@@ -89,26 +98,42 @@ runner refuses `workspace-write`, `hermetic: false`, `network`, `resume`, `taskF
 sleep the supervisor extends the deadline by the time asleep and pauses abandonment for one
 `orphanAfterSec`; `wait` declares `lost` only after watching the supervisor stay silent.
 
-### The relay guard (plugin hook)
+### The guard (plugin hook)
 
-`hooks/hooks.json` registers `scripts/relay-guard.mjs` as a PreToolUse hook. It ignores every
-tool call except those from the plugin's two agent types (hook input `agent_type`). The job
-relay (`ultracodex:codex-relay`) may run exactly
-`node "<plugin>/scripts/codex-node.mjs" part (new|ucx-…) K N HASH <<'UCX_P…' … UCX_P…` with a
-quote- and backslash-free body, `… wait <runId>` and `… page <runId> <k>`; the key agent
-(`ultracodex:codex-key`) may run exactly `… key`. Both without a permission prompt; everything
-else is denied. What each may do follows from the agent type the helper chose, never from
-what the model asks for: a job relay cannot read the key, whatever its prompt says. A relay
+`hooks/hooks.json` registers `scripts/relay-guard.mjs` as a PreToolUse hook on Bash. It
+judges a command by the agent type that runs it (hook input `agent_type`) — the type the
+helper chose, never what the model asks for — and leaves the main conversation alone:
+
+| Agent type | May run through Bash | Otherwise |
+| --- | --- | --- |
+| `ultracodex:codex-relay` — job relay | `node "<plugin>/scripts/codex-node.mjs" part (new\|ucx-…) K N HASH <<'UCX_P…' … UCX_P…` with a quote- and backslash-free body, `… wait <runId>`, `… page <runId> <k>` | denied, other tools too |
+| `ultracodex:codex-key` — key agent | `… key`, `… expect <64 hex>` | denied, other tools too |
+| `ultracodex:codex-reader` — Claude stages that read reviewed code | one read-only git command: `git [-C <repository root>] diff\|log\|show\|status\|blame\|ls-files\|ls-tree\|grep\|rev-parse\|merge-base\|cat-file\|describe\|shortlog\|diff-tree\|rev-list\|name-rev …` — no shell metacharacters or unquoted globs, no global options, no `--output`/`--ext-diff`/`--no-index`/`--contents`/`--open-files-in-pager`/`--exec` nor any abbreviation of them, no `-O` even bundled, no network paths, nothing under the ultracodex home; `-C` only onto a directory that contains `.git`, and without `-C` only where git would not pick up a bare-looking directory first (Read, Grep, Glob stay available) | denied |
+| any other subagent | whatever its permissions allow, except the runner's `key` and `expect` | no opinion |
+
+The allowed commands of the three confined types run without a permission prompt. A relay
 prompt-injected by reviewed content therefore cannot run other commands, pick another
-executable, compute hashes, read the key, or start a job the helper did not sign.
+executable, compute hashes, read the key or announce a request; a reader can run nothing but
+read-only git, so whatever the reviewed code tells it, it can neither sign nor announce.
+Each reader rule closes a way, measured on git 2.55, to make "read-only" git run a program as
+the owner: `git grep -nO<cmd>` and `git grep --open-files=<cmd>` start `<cmd>` as a pager, and
+git run inside an embedded bare repository — `HEAD`, `objects/`, `refs/` and `config` are
+ordinary files a repository can contain — loads that `config`, whose `core.fsmonitor` is a
+program. A tree checked out by git never contains a `.git` of its own, which is why `-C` must
+land on one.
 
-Residual risks: with hooks disabled (`disableAllHooks`) the relays keep their plain Bash tool
-and could read the key file. And the signatures defend against the confined relays, not
-against a Claude agent the owner lets run arbitrary Bash or Write on this machine: such an
-agent could read `~/.ultracodex/key` or plant a run file — keep workflow agents on normal
-permission prompts when they read untrusted repositories. (Codex jobs themselves can read
-the key — read-only still reads the whole disk — but cannot use it: every job's own answer is
-already bound to its own request, and a relayed job cannot start another.)
+Residual risks: with hooks disabled (`disableAllHooks`) the confined agents keep their plain
+tools. The guard sees Bash only, so a reader can still Read `~/.ultracodex/key` — which no
+longer suffices for anything: a job needs an announcement only the key agent can make, and a
+result MAC needs an HMAC computed, which no confined agent can do. The protection covers the
+plugin's confined agent types, not an unconfined agent the owner lets run arbitrary Bash or
+Write on this machine: such an agent could read the key, write an announcement or plant a run
+file. Give custom stages that read reviewed code `agentType: UCX_READER`, and keep other
+workflow agents on normal permission prompts when they read untrusted repositories. (Codex
+jobs can read the key too, but cannot write the home, and each job's answer is bound to its
+own request.) The reader's git uses the repository's own configuration: review a repository
+you cloned, not an unpacked archive that ships its own `.git` directory — git would load
+that `config` for any command, the owner's own included.
 
 The runner never resolves executables through the current directory: PowerShell is called by
 its System32 path, and no process of the runner works in the reviewed repository or in the
@@ -126,11 +151,14 @@ the Codex binary (only the operator's `ULTRACODEX_CODEX_PATH`).
   PowerShell helper puts the supervisor into a fresh **Job Object**, so every process of the run
   is born into the job — including ones whose parent has exited, which no PID bookkeeping could
   attribute. Stopping terminates exactly the job's members, each through a handle checked to
-  belong to the job (a PID can be reused, a membership cannot). Without a job (`preflight`
+  belong to the job (a PID can be reused, a membership cannot), and sweeps again (up to 8
+  rounds) until a round finds no member left: a process spawned during the sweep is not
+  missed. Without a job (`preflight`
   reports `windowsJob`; `ULTRACODEX_NO_JOB=1` forces it) an identity-checked fallback kills
-  only through handles pinned before their PID + creation time was verified, attributes
-  children only through pinned parents (live snapshots every 20 s), and reports what it cannot
-  prove as `possibleLeftovers` — never killing them. `taskkill /T`, which follows the parent
+  only through handles pinned before their PID + creation time was verified (creation times
+  are FILETIMEs, compared exactly as 64-bit integers — they exceed a double's precision),
+  attributes children only through pinned parents (live snapshots every 20 s), and reports
+  what it cannot prove as `possibleLeftovers` — never killing them. `taskkill /T`, which follows the parent
   PIDs of orphans and so can reach processes of other sessions, is never used. On POSIX: the
   child's process group, SIGTERM then SIGKILL. Only the run's own tree is ever stopped;
   survivors are reported.
@@ -206,6 +234,9 @@ MCP OAuth refresh noise filtered out.
 | `upload_busy` | no | another caller is assembling that upload (rare; a scanner lock is retried first) |
 | `unauthenticated_result` · `key_unavailable` | helper re-collects once / retryable | result not signed by this runner for this request / the key agent could not fetch the key — never trusted |
 | `unauthenticated_request` | no | a relayed frame without the helper's valid signature (a relay composing its own job) |
+| `unregistered_request` | no | a signed frame the helper never announced (or announced over a day ago): a replay, or a job composed by someone holding the key |
+| `register_failed` | no | the helper's key agent could not announce the request; nothing was uploaded |
+| `key_invalid` | no | `~/.ultracodex/key` exists but is not a key (an interrupted older runner): delete it and a new one is made — never replaced automatically |
 | `nonce_reused` | no | a signed request was uploaded again while its first upload was still being registered |
 | `result_too_large` | no | over 400 pages (4 MB): read the run's `result.json` from the conversation instead |
 | `helper_error` | no | an unexpected error inside the helper — reported as a failed node, never a crash |

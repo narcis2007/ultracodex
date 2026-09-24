@@ -110,10 +110,14 @@ What the helper guarantees (keep it intact):
 
 1. **Relay, not solver — and signed both ways.** Each node runs through the
    `ultracodex:codex-relay` agent (Bash only, confined by the plugin's relay guard to the
-   runner's own commands). The helper signs every request (the runner starts nothing a relay
-   composed itself) and accepts only results the runner signed for that very request; the
-   key comes from a separate `ultracodex:codex-key` agent, so no job relay ever holds it. A
-   relay prompt-injected by reviewed content cannot fake, replay or retarget a verdict.
+   runner's own commands). The helper signs every request and announces it to the runner
+   before a relay sees it (the runner starts nothing a relay, a Codex job or anyone else
+   composed), and accepts only results the runner signed for that very request; key and
+   announcements go through a separate `ultracodex:codex-key` agent, so no job relay ever
+   holds the key. A relay prompt-injected by reviewed content cannot fake, replay or
+   retarget a verdict. Claude stages that read reviewed code run as `UCX_READER`
+   (`ultracodex:codex-reader`: Read, Grep, Glob and read-only git) — use it in custom
+   scripts too.
 2. **Byte-exact transport, both ways.** Requests are normalized, percent-encoded (no quote,
    backslash or control character reaches a Bash command), sent in ≤1.6 KB parts with per-part
    hashes (the Windows command line breaks near 8 KB) and verified by the runner; results come

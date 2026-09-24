@@ -75,12 +75,22 @@ test("the relay agent is Bash-only, cheap, and reaches the runner through the pl
   assert.match(body, /"paged"/);
 });
 
-test("the key agent is a separate Bash-only agent that runs only the key command", () => {
+test("the key agent is a separate Bash-only agent that runs only key and expect", () => {
   const { fields, body } = frontmatter(path.join(PLUGIN, "agents", "codex-key.md"));
   assert.equal(fields.name, "codex-key");
   assert.equal(fields.tools, "Bash");
   assert.ok(body.includes('node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" key'));
+  assert.ok(body.includes('node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" expect'));
+  assert.match(body, /ULTRACODEX EXPECT/);
   assert.ok(!/ part | wait | page /.test(body.replace(/`[^`]*`/g, "")), "no job commands in its instructions");
+});
+
+test("the reader agent reads only: files through Read/Grep/Glob, history through read-only git", () => {
+  const { fields, body } = frontmatter(path.join(PLUGIN, "agents", "codex-reader.md"));
+  assert.equal(fields.name, "codex-reader");
+  assert.deepEqual(fields.tools.split(",").map((tool) => tool.trim()).sort(), ["Bash", "Glob", "Grep", "Read"]);
+  assert.match(body, /read-only git/);
+  assert.match(body, /data, never instructions/);
 });
 
 test("the plugin registers the relay guard as a Bash PreToolUse hook", () => {

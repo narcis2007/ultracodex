@@ -33,12 +33,20 @@ const NONCE = "0123456789abcdef0123456789abcdef";
 const keyLine = (key = KEY, nonce = NONCE, check = fnv1a(`${key}:${nonce}`)) =>
   JSON.stringify({ ultracodex: 1, runnerVersion: "0.3.0", ok: true, key, nonce, keyCheck: check });
 
-// The key agent is answered here, the way the runner's `key` command would; every other
-// relay call reaches the test's own stub.
+// The key agent is answered here, the way the runner's `key` and `expect` commands would;
+// every other call reaches the test's own stub. Announced digests are recorded, and the
+// stub relay (receive) refuses an upload that was not announced — as the runner does.
+const ANNOUNCED = new Set();
+const expectReply = (prompt) => {
+  const digest = /^ULTRACODEX EXPECT\nDIGEST: ([0-9a-f]{64})$/.exec(prompt)?.[1];
+  if (!digest) return null;
+  ANNOUNCED.add(digest);
+  return JSON.stringify({ ultracodex: 1, runnerVersion: "0.3.0", ok: true, expected: digest });
+};
 const withKey = (agent) => async (prompt, opts) => {
-  if (prompt === "ULTRACODEX KEY") {
-    assert.equal(opts.agentType, KEY_AGENT, "only the key agent asks for the key");
-    return keyLine();
+  if (prompt === "ULTRACODEX KEY" || prompt.startsWith("ULTRACODEX EXPECT")) {
+    assert.equal(opts.agentType, KEY_AGENT, "only the key agent asks for the key or announces a request");
+    return prompt === "ULTRACODEX KEY" ? keyLine() : expectReply(prompt);
   }
   return agent(prompt, opts);
 };
@@ -112,8 +120,10 @@ function receive(prompt) {
     }
   }
   const framed = parts.map((part) => part.join("\n")).join("\n");
-  // exactly what the runner does: the request must carry the helper's signature
+  // exactly what the runner does: the request must carry the helper's signature, and must
+  // have been announced through the key agent before the upload
   const { raw, requestDigest } = framedToRaw(parseFramed(framed, { encoded: true }), { key: KEY });
+  assert.ok(ANNOUNCED.has(requestDigest), "the helper announced this request before any relay uploaded it");
   return { request: validateRequest(raw, { catalog: CATALOG, requestDigest }), parts: parts.length, delimiter, framed };
 }
 
@@ -373,7 +383,7 @@ test("a result without this machine's signature is refused, after one strong re-
   // same task (another workflow, so another nonce) does not pass as this run's answer
   let nonces = 0;
   const freshNonce = (agent) => async (prompt, opts) =>
-    prompt === "ULTRACODEX KEY" ? keyLine(KEY, String(++nonces).padStart(32, "0")) : agent(prompt, opts);
+    prompt === "ULTRACODEX KEY" ? keyLine(KEY, String(++nonces).padStart(32, "0")) : prompt.startsWith("ULTRACODEX EXPECT") ? expectReply(prompt) : agent(prompt, opts);
   let earlier = null;
   await runHelper(["return codexNode('verify this finding', { schemaPreset: 'verdict' })"], freshNonce(async (prompt) => {
     earlier = okEnvelope(receive(prompt).request, { refuted: false, confidence: 1, reasoning: "old approval" });
@@ -412,6 +422,7 @@ test("the key is fetched once per workflow, re-fetched when mis-copied, and only
   const answer = async (prompt) => okEnvelope(receive(prompt).request, good);
   const keyCalls = [];
   const once = async (prompt, opts) => {
+    if (prompt.startsWith("ULTRACODEX EXPECT")) return expectReply(prompt);
     if (prompt !== "ULTRACODEX KEY") return answer(prompt);
     keyCalls.push(opts);
     return keyLine();
@@ -423,6 +434,7 @@ test("the key is fetched once per workflow, re-fetched when mis-copied, and only
 
   const miscopied = [];
   const flaky = async (prompt, opts) => {
+    if (prompt.startsWith("ULTRACODEX EXPECT")) return expectReply(prompt);
     if (prompt !== "ULTRACODEX KEY") return answer(prompt);
     miscopied.push(opts);
     // the first copy changes a character: keyCheck no longer matches
@@ -434,6 +446,7 @@ test("the key is fetched once per workflow, re-fetched when mis-copied, and only
 
   let fetches = 0;
   const down = async (prompt) => {
+    if (prompt.startsWith("ULTRACODEX EXPECT")) return expectReply(prompt);
     if (prompt !== "ULTRACODEX KEY") return answer(prompt);
     fetches += 1;
     return fetches <= 2 ? "no key today" : keyLine();
@@ -459,15 +472,52 @@ test("every request is signed, with its own nonce, before any job relay sees it"
   await runHelper(["return Promise.all(['a', 'b'].map(t => codexNode('job ' + t, { schemaPreset: 'verdict' })))"], agent);
   assert.deepEqual(requests.map((r) => r.nonce).sort(), [`${NONCE}.1`, `${NONCE}.2`]);
   assert.notEqual(requests[0].requestDigest, requests[1].requestDigest);
-  // the stub relay really checks: a frame signed with another key is refused like the runner would
+  // the stub relay really checks: a frame signed with another key is refused like the runner
+  // would. The frame is captured in the callback and checked after the run, so a failing
+  // assertion fails the test instead of becoming one more failed node.
+  let captured = null;
   const other = async (prompt) => {
     const lines = prompt.split("\n");
     const delimiter = lines.find((line) => line.startsWith("DELIMITER: ")).slice(11);
-    const body = lines.filter((line) => !line.startsWith("=====" + delimiter) && !/^(ULTRACODEX START|PARTS: |DELIMITER: |Part 1: )/.test(line)).join("\n");
-    assert.throws(() => framedToRaw(parseFramed(body, { encoded: true }), { key: "ab".repeat(32) }), (error) => error.kind === "unauthenticated_request");
+    captured = lines.filter((line) => !line.startsWith("=====" + delimiter) && !/^(ULTRACODEX START|PARTS: |DELIMITER: |Part 1: )/.test(line)).join("\n");
     return "refused";
   };
   await runHelper(["return codexNode('job', { schemaPreset: 'verdict' })"], other);
+  assert.ok(captured, "the relay was called");
+  assert.doesNotThrow(() => framedToRaw(parseFramed(captured, { encoded: true }), { key: KEY }));
+  assert.throws(() => framedToRaw(parseFramed(captured, { encoded: true }), { key: "ab".repeat(32) }), (error) => error.kind === "unauthenticated_request");
+});
+
+test("a request the runner was not told about never reaches a relay", async () => {
+  let relayed = 0;
+  const agent = async (prompt, opts) => {
+    if (prompt === "ULTRACODEX KEY") return keyLine();
+    if (prompt.startsWith("ULTRACODEX EXPECT")) return JSON.stringify({ ultracodex: 1, ok: false, state: "rejected", error: { kind: "usage", message: "disk full" } });
+    relayed += 1;
+    return okEnvelope(receive(prompt).request, { refuted: true, confidence: 1, reasoning: "r" });
+  };
+  const out = await runHelper(["return codexNode('job', { schemaPreset: 'verdict' })"], agent, { key: false });
+  assert.equal(out.kind, "register_failed");
+  assert.match(out.message, /disk full/);
+  assert.equal(relayed, 0, "no upload without an announcement");
+});
+
+test("the shipped workflows run their repository-reading Claude stages as the confined reader", async () => {
+  const types = new Map();
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      if (request.label === "codex:final-gate") return okEnvelope(request, { results: [{ id: "correctness:1", refuted: false, confidence: 1, reasoning: "ok" }] });
+      return okEnvelope(request, { results: [{ id: "correctness:1", refuted: false, confidence: 1, reasoning: "ok" }] });
+    }
+    types.set(opts.label, opts.agentType);
+    if (opts.label === "find:correctness") return { findings: [{ id: "x", title: "t", file: "a.ts", line: 1, detail: "d", failure_scenario: "s", severity: "high" }] };
+    if (opts.label === "synthesize") return "REPORT";
+    return { findings: [] };
+  };
+  await runWorkflow("cross-review", { agent, args: { dimensions: ["correctness"] } });
+  assert.equal(types.get("find:correctness"), "ultracodex:codex-reader");
+  assert.equal(types.get("synthesize"), "ultracodex:codex-reader");
 });
 
 test("a malformed page count is a failed node, never an exception that aborts the workflow", async () => {

@@ -58,7 +58,7 @@ phase('Find')
 // reported, never silently turned into "no findings".
 const results = await pipeline(
   DIMENSIONS,
-  d => agent(findPrompt(d), { label: 'find:' + d, phase: 'Find', schema: FINDINGS })
+  d => agent(findPrompt(d), { label: 'find:' + d, phase: 'Find', schema: FINDINGS, agentType: UCX_READER })
     .then(review => review, e => ({ __failed: String((e && e.message) || e) })),
   async (review, d) => {
     if (!review || review.__failed) return { dimension: d, findings: [], failed: review ? review.__failed : 'the finder returned nothing' }
@@ -144,7 +144,7 @@ ${JSON.stringify(confirmed)}
 ${disputed.length ? 'DISPUTED findings (gpt-6-sol confirmed them, the gpt-6-astra final gate refuted them — present both reasonings and say the owner must decide):\n' + JSON.stringify(disputed.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, severity: f.severity, sol: f.verdict.reasoning, astra: f.finalGate.reasoning }))) : ''}
 UNVERIFIED findings (the Codex verifier failed — state this plainly at the top; they are neither confirmed nor refuted):
 ${JSON.stringify(part.unverified.map(f => ({ id: f.id, title: f.title, file: f.file, why: f.verdict && f.verdict.kind })))}
-REFUTED count: ${part.refuted.length} (list their titles briefly at the end).`, { label: 'synthesize', phase: 'Synthesize' })
+REFUTED count: ${part.refuted.length} (list their titles briefly at the end).`, { label: 'synthesize', phase: 'Synthesize', agentType: UCX_READER })
 
 return {
   // an enabled final gate that could not check every blocking finding leaves the review incomplete

@@ -1414,10 +1414,8 @@ export function ensureKey(env = process.env) {
       if (KEY_RE.test(current)) return current;
       sleepSync(10); // an older runner's creator (open, then write) may still be writing
     }
-    renameRetry(tmp, file); // an empty or corrupt key nobody completes: replace it
-    current = read();
-    if (KEY_RE.test(current)) return current;
-    throw new Error(`cannot establish the ultracodex result key at ${file}`);
+    // Never repaired automatically: two repairers could each hand out a different key.
+    throw new RequestError("key_invalid", `the ultracodex key at ${file} exists but is not valid (left by an interrupted older runner?); delete it and a new one is created`);
   } finally {
     fs.rmSync(tmp, { force: true });
   }
@@ -1584,23 +1582,33 @@ function tryTakeSlot(index, runId, watch) {
       fs.rmSync(tombstone, { recursive: true, force: true });
       watch.suspects.delete(dir);
       // the slot directory is now empty and fresh: no other taker judges it gone
-    } else {
+    } else if (judged) {
+      // A pre-0.3 owner file directly in the slot: only that file moves, never the directory.
+      const legacy = path.join(dir, "owner.json");
       const tombstone = `${dir}.stale-${randomBytes(4).toString("hex")}`;
       try {
-        renameRetry(dir, tombstone);
+        renameRetry(legacy, tombstone);
       } catch {
-        return null; // another supervisor reclaimed it first
+        return null;
       }
-      const moved = slotOwner(tombstone);
-      if (judged ? !sameOwner(moved, judged) : moved !== null) {
+      if (!sameOwner(readJsonSafe(tombstone), judged)) {
         try {
-          renameRetry(tombstone, dir);
+          renameRetry(tombstone, legacy);
         } catch {
-          // an older runner's owner notices on its next renewal
+          // an older runner's owner rewrites its file on its next renewal
         }
         return null;
       }
-      fs.rmSync(tombstone, { recursive: true, force: true });
+      fs.rmSync(tombstone, { force: true });
+      watch.suspects.delete(dir);
+    } else {
+      // Empty debris: removed only while still empty (rmdir fails on a directory another
+      // taker has just filled), then taken fresh — the shared directory is never moved.
+      try {
+        fs.rmdirSync(dir);
+      } catch {
+        return null;
+      }
       watch.suspects.delete(dir);
       try {
         fs.mkdirSync(dir);
@@ -1614,8 +1622,23 @@ function tryTakeSlot(index, runId, watch) {
   } catch {
     return null;
   }
+  // Two takers that judged the same debris can both end up here: one generation wins
+  // (the smaller run id), the other backs out before it runs anything.
+  const rival = generationsIn(dir).find((name) => name !== `lease-${runId}` && name < `lease-${runId}`);
+  if (rival) {
+    fs.rmSync(leaseDir(dir, runId), { recursive: true, force: true });
+    return null;
+  }
   writeJsonAtomic(path.join(leaseDir(dir, runId), "owner.json"), { runId, pid: process.pid, beatAt: Date.now() });
   return dir;
+}
+
+function generationsIn(dir) {
+  try {
+    return fs.readdirSync(dir).filter((name) => name.startsWith("lease-"));
+  } catch {
+    return [];
+  }
 }
 
 // Release touches only this run's own generation: it moves lease-<runId> out of the slot
@@ -1673,7 +1696,9 @@ export async function acquireSlots(weight, runId, shouldStop) {
               // Keeps trying after a failure: a reclaimer that moved the slot away by mistake
               // puts it back, and a lease that stopped renewing would then really go stale.
               writeJsonAtomic(path.join(leaseDir(dir, runId), "owner.json"), { runId, pid: process.pid, beatAt: Date.now() });
-              lost.delete(dir);
+              // another generation beside ours: the slot is double-booked (reported, as lost)
+              if (generationsIn(dir).length > 1) lost.add(dir);
+              else lost.delete(dir);
             } catch {
               lost.add(dir);
             }
@@ -1727,11 +1752,13 @@ function runPowerShell(script, { timeout = 60_000 } = {}) {
   });
 }
 
+// Creation times are FILETIMEs (~1.3e17, far beyond 2^53): kept as BigInt, never as a
+// Number, or an identity check against the exact value would silently fail.
 export function parseProcessTable(text) {
   const rows = [];
   for (const line of String(text ?? "").split(/\r?\n/)) {
     const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s*$/.exec(line);
-    if (match) rows.push({ pid: Number(match[1]), ppid: Number(match[2]), created: Number(match[3]) });
+    if (match) rows.push({ pid: Number(match[1]), ppid: Number(match[2]), created: BigInt(match[3]) });
   }
   return rows;
 }
@@ -1826,20 +1853,24 @@ public static class UcxJob {
     } finally { Marshal.FreeHGlobal(buffer); }
   }
   // Every member but keep, each terminated through a handle checked to be in this job
-  // after it was opened: a PID can be reused, a job membership cannot be faked.
+  // after it was opened: a PID can be reused, a job membership cannot be faked. Repeated
+  // until no member is left, since a member can start a child while the sweep runs.
   public static string KillAllBut(IntPtr job, int keep) {
-    int[] pids = Members(job);
-    if (pids == null) return "error " + Marshal.GetLastWin32Error();
-    List<IntPtr> held = new List<IntPtr>();
     int killed = 0;
-    foreach (int pid in pids) {
-      if (pid == keep) continue;
-      IntPtr h = OpenProcess(0x00100000 | 0x1000 | 0x0001, false, pid);
-      if (h == IntPtr.Zero) continue;
-      bool member;
-      if (IsProcessInJob(h, job, out member) && member) { if (TerminateProcess(h, 1)) killed++; held.Add(h); } else CloseHandle(h);
+    for (int round = 0; round < 8; round++) {
+      int[] pids = Members(job);
+      if (pids == null) return "error " + Marshal.GetLastWin32Error();
+      List<IntPtr> held = new List<IntPtr>();
+      foreach (int pid in pids) {
+        if (pid == keep) continue;
+        IntPtr h = OpenProcess(0x00100000 | 0x1000 | 0x0001, false, pid);
+        if (h == IntPtr.Zero) continue;
+        bool member;
+        if (IsProcessInJob(h, job, out member) && member) { if (TerminateProcess(h, 1)) killed++; held.Add(h); } else CloseHandle(h);
+      }
+      if (held.Count == 0) break;
+      foreach (IntPtr h in held) { WaitForSingleObject(h, 3000); CloseHandle(h); }
     }
-    foreach (IntPtr h in held) { WaitForSingleObject(h, 3000); CloseHandle(h); }
     int[] after = Members(job);
     List<string> left = new List<string>();
     if (after != null) foreach (int pid in after) if (pid != keep) left.Add(pid.ToString());
@@ -1873,7 +1904,7 @@ function jobHelperScript(pid) {
 // Puts process `pid` (default: this one) into a fresh Job Object. Resolves `ready` to
 // true once it is in; `kill()` resolves to a teardown report, or null when the helper is
 // unavailable (the caller then falls back).
-export function startWindowsJob({ pid = process.pid, readyMs = 30_000, killMs = 20_000 } = {}) {
+export function startWindowsJob({ pid = process.pid, readyMs = 30_000, killMs = 40_000 } = {}) {
   const unavailable = { ready: Promise.resolve(false), kill: async () => null, close() {}, reason: null };
   let helper;
   try {
@@ -1955,7 +1986,7 @@ export function startWindowsJob({ pid = process.pid, readyMs = 30_000, killMs = 
 // Children started meanwhile are attributed only to parents whose PID is pinned — held by
 // this script, or by the caller (the root, whose handle Node holds until it yields).
 function pinnedKillScript(seeds, pinnedParents) {
-  const assign = (name, pairs) => pairs.map(([pid, created]) => `$${name}[${Number(pid)}] = [long]${Number(created)}`).join("\n");
+  const assign = (name, pairs) => pairs.map(([pid, created]) => `$${name}[${Number(pid)}] = [long]${BigInt(created)}`).join("\n");
   return `$ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 function Say($text) { [Console]::Out.WriteLine($text) }
@@ -2020,8 +2051,13 @@ function windowsPinnedStop(child, tracked, { killRoot }) {
   if (rootPinned) child.kill("SIGKILL");
   const report = runPinnedKill([...seeds], rootPinned ? [[root.pid, root.created]] : []);
   const after = windowsProcessTable();
-  const survivors = [...report.survivors];
-  if (rootPinned && after?.some((proc) => proc.pid === root.pid && proc.created === root.created)) survivors.push(root.pid);
+  // Reconciled against the final table, whatever the script said: every targeted identity
+  // still present is a survivor — a skipped or failed kill is never reported as clean.
+  const aimed = new Map(seeds);
+  if (rootPinned) aimed.set(root.pid, root.created);
+  const survivors = after
+    ? [...aimed].filter(([pid, created]) => after.some((proc) => proc.pid === pid && proc.created === created)).map(([pid]) => pid)
+    : [...report.survivors];
   // Children of tracked processes that died before the teardown: probably ours, but their
   // parent's PID is no longer pinned, so nothing proves it — reported, never killed.
   const dead = [...tracked].filter(([pid, created]) => !(after ?? table).some((proc) => proc.pid === pid && proc.created === created));
@@ -2808,6 +2844,41 @@ export async function cmdPart(uploadArg, indexText, totalText, hashText, options
   return startFromRaw(loaded.raw, options, { requestDigest: loaded.requestDigest });
 }
 
+// ── request registration ──
+// Before each upload, the helper announces the request's digest through its key agent
+// (`expect DIGEST`), a channel no relay and no Codex job can use: relays may only run
+// part/wait/page, and a read-only Codex sandbox cannot write this registry. The runner starts
+// a relayed job only for an announced digest, and consumes the announcement when it does.
+const EXPECT_TTL_MS = 24 * 3600 * 1000;
+
+function expectedPath(digest) {
+  return path.join(ucxHome(), "expected", digest);
+}
+
+function nonceMarker(nonce) {
+  return path.join(ucxHome(), "nonces", nonce);
+}
+
+function existingRunForNonce(nonce, { waitMs = 0 } = {}) {
+  const marker = nonceMarker(nonce);
+  const until = Date.now() + waitMs;
+  for (;;) {
+    const runId = (readTextSafe(marker) ?? "").trim();
+    if (RUN_ID_RE.test(runId)) return runId;
+    if (Date.now() >= until) return null;
+    sleepSync(20);
+  }
+}
+
+export function cmdExpect(digest, { pretty = false } = {}) {
+  if (!/^[0-9a-f]{64}$/.test(String(digest ?? ""))) throw new UsageError("expect needs a 64-hex request digest");
+  const file = expectedPath(digest);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, nowIso());
+  print({ ultracodex: 1, runnerVersion: RUNNER_VERSION, ok: true, expected: digest }, pretty);
+  return 0;
+}
+
 // The line `start` prints for a run, also used when a signed request is uploaded again.
 function startedLine(runId, request, state) {
   return {
@@ -2834,29 +2905,45 @@ async function startFromRaw(raw, options, { requestDigest = null } = {}) {
     print(rejection(error.kind ?? "invalid_request", error.message), options.pretty);
     return 1;
   }
+  let registration = null;
+  if (requestDigest) {
+    if (!request.nonce) {
+      print(rejection("unauthenticated_request", "a relayed request needs a nonce"), options.pretty);
+      return 1;
+    }
+    // A second upload of a request that already started (a retrying relay) joins that run.
+    const joined = existingRunForNonce(request.nonce);
+    if (joined) {
+      print(startedLine(joined, request, readJsonSafe(runPaths(joined).state)?.state), options.pretty);
+      return 3;
+    }
+    // Otherwise the request must have been announced through the helper's key agent: a frame
+    // anyone else composed — even one signed with a key read off the disk — starts nothing.
+    registration = expectedPath(requestDigest);
+    if (!isFileSync(registration) || Date.now() - fs.statSync(registration).mtimeMs > EXPECT_TTL_MS) {
+      print(rejection("unregistered_request", "the Workflow helper did not announce this request to the runner"), options.pretty);
+      return 1;
+    }
+  }
   const { runId, paths } = persistRun(request);
-  if (requestDigest && request.nonce) {
-    // One run per signed request: a second upload (a retrying relay, or a hijacked one
-    // trying to multiply runs) joins the run the first one started.
-    const marker = path.join(ucxHome(), "nonces", request.nonce);
+  if (requestDigest) {
+    // One run per signed request (atomic): the loser of a race joins the winner's run.
+    const marker = nonceMarker(request.nonce);
     fs.mkdirSync(path.dirname(marker), { recursive: true });
     try {
       fs.writeFileSync(marker, runId, { flag: "wx" });
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
       fs.rmSync(paths.dir, { recursive: true, force: true }); // never started
-      let existing = "";
-      for (let attempt = 0; attempt < 50 && !RUN_ID_RE.test(existing); attempt += 1) {
-        existing = (readTextSafe(marker) ?? "").trim();
-        if (!RUN_ID_RE.test(existing)) sleepSync(20);
-      }
-      if (!RUN_ID_RE.test(existing)) {
+      const existing = existingRunForNonce(request.nonce, { waitMs: 1000 });
+      if (!existing) {
         print(rejection("nonce_reused", "this signed request was already uploaded"), options.pretty);
         return 1;
       }
       print(startedLine(existing, request, readJsonSafe(runPaths(existing).state)?.state), options.pretty);
       return 3;
     }
+    fs.rmSync(registration, { force: true }); // consumed: the announcement starts one run, once
   }
   const supervisor = spawn(process.execPath, [RUNNER_FILE, "supervise", runId], {
     // Never the (possibly untrusted) repository, and not the home either: a process's working
@@ -3034,12 +3121,15 @@ export function cmdGc({ olderThanDays = 7, pretty = false } = {}) {
     }
   }
   const inboxes = [];
-  for (const sub of ["inbox", "rejected", "nonces", "relay-roles"]) {
+  const day = 24 * 3600 * 1000;
+  // A consumed nonce is kept as long as its run: a replayed frame then joins that run, and
+  // once both are gone the frame's announcement (consumed at the start) is long gone too.
+  for (const [sub, maxAge] of [["inbox", day], ["rejected", day], ["expected", day], ["relay-roles", day], ["nonces", Math.max(day, olderThanDays * day)]]) {
     try {
       const root = path.join(ucxHome(), sub);
       for (const name of fs.readdirSync(root)) {
         const entry = path.join(root, name);
-        if (Date.now() - fs.statSync(entry).mtimeMs > 24 * 3600 * 1000) {
+        if (Date.now() - fs.statSync(entry).mtimeMs > maxAge) {
           fs.rmSync(entry, { recursive: true, force: true });
           inboxes.push(`${sub}/${name}`);
         }
@@ -3202,7 +3292,8 @@ function helpText() {
     "  node codex-node.mjs status [RUN_ID] [--all]                      list runs",
     "  node codex-node.mjs result RUN_ID                                print the final envelope",
     "  node codex-node.mjs page RUN_ID K                                 slice K of a large (paged) result",
-    "  node codex-node.mjs key                                          the per-machine result-MAC key (for the Workflow helper)",
+    "  node codex-node.mjs key                                          the per-machine key and a fresh nonce (for the helper's key agent)",
+    "  node codex-node.mjs expect DIGEST                                announce a request the helper built (for the helper's key agent)",
     "  node codex-node.mjs cancel RUN_ID                                stop that run's own process tree",
     "  node codex-node.mjs preflight [--live]                           check CLI, auth, catalog (no model call unless --live)",
     "  node codex-node.mjs policy | models | schema PRESET              routing policy, catalog, schema presets",
@@ -3292,6 +3383,8 @@ export async function main(argv = process.argv.slice(2)) {
         print({ ultracodex: 1, runnerVersion: RUNNER_VERSION, ok: true, key, nonce, keyCheck: fnv1a(`${key}:${nonce}`) }, options.pretty);
         return 0;
       }
+      case "expect":
+        return cmdExpect(id, options);
       case "status":
         return cmdStatus(id, options);
       case "result":

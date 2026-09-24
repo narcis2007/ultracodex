@@ -13,8 +13,8 @@ export const meta = {
 
 // ── ultracodex helper v0.3.0 ───────────────────────────────────────────────────
 // Generated from tools/src/helper.js in the ultracodex repo — edit the source, then
-// `npm run build`. Needs the ultracodex plugin (its `codex-relay` and `codex-key`
-// agents + runner).
+// `npm run build`. Needs the ultracodex plugin (its `codex-relay`, `codex-key` and
+// `codex-reader` agents + runner).
 //
 // codexNode(task, opts) runs ONE Codex (GPT) job and resolves to:
 //   • the parsed object when a schema/schemaPreset is given — with a non-enumerable
@@ -122,9 +122,10 @@ function isCodexError(x) { return x == null || (typeof x === 'object' && x._code
 // ── authentication: HMAC-SHA256 in plain JS (the Workflow runtime has no crypto) ──
 // The helper fetches the per-machine key and a fresh nonce once per workflow through the
 // key agent (a separate agent type whose prompt holds no untrusted text), signs every
-// request it builds — the runner starts nothing else a relay uploads — and accepts only
-// results the runner signed for that very request. A relay hijacked by reviewed content
-// can neither start a job of its own nor pass off an answer as Codex's.
+// request it builds and announces it through the key agent — the runner starts nothing
+// else a relay uploads — and accepts only results the runner signed for that very request.
+// A relay hijacked by reviewed content can neither start a job of its own nor pass off an
+// answer as Codex's.
 const UCX_K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
   0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
   0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
@@ -211,6 +212,29 @@ function ucxKey(call, phase) {
   }
   return ucxKeyPromise
 }
+
+// Each request is announced to the runner, by digest, through the same key agent before a
+// relay uploads it: the runner starts a relayed job only for an announced request, so no
+// party that saw untrusted text — a relay, a reader agent, a Codex job — can start one of
+// its own, even with the key. The runner echoes the digest back; a mis-copied one is retried.
+async function ucxExpect(call, phase, digest, label) {
+  let why = 'the key agent returned no confirmation'
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const raw = await call('ULTRACODEX EXPECT\nDIGEST: ' + digest, {
+      agentType: UCX_KEY_AGENT, label: label + ':expect' + (attempt ? ':retry' : ''), phase, ...(attempt ? { model: 'opus' } : { effort: 'low' }),
+    })
+    const env = ucxEnvelope(raw)
+    if (env && env.ok === true && env.expected === digest) return null
+    why = raw && raw.__ucxRejected !== undefined ? 'the key agent call failed: ' + raw.__ucxRejected
+      : env && env.ok === false ? 'the runner refused: ' + ((env.error && env.error.message) || env.state)
+        : env && env.ok === true ? 'the key agent announced another digest' : 'the key agent returned no confirmation'
+  }
+  return why
+}
+
+// Claude stages that read reviewed code run as this confined agent type (Read, Grep, Glob,
+// read-only git): whatever the code tells them, they can neither sign nor announce a request.
+const UCX_READER = 'ultracodex:codex-reader'
 
 // Only a well-formed run id is ever put into another relay's prompt: a reply is untrusted.
 const UCX_RUN_ID = /^\d{8}T\d{6}Z-[0-9a-f]{6}$/
@@ -422,6 +446,8 @@ function codexNode(task, opts = {}) {
       const digest = ucxSha256Hex(JSON.stringify(header) + '\n' + schemaText + '\n' + text)
       const frame = [JSON.stringify({ ...header, rmac: ucxHmacHex(auth.key, 'ucx-request\n' + digest) }),
         '---ULTRACODEX-SCHEMA---', schemaText, '---ULTRACODEX-TASK---', text].join('\n')
+      const refused = await ucxExpect(call, phase, digest, relayLabel)
+      if (refused) return ucxError('register_failed', 'the request could not be announced to the runner: ' + refused, null, true)
       // No separate marker line: relays tended to drop it. `part` uploads are always encoded.
       const lines = ucxEncode(frame).split('\n').flatMap(ucxWrap)
       const parts = ucxParts(lines)
@@ -541,7 +567,7 @@ const task = extra => `PROBLEM:\n${A.problem}\n\n${extra}\nReturn the approach, 
 phase('Generate')
 // Every requested candidate is accounted for; a failed generation is reported, not dropped.
 const requested = [
-  ...ANGLES.map(a => ({ author: 'claude:' + a.key, run: () => agent(task(a.prompt), { label: 'gen:' + a.key, phase: 'Generate', schema: SOLUTION })
+  ...ANGLES.map(a => ({ author: 'claude:' + a.key, run: () => agent(task(a.prompt), { label: 'gen:' + a.key, phase: 'Generate', schema: SOLUTION, agentType: UCX_READER })
     .then(s => (s ? { ...s, author: 'claude:' + a.key, family: 'claude' } : { __failed: 'the generator returned nothing' }), e => ({ __failed: String((e && e.message) || e) })) })),
   ...(A.codexCandidate === false ? [] : [{ author: 'codex', run: () => codexNode(task('Propose the approach you think is most robust.'),
     { schema: SOLUTION, tier: 'daily', kind: 'ask', cwd: CWD, label: 'gen:codex', phase: 'Generate' })
@@ -557,7 +583,7 @@ if (!candidates.length) return { status: 'incomplete', final: null, winner: null
 phase('Judge')
 const judgePrompt = c => `Score this approach 0..10 for the problem (correctness, risk, cost, time to value). Be strict.\nPROBLEM:\n${A.problem}\nAPPROACH (JSON):\n${JSON.stringify({ approach: c.approach, plan: c.plan, risks: c.risks })}`
 const judgedRaw = (await parallel(candidates.map(c => () => parallel([
-  () => agent(judgePrompt(c), { label: 'judge:claude:' + c.author, phase: 'Judge', schema: SCORE }),
+  () => agent(judgePrompt(c), { label: 'judge:claude:' + c.author, phase: 'Judge', schema: SCORE, agentType: UCX_READER }),
   () => codexNode(judgePrompt(c), { schema: SCORE, tier: 'daily', kind: 'verify', cwd: CWD, label: 'judge:codex:' + c.author, phase: 'Judge' }),
 ]).then(([cl, cx]) => {
   const jurors = [
@@ -583,7 +609,7 @@ const final = await agent(`Write the final approach for the problem. Base it on 
 PROBLEM:\n${A.problem}
 WINNER: ${JSON.stringify(ranked[0].candidate)}
 RUNNERS-UP: ${JSON.stringify(ranked.slice(1).map(j => j.candidate))}
-JURY NOTES: ${JSON.stringify(ranked.map(j => ({ author: j.candidate.author, avg: j.avg, jurors: j.jurors })))}`, { label: 'synthesize', phase: 'Synthesize' })
+JURY NOTES: ${JSON.stringify(ranked.map(j => ({ author: j.candidate.author, avg: j.avg, jurors: j.jurors })))}`, { label: 'synthesize', phase: 'Synthesize', agentType: UCX_READER })
 
 return {
   status: ranked.length === candidates.length && !failedGenerations.length ? 'complete' : 'partial',

@@ -38,8 +38,8 @@ model — return it as `codexUsage`), `isCodexError(x)` and `ucxError(kind, mess
 ```js
 // ── ultracodex helper v0.3.0 ───────────────────────────────────────────────────
 // Generated from tools/src/helper.js in the ultracodex repo — edit the source, then
-// `npm run build`. Needs the ultracodex plugin (its `codex-relay` and `codex-key`
-// agents + runner).
+// `npm run build`. Needs the ultracodex plugin (its `codex-relay`, `codex-key` and
+// `codex-reader` agents + runner).
 //
 // codexNode(task, opts) runs ONE Codex (GPT) job and resolves to:
 //   • the parsed object when a schema/schemaPreset is given — with a non-enumerable
@@ -147,9 +147,10 @@ function isCodexError(x) { return x == null || (typeof x === 'object' && x._code
 // ── authentication: HMAC-SHA256 in plain JS (the Workflow runtime has no crypto) ──
 // The helper fetches the per-machine key and a fresh nonce once per workflow through the
 // key agent (a separate agent type whose prompt holds no untrusted text), signs every
-// request it builds — the runner starts nothing else a relay uploads — and accepts only
-// results the runner signed for that very request. A relay hijacked by reviewed content
-// can neither start a job of its own nor pass off an answer as Codex's.
+// request it builds and announces it through the key agent — the runner starts nothing
+// else a relay uploads — and accepts only results the runner signed for that very request.
+// A relay hijacked by reviewed content can neither start a job of its own nor pass off an
+// answer as Codex's.
 const UCX_K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
   0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
   0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
@@ -236,6 +237,29 @@ function ucxKey(call, phase) {
   }
   return ucxKeyPromise
 }
+
+// Each request is announced to the runner, by digest, through the same key agent before a
+// relay uploads it: the runner starts a relayed job only for an announced request, so no
+// party that saw untrusted text — a relay, a reader agent, a Codex job — can start one of
+// its own, even with the key. The runner echoes the digest back; a mis-copied one is retried.
+async function ucxExpect(call, phase, digest, label) {
+  let why = 'the key agent returned no confirmation'
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const raw = await call('ULTRACODEX EXPECT\nDIGEST: ' + digest, {
+      agentType: UCX_KEY_AGENT, label: label + ':expect' + (attempt ? ':retry' : ''), phase, ...(attempt ? { model: 'opus' } : { effort: 'low' }),
+    })
+    const env = ucxEnvelope(raw)
+    if (env && env.ok === true && env.expected === digest) return null
+    why = raw && raw.__ucxRejected !== undefined ? 'the key agent call failed: ' + raw.__ucxRejected
+      : env && env.ok === false ? 'the runner refused: ' + ((env.error && env.error.message) || env.state)
+        : env && env.ok === true ? 'the key agent announced another digest' : 'the key agent returned no confirmation'
+  }
+  return why
+}
+
+// Claude stages that read reviewed code run as this confined agent type (Read, Grep, Glob,
+// read-only git): whatever the code tells them, they can neither sign nor announce a request.
+const UCX_READER = 'ultracodex:codex-reader'
 
 // Only a well-formed run id is ever put into another relay's prompt: a reply is untrusted.
 const UCX_RUN_ID = /^\d{8}T\d{6}Z-[0-9a-f]{6}$/
@@ -447,6 +471,8 @@ function codexNode(task, opts = {}) {
       const digest = ucxSha256Hex(JSON.stringify(header) + '\n' + schemaText + '\n' + text)
       const frame = [JSON.stringify({ ...header, rmac: ucxHmacHex(auth.key, 'ucx-request\n' + digest) }),
         '---ULTRACODEX-SCHEMA---', schemaText, '---ULTRACODEX-TASK---', text].join('\n')
+      const refused = await ucxExpect(call, phase, digest, relayLabel)
+      if (refused) return ucxError('register_failed', 'the request could not be announced to the runner: ' + refused, null, true)
       // No separate marker line: relays tended to drop it. `part` uploads are always encoded.
       const lines = ucxEncode(frame).split('\n').flatMap(ucxWrap)
       const parts = ucxParts(lines)
@@ -564,12 +590,20 @@ Rules the helper already enforces — do not work around them:
   a missing or garbled page is fetched again (`relay_incomplete_result` if it stays missing).
 - **Signed both ways.** Once per workflow the helper's key agent (`ultracodex:codex-key`, a
   separate agent type whose prompt holds no task text; job relays can never read the key)
-  fetches the per-machine key and a fresh nonce. Every request is signed before any relay
-  sees it — the runner starts nothing else a relay uploads — and every result must carry the
-  runner's MAC over the run, the full request digest (nonce, model, cwd, schema, task) and the
-  payload type (`unauthenticated_result` otherwise). A relay hijacked by reviewed content can
-  neither start a job of its own nor pass off an answer, an older run's answer or a
-  retyped payload as Codex's. A MAC mangled in transcription is fetched once more.
+  fetches the per-machine key and a fresh nonce. Every request is signed, and announced to
+  the runner through the key agent (`expect`, `register_failed` if that fails), before any
+  relay sees it — the runner starts nothing else a relay uploads (`unregistered_request`) —
+  and every result must carry the runner's MAC over the run, the full request digest (nonce,
+  model, cwd, schema, task) and the payload type (`unauthenticated_result` otherwise). A
+  relay hijacked by reviewed content can neither start a job of its own nor pass off an
+  answer, an older run's answer or a retyped payload as Codex's; a party that read the key
+  (a Codex job can) still cannot start one. A MAC mangled in transcription is fetched once
+  more.
+- **Confined readers.** Claude stages that read the reviewed code — finders, triage, jurors,
+  synthesis — pass `agentType: UCX_READER` (`ultracodex:codex-reader`: Read, Grep, Glob and
+  read-only git through the plugin's guard). Content that hijacks such a stage can run
+  nothing and write nothing; do the same in custom scripts, and use a writing agent type only
+  for stages that must write (implementation, fixes) and never for ones that just read.
 - **Nothing vanishes.** A rejected relay call is a `relay_failed` node; the shipped workflows
   reconcile every requested dimension, lens, finding and candidate, and report what failed.
 - **No slot is held by a blocked call.** Codex runs detached under the runner's supervisor, which
@@ -610,7 +644,7 @@ const DIMENSIONS = ['correctness', 'security']
 
 const results = await pipeline(
   DIMENSIONS,
-  d => agent(`Review the branch in ${CWD} for ${d} issues. Concrete findings only.`, { label: 'find:' + d, phase: 'Find', schema: FINDINGS }),
+  d => agent(`Review the branch in ${CWD} for ${d} issues. Concrete findings only.`, { label: 'find:' + d, phase: 'Find', schema: FINDINGS, agentType: UCX_READER }),
   (review, d) => parallel(((review && review.findings) || []).map(f => () =>
     codexNode(`Adversarially verify this finding against the code; refuted=true unless the code confirms it.\n${JSON.stringify(f)}`,
       { schemaPreset: 'verdict', tier: 'daily', kind: 'verify', cwd: CWD, label: 'codex:' + d + ':' + f.id, phase: 'Verify' })
@@ -619,7 +653,7 @@ const results = await pipeline(
 const part = ucxPartition(results.flat())
 if (part.unverified.length) log(`⚠ ${part.unverified.length} findings UNVERIFIED — incomplete`)
 phase('Synthesize')
-const report = await agent(`Report CONFIRMED: ${JSON.stringify(part.confirmed)}\nUNVERIFIED (say so up top): ${JSON.stringify(part.unverified.map(f => f.title))}`, { label: 'synthesize' })
+const report = await agent(`Report CONFIRMED: ${JSON.stringify(part.confirmed)}\nUNVERIFIED (say so up top): ${JSON.stringify(part.unverified.map(f => f.title))}`, { label: 'synthesize', agentType: UCX_READER })
 return { status: part.status, report, confirmed: part.confirmed, unverified: part.unverified }
 ```
 
@@ -650,7 +684,7 @@ for (let round = 0; round < MAX_ROUNDS; round++) {
   let toVerify = [...pending]
   if (!finderDry) {
     const review = await agent(`Find issues in ${CWD}. Stable ids. Skip these already-resolved ids: ${[...resolved].join(', ') || '(none)'}`,
-      { label: 'find:r' + rounds, schema: FINDINGS })
+      { label: 'find:r' + rounds, schema: FINDINGS, agentType: UCX_READER })
     const fresh = ((review && review.findings) || []).filter(f => !resolved.has(f.id) && !pending.some(p => p.id === f.id))
     if (!fresh.length) finderDry = true
     toVerify = [...pending, ...fresh]
@@ -725,8 +759,9 @@ Policy (enforced by the runner; override per node only with a reason):
 `schema_mismatch` · `parse` · `empty_output` · `invalid_request` · `execution` · `spawn` ·
 relay-side `relay_corruption` · `relay_incomplete_upload` · `relay_incomplete_result` ·
 `relay_gave_up` · `relay_failed` · `relay_no_envelope` · `relay_error` · `relay_mismatch` ·
-`no_provenance` · `unauthenticated_result` · `unauthenticated_request` · `key_unavailable` ·
-`nonce_reused` · `result_too_large` · `upload_busy` · `helper_error` · `supervisor_lost`.
+`no_provenance` · `unauthenticated_result` · `unauthenticated_request` · `unregistered_request` ·
+`register_failed` · `key_unavailable` · `key_invalid` · `nonce_reused` · `result_too_large` ·
+`upload_busy` · `helper_error` · `supervisor_lost`.
 
 - Treat every one as **no data**. Exclude errored jurors from averages; never score them 0.
 - Many errors in one run → stop and run `node <runner> preflight` (auth, catalog, CLI).

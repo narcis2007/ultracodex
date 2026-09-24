@@ -279,6 +279,48 @@ test("an owner file that cannot be read this instant does not make a live lease 
   assert.equal(old.taken, true, "a lease nobody renews is debris");
 });
 
+test("creation times stay exact: FILETIMEs are far beyond Number precision", () => {
+  const [row] = parseProcessTable("4242 1 134346764568274730");
+  assert.equal(typeof row.created, "bigint");
+  assert.equal(String(row.created), "134346764568274730", "a Number would read 134346764568274740");
+  assert.notEqual(String(Number("134346764568274730")), "134346764568274730", "(which is why BigInt)");
+  const kids = windowsDescendants(row, parseProcessTable("4243 4242 134346764568274731\n4244 4242 134346764568274729"));
+  assert.deepEqual(kids.map((proc) => proc.pid), [4243], "a one-tick difference still decides parenthood");
+});
+
+test("an existing key that is not valid is never silently replaced", (t) => {
+  const home = withHome(t);
+  fs.writeFileSync(path.join(home, "key"), "");
+  assert.throws(() => ensureKey(), (error) => error.kind === "key_invalid" && /exists but is not valid/.test(error.message));
+  assert.equal(fs.readFileSync(path.join(home, "key"), "utf8"), "", "left for the owner to delete");
+});
+
+test("an old empty slot directory is taken by removing it only while empty — never by moving it", async (t) => {
+  const home = withHome(t, { ULTRACODEX_MAX_CONCURRENT: "1", ULTRACODEX_SLOT_STALE_MS: "0" });
+  const slot = path.join(home, "slots", "slot-0");
+  fs.mkdirSync(slot, { recursive: true });
+  const old = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(slot, old, old);
+  const lease = await acquireSlots(1, "run-D", () => null);
+  assert.deepEqual(fs.readdirSync(slot), ["lease-run-D"]);
+  assert.deepEqual(fs.readdirSync(path.join(home, "slots")).filter((name) => name.includes(".stale-")), [], "nothing was moved aside");
+  lease.release();
+  assert.equal(fs.existsSync(slot), false, "release removes the emptied slot");
+});
+
+test("two generations in one slot: the larger run id backs out, the owner that stays notices", async (t) => {
+  const home = withHome(t, { ULTRACODEX_MAX_CONCURRENT: "1" });
+  const lease = await acquireSlots(1, "run-B", () => null);
+  const slot = path.join(home, "slots", "slot-0");
+  // a rival generation appears beside ours (two takers that judged the same debris)
+  fs.mkdirSync(path.join(slot, "lease-run-A"));
+  fs.writeFileSync(path.join(slot, "lease-run-A", "owner.json"), JSON.stringify({ runId: "run-A", pid: process.pid, beatAt: Date.now() }));
+  lease.touch();
+  assert.equal(lease.lost().length, 1, "a double-booked slot is reported");
+  lease.release();
+  assert.deepEqual(fs.readdirSync(slot), ["lease-run-A"], "release takes only its own generation, and leaves the rival's slot in place");
+});
+
 test("windowsDescendants follows only genuine parent links (created after the parent)", () => {
   const table = parseProcessTable(["", "  100 1 500", "200 100 600", "300 200 700", "400 100 400", "500 400 800", "garbage line", "600 300 650"].join("\r\n"));
   assert.equal(table.length, 6);

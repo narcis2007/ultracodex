@@ -25,7 +25,8 @@ see [CHANGELOG.md](CHANGELOG.md) for what changed.
 | Skill `codex-review` | Standalone adversarial review of a branch / commit / uncommitted change, with triage. |
 | Skill `codex-implement` | Delegate implementation to Codex in a worktree, verify, iterate, review. |
 | Agent `codex-relay` | Internal: the Bash-only relay that runs one Codex job for a Workflow node. |
-| Agent `codex-key` | Internal: fetches the runner key and a nonce once per workflow (no task text in its prompt). |
+| Agent `codex-key` | Internal: fetches the runner key and a nonce once per workflow, and announces each request to the runner (no task text in its prompt). |
+| Agent `codex-reader` | Internal: the confined type for Claude stages that read reviewed code — Read, Grep, Glob and read-only git. |
 | Runner `scripts/codex-node.mjs` | Validates requests, runs `codex exec` under a detached supervisor with deadlines, process-tree teardown, retries, machine-wide slots and a provenance envelope. |
 
 ## Model policy — astra, sol, luna
@@ -74,8 +75,9 @@ node "<plugin dir>/scripts/codex-node.mjs" preflight --pretty
 ## How a Codex node runs
 
 ```
-Workflow script ──agent({agentType:'ultracodex:codex-relay'})──▶ relay (Bash only)
-   codexNode()                                                     │  part … (≤1.6 KB each, hash-checked)
+Workflow script ──agent({agentType:'ultracodex:codex-key'})────▶ key agent: key (once) · expect DIGEST
+   codexNode()   ──agent({agentType:'ultracodex:codex-relay'})──▶ relay (Bash only)
+                                                                   │  part … (≤1.6 KB each, hash-checked)
                                                                    ▼
                                                      codex-node.mjs start → detached supervisor
                                                                    │  spawns codex.exe directly,
@@ -90,8 +92,9 @@ Workflow script ──agent({agentType:'ultracodex:codex-relay'})──▶ relay
 - **Byte-exact transport.** On Windows the Bash tool halves backslashes and breaks commands over
   ~8 KB. Requests are percent-encoded (no quotes, backslashes or control characters), split into
   small parts with per-part hashes, and verified end to end.
-- **Signed both ways.** The helper signs every request it builds (the runner starts nothing a
-  relay composed itself) and accepts only results the runner signed for that exact request —
+- **Signed both ways.** The helper signs every request it builds and announces it to the runner
+  before a relay sees it (the runner starts nothing a relay, a Codex job or anyone else
+  composed) and accepts only results the runner signed for that exact request —
   nonce, model, directory, schema, task and payload type — so a relay that "answers" by itself,
   replays an old run or retargets a job cannot pass for Codex. The key reaches the helper
   through a separate key agent; no job relay ever holds it. Large results travel in verified
@@ -102,9 +105,10 @@ Workflow script ──agent({agentType:'ultracodex:codex-relay'})──▶ relay
   relay that stopped polling) — on Windows exactly the members of the run's Job Object, so an
   orphan whose parent exited is still stopped and nothing of another session ever is. It
   never touches other Codex sessions.
-- **Confined relays.** A plugin hook lets the job relay run exactly the runner's `part`,
-  `wait` and `page` commands, and the key agent exactly `key` (without permission prompts),
-  and denies anything else. Reviewed content that tries to hijack a relay gets nowhere.
+- **Confined agents.** A plugin hook lets the job relay run exactly the runner's `part`,
+  `wait` and `page` commands, the key agent exactly `key` and `expect`, and the Claude stages
+  that read reviewed code only read-only git (without permission prompts), and denies
+  anything else. Reviewed content that tries to hijack a relay or a reader gets nowhere.
   Workflow nodes are read-only and hermetic by construction, and writing tasks are never
   retried automatically.
 

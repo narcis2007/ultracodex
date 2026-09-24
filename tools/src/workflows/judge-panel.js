@@ -32,7 +32,7 @@ const task = extra => `PROBLEM:\n${A.problem}\n\n${extra}\nReturn the approach, 
 phase('Generate')
 // Every requested candidate is accounted for; a failed generation is reported, not dropped.
 const requested = [
-  ...ANGLES.map(a => ({ author: 'claude:' + a.key, run: () => agent(task(a.prompt), { label: 'gen:' + a.key, phase: 'Generate', schema: SOLUTION })
+  ...ANGLES.map(a => ({ author: 'claude:' + a.key, run: () => agent(task(a.prompt), { label: 'gen:' + a.key, phase: 'Generate', schema: SOLUTION, agentType: UCX_READER })
     .then(s => (s ? { ...s, author: 'claude:' + a.key, family: 'claude' } : { __failed: 'the generator returned nothing' }), e => ({ __failed: String((e && e.message) || e) })) })),
   ...(A.codexCandidate === false ? [] : [{ author: 'codex', run: () => codexNode(task('Propose the approach you think is most robust.'),
     { schema: SOLUTION, tier: 'daily', kind: 'ask', cwd: CWD, label: 'gen:codex', phase: 'Generate' })
@@ -48,7 +48,7 @@ if (!candidates.length) return { status: 'incomplete', final: null, winner: null
 phase('Judge')
 const judgePrompt = c => `Score this approach 0..10 for the problem (correctness, risk, cost, time to value). Be strict.\nPROBLEM:\n${A.problem}\nAPPROACH (JSON):\n${JSON.stringify({ approach: c.approach, plan: c.plan, risks: c.risks })}`
 const judgedRaw = (await parallel(candidates.map(c => () => parallel([
-  () => agent(judgePrompt(c), { label: 'judge:claude:' + c.author, phase: 'Judge', schema: SCORE }),
+  () => agent(judgePrompt(c), { label: 'judge:claude:' + c.author, phase: 'Judge', schema: SCORE, agentType: UCX_READER }),
   () => codexNode(judgePrompt(c), { schema: SCORE, tier: 'daily', kind: 'verify', cwd: CWD, label: 'judge:codex:' + c.author, phase: 'Judge' }),
 ]).then(([cl, cx]) => {
   const jurors = [
@@ -74,7 +74,7 @@ const final = await agent(`Write the final approach for the problem. Base it on 
 PROBLEM:\n${A.problem}
 WINNER: ${JSON.stringify(ranked[0].candidate)}
 RUNNERS-UP: ${JSON.stringify(ranked.slice(1).map(j => j.candidate))}
-JURY NOTES: ${JSON.stringify(ranked.map(j => ({ author: j.candidate.author, avg: j.avg, jurors: j.jurors })))}`, { label: 'synthesize', phase: 'Synthesize' })
+JURY NOTES: ${JSON.stringify(ranked.map(j => ({ author: j.candidate.author, avg: j.avg, jurors: j.jurors })))}`, { label: 'synthesize', phase: 'Synthesize', agentType: UCX_READER })
 
 return {
   status: ranked.length === candidates.length && !failedGenerations.length ? 'complete' : 'partial',
