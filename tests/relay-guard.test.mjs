@@ -123,7 +123,7 @@ test("a reader's git cannot be turned into a program runner (each case measured 
   assert.equal(judge("git log -- vendor/evil"), null, "a subdirectory named as a path");
   assert.notEqual(judge(`git -C "${slash(bare)}" status`), null, "-C into an embedded bare repository (its fsmonitor would run)");
   assert.notEqual(judge("git -C vendor/evil status"), null, "relative -C into it");
-  assert.notEqual(judge("git -C vendor log"), null, "-C onto a directory that is not a root");
+  assert.equal(judge("git -C vendor log"), null, "-C into a plain directory inside the repository: git finds its .git above");
   assert.notEqual(judge("git status", path.join(bare, "refs")), null, "no -C, from inside the bare repository");
   for (const bad of [
     "git grep -nOtouch x", // bundled: -n -O<cmd> runs <cmd>
@@ -148,6 +148,25 @@ test("a reader's git cannot be turned into a program runner (each case measured 
   }
   assert.deepEqual(shellWords(`git log --format="%h %s" -- 'a b'`), ["git", "log", "--format=%h %s", "--", "a b"]);
   assert.deepEqual(shellWords("a\u00a0b c"), ["a\u00a0b", "c"], "a no-break space is part of a word, as in bash");
+});
+
+test("a committed link cannot walk a reader's git into an embedded bare repository", (t) => {
+  const READER = "ultracodex:codex-reader";
+  const tree = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-link-"));
+  t.after(() => fs.rmSync(tree, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(tree, ".git"));
+  const bare = path.join(tree, "payload");
+  for (const dir of ["objects", "refs"]) fs.mkdirSync(path.join(bare, dir), { recursive: true });
+  fs.writeFileSync(path.join(bare, "HEAD"), "ref: refs/heads/main\n");
+  fs.mkdirSync(path.join(tree, "src", "pkg"), { recursive: true });
+  // what a hostile repository commits on POSIX: hop -> payload/refs (a junction here on Windows)
+  fs.symlinkSync(path.join(bare, "refs"), path.join(tree, "hop"), process.platform === "win32" ? "junction" : "dir");
+  const judge = (command, cwd = tree) => checkAgentCommand(READER, command, PLUGIN_ROOT, { cwd });
+  assert.notEqual(judge("git -C hop/.. status"), null, "the kernel follows hop before .., so .. is refused outright");
+  assert.notEqual(judge("git -C hop status"), null, "walked up physically, hop lands inside the bare repository");
+  assert.notEqual(judge("git status", path.join(tree, "hop")), null, "no -C, working directory behind the link");
+  assert.equal(judge("git -C src/pkg log --oneline -3"), null, "a directory inside a real repository is fine");
+  assert.equal(judge(`git -C "${tree.replace(/\\/g, "/")}" status`), null, "the root itself");
 });
 
 test("the hook judges by agent type — never by what an agent asks for", () => {

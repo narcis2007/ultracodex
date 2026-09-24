@@ -137,6 +137,33 @@ review):
 - Tests: 112 offline tests, including replayed frames, unannounced frames, exact FILETIMEs,
   double-booked slots, the reader allowlist and each measured git bypass.
 
+**Round 6 — after the astra@max final gate of round 5** (code + security lenses: all seven
+round-4 findings confirmed fixed; six new findings, one high):
+- Reader: `git -C hop/..` passed the check on POSIX, where the kernel follows a committed
+  symlink `hop` before `..` (a text normalisation does not). `..` is now refused in `-C`, and
+  the guard mirrors git's upward discovery both as written and with links resolved — git
+  walks up the physical path, measured on Windows through a junction into an embedded bare
+  repository's `refs/`, where it ran that repository's `core.fsmonitor`. This also lets `-C`
+  name a directory inside a repository (monorepo packages), not only its root.
+- Slots are **born whole**: a taker prepares `.claim-<run>/lease-<run>/owner.json` and renames
+  it to `slot-N`, which fails while `slot-N` exists. A slot someone owns is never empty, so an
+  empty directory is never a live lease, and two takers can no longer both own a freed slot
+  (the tie-break by run id, which a late smaller id defeated, is gone). A generation given
+  back after a mistaken reclaim is reborn the same way, only into a slot nobody took since.
+- Stale pre-0.3 debris (a corrupt `owner.json`, leftover temp files) is deleted file by file
+  instead of blocking its slot forever; unknown content is left alone. `gc` frees slots only
+  through the same fenced path (it used to delete whole slot directories after a check).
+- Job Object teardown sweeps until a snapshot holds nothing but the supervisor — a member
+  that started a child and exited before it could be opened no longer ends the sweep early.
+- Fallback teardown: the kill script names every process it targets by PID and creation
+  time, including descendants found during its rounds, and all of them are reconciled
+  against the final process table — a late survivor is reported, never dropped.
+- A duplicate upload that loses a race with the winner of the same request now joins the
+  winner's run (it looks for the nonce record again, `ULTRACODEX_NONCE_WAIT_MS`) instead of
+  failing as `unregistered_request` or `execution`.
+- Tests: 117 offline tests, including a two-process slot race with a late claim, a junction
+  into an embedded bare repository, legacy slot debris and a late-winner upload race.
+
 ## 0.2.1 — 2026-07-10 (fork)
 
 Correctness fixes from a cross-model review; runtime self-test.

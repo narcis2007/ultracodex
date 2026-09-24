@@ -108,7 +108,9 @@ Workflow script ──agent({agentType:'ultracodex:codex-key'})────▶ k
 - **Confined agents.** A plugin hook lets the job relay run exactly the runner's `part`,
   `wait` and `page` commands, the key agent exactly `key` and `expect`, and the Claude stages
   that read reviewed code only read-only git (without permission prompts), and denies
-  anything else. Reviewed content that tries to hijack a relay or a reader gets nowhere.
+  anything else. Reviewed content that hijacks a relay or a reader can neither run a program
+  nor sign or announce a request (the reader's git is checked word by word against the ways,
+  measured on git 2.55, to make "read-only" git run one).
   Workflow nodes are read-only and hermetic by construction, and writing tasks are never
   retried automatically.
 

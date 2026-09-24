@@ -308,17 +308,73 @@ test("an old empty slot directory is taken by removing it only while empty — n
   assert.equal(fs.existsSync(slot), false, "release removes the emptied slot");
 });
 
-test("two generations in one slot: the larger run id backs out, the owner that stays notices", async (t) => {
+test("a double-booked slot is reported as lost, and release takes only its own generation", async (t) => {
   const home = withHome(t, { ULTRACODEX_MAX_CONCURRENT: "1" });
   const lease = await acquireSlots(1, "run-B", () => null);
   const slot = path.join(home, "slots", "slot-0");
-  // a rival generation appears beside ours (two takers that judged the same debris)
+  // a second generation beside ours (only a stalled owner given back its lease can do this)
   fs.mkdirSync(path.join(slot, "lease-run-A"));
   fs.writeFileSync(path.join(slot, "lease-run-A", "owner.json"), JSON.stringify({ runId: "run-A", pid: process.pid, beatAt: Date.now() }));
   lease.touch();
   assert.equal(lease.lost().length, 1, "a double-booked slot is reported");
   lease.release();
-  assert.deepEqual(fs.readdirSync(slot), ["lease-run-A"], "release takes only its own generation, and leaves the rival's slot in place");
+  assert.deepEqual(fs.readdirSync(slot), ["lease-run-A"], "release takes only its own generation, and leaves the other one's slot in place");
+});
+
+test("a claim never lands in an existing slot, whatever the taker's run id", async (t) => {
+  const home = withHome(t, { ULTRACODEX_MAX_CONCURRENT: "1" });
+  const b = await acquireSlots(1, "run-B", () => null);
+  let polls = 0;
+  const a = await acquireSlots(1, "run-A", () => (++polls > 3 ? "cancelled" : null));
+  assert.equal(a.stopped, "cancelled", "the smaller run id waits like any other taker");
+  assert.deepEqual(fs.readdirSync(path.join(home, "slots", "slot-0")), ["lease-run-B"]);
+  assert.deepEqual(fs.readdirSync(path.join(home, "slots")).filter((name) => name.startsWith(".claim-")), [], "a claim that did not land is removed");
+  b.release();
+});
+
+test("two takers of a freed slot never both own it — even when one lands its claim late", async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-race-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  // an old empty remnant that both takers judge free
+  const slot = path.join(home, "slots", "slot-0");
+  fs.mkdirSync(slot, { recursive: true });
+  const old = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(slot, old, old);
+  const env = { ...process.env, ULTRACODEX_HOME: home, ULTRACODEX_MAX_CONCURRENT: "1", ULTRACODEX_SLOT_POLL_MS: "20" };
+  const taker = (runId, holdMs, extra = {}) =>
+    new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [path.join(TESTS_DIR, "fixtures", "slot-race.mjs"), runId, String(holdMs)], { env: { ...env, ...extra } });
+      let out = "";
+      child.stdout.on("data", (chunk) => (out += chunk));
+      child.on("error", reject);
+      child.on("exit", (code) => (code === 0 ? resolve(JSON.parse(out.trim().split("\n").at(-1))) : reject(new Error(`${runId} exited ${code}`))));
+    });
+  // A (the smaller id) removes the remnant, then lands its claim 1.5 s later; B arrives in between
+  const late = taker("run-A", 300, { ULTRACODEX_SLOT_CLAIM_DELAY_MS: "1500" });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const [a, b] = await Promise.all([late, taker("run-B", 600)]);
+  assert.deepEqual(a.overlaps, [], "A never held the slot while B did");
+  assert.deepEqual(b.overlaps, [], "B never held the slot while A did");
+});
+
+test("stale pre-0.3 debris that is not empty never blocks a slot; unknown content is left alone", async (t) => {
+  const home = withHome(t, { ULTRACODEX_MAX_CONCURRENT: "1" });
+  const slot = path.join(home, "slots", "slot-0");
+  fs.mkdirSync(slot, { recursive: true });
+  fs.writeFileSync(path.join(slot, "owner.json"), "{"); // corrupt
+  fs.writeFileSync(path.join(slot, "owner.json.tmp-4242-1"), "");
+  const old = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(slot, old, old);
+  const lease = await acquireSlots(1, "run-E", () => null);
+  assert.deepEqual(fs.readdirSync(slot), ["lease-run-E"], "the legacy files went, the slot was taken whole");
+  lease.release();
+  fs.mkdirSync(slot);
+  fs.writeFileSync(path.join(slot, "notes.txt"), "not ours");
+  fs.utimesSync(slot, old, old);
+  let polls = 0;
+  const blocked = await acquireSlots(1, "run-F", () => (++polls > 3 ? "cancelled" : null));
+  assert.equal(blocked.stopped, "cancelled");
+  assert.deepEqual(fs.readdirSync(slot), ["notes.txt"], "nothing unknown is ever deleted");
 });
 
 test("windowsDescendants follows only genuine parent links (created after the parent)", () => {

@@ -288,6 +288,24 @@ test("a signed request uploaded twice starts one run: the second upload joins th
   assert.equal(fs.readdirSync(path.join(home, "runs")).length, 1, "no second run");
 });
 
+test("a duplicate upload that loses the race joins the winner's run instead of being refused", async (t) => {
+  const home = makeHome(t);
+  const env = fastEnv(home, { ULTRACODEX_NONCE_WAIT_MS: "5000" });
+  const task = "raced";
+  const signed = signedHeader(home, { tier: "light", kind: "verify", label: "race" }, null, task, 9);
+  // The winner has consumed the announcement and is about to publish its nonce record:
+  // the loser finds neither at first — then the record appears while it looks again.
+  const winner = "20260924T043000Z-abc123";
+  const loser = runCli(["start", "--framed", "-"], { env, input: frame(signed, null, task) });
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  fs.mkdirSync(path.join(home, "nonces"), { recursive: true });
+  fs.writeFileSync(path.join(home, "nonces", signed.nonce), winner);
+  const joined = await loser;
+  assert.equal(joined.code, 3, joined.stdout);
+  assert.equal(joined.json.runId, winner, "joined the winner's run");
+  assert.equal(fs.existsSync(path.join(home, "runs")) ? fs.readdirSync(path.join(home, "runs")).length : 0, 0, "and started none of its own");
+});
+
 test("an encoded frame uploaded in parts (out of order) starts once the last part lands", async (t) => {
   const home = makeHome(t);
   const env = fastEnv(home);

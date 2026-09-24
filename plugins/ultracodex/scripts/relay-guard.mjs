@@ -146,21 +146,38 @@ export function checkReaderCommand(command, { env = process.env, cwd = process.c
   // Which repository git will use. A directory inside the reviewed tree can be an embedded
   // bare repository (HEAD, objects/, refs/, config are ordinary files to commit), and git run
   // there loads that config — whose core.fsmonitor is a program (measured). A tree checked out
-  // by git never contains a `.git` of its own, so a `.git` names a real repository root.
+  // by git never contains a `.git` of its own, so a `.git` marks a real repository.
+  let start = cwd;
   if (at === 3) {
-    if (!fs.existsSync(path.join(path.resolve(cwd, words[2]), ".git"))) {
-      return "-C must name a repository's root directory (the one that contains .git); name subdirectories as paths after --";
-    }
-  } else if (discoversBareDirectory(cwd)) {
-    return "this working directory is inside something git would take for a bare repository; use git -C <repository root>";
+    // No `..`: path.resolve drops `hop/..` as text, but the kernel follows `hop` first — a
+    // committed symlink would put git somewhere this check never looked.
+    if (words[2].split("/").includes("..")) return "-C may not contain .. (name the directory itself)";
+    start = path.resolve(cwd, words[2]);
+  }
+  if (discoversBareDirectory(start)) {
+    return "git would start inside something it takes for a bare repository here, not in a real repository; use git -C <repository root>";
   }
   return null;
 }
 
-// git's discovery, upwards from `start`: at each level `<dir>/.git` first, then `<dir>` itself
-// as a bare repository. True when a bare-looking directory would be found before a real root.
+// git's discovery, upwards from its working directory: at each level `<dir>/.git` first,
+// then `<dir>` itself as a bare repository. git walks up the physical path, links resolved
+// (measured on Windows too: `git -C <junction to a bare repository's refs/>` picks that
+// repository); both it and the path as written are walked, and a bare-looking directory
+// found before a `.git` on either walk refuses the command.
 function discoversBareDirectory(start) {
-  let dir = path.resolve(start);
+  const logical = path.resolve(start);
+  let physical = logical;
+  try {
+    physical = fs.realpathSync.native(logical);
+  } catch {
+    return false; // no such directory: git refuses to start there
+  }
+  return walkFindsBare(logical) || (physical !== logical && walkFindsBare(physical));
+}
+
+function walkFindsBare(start) {
+  let dir = start;
   for (;;) {
     if (fs.existsSync(path.join(dir, ".git"))) return false;
     if (["HEAD", "objects", "refs"].every((entry) => fs.existsSync(path.join(dir, entry)))) return true;

@@ -78,6 +78,8 @@ export const TIMING = Object.freeze({
   minOrphanSec: envInt("ULTRACODEX_MIN_ORPHAN_SEC", 60),
   minTimeoutSec: envInt("ULTRACODEX_MIN_TIMEOUT_SEC", 60),
   treeSnapshotMs: envInt("ULTRACODEX_TREE_SNAPSHOT_MS", 20_000), // fallback mode only (no Job Object)
+  nonceWaitMs: envInt("ULTRACODEX_NONCE_WAIT_MS", 1000), // how long a duplicate upload looks for the winner's run
+  slotClaimDelayMs: envInt("ULTRACODEX_SLOT_CLAIM_DELAY_MS", 0), // tests: widens the window between judging a slot free and landing the claim
 });
 
 // ─── small utilities ────────────────────────────────────────────────────────
@@ -1485,10 +1487,14 @@ export function maxConcurrent(env = process.env) {
   return Number.isInteger(value) && value >= 0 ? value : 4;
 }
 
-// Layout: slots/slot-N/ is the lease (taken with an atomic mkdir), and inside it
-// lease-<runId>/owner.json is its owner's generation. An owner only ever writes inside
-// its own generation directory, so after its lease was reclaimed its renewals fail with
-// ENOENT instead of overwriting the new owner — the displacement is noticed, never hidden.
+// Layout: slots/slot-N/ is the lease, and lease-<runId>/owner.json inside it is its owner's
+// generation. A slot directory is born whole: the taker prepares
+// slots/.claim-<runId>-<rand>/lease-<runId>/owner.json and renames that directory to
+// slot-N, which fails while slot-N exists — so exactly one taker gets a free slot, and a
+// slot someone owns is never empty, the only state in which it is ever removed (rmdir) or,
+// on POSIX, replaced by a rename. An owner only ever writes inside its own generation
+// directory, so after its lease was reclaimed its renewals fail with ENOENT instead of
+// overwriting the new owner — the displacement is noticed, never hidden.
 function leaseDir(dir, runId) {
   return path.join(dir, `lease-${runId}`);
 }
@@ -1548,89 +1554,109 @@ function ownerGone(dir, owner, watch) {
 
 const sameOwner = (a, b) => Boolean(a && b) && a.runId === b.runId && a.beatAt === b.beatAt;
 
-// Reclaiming moves out only the generation it judged gone (only one reclaimer can win
-// that rename), then checks it moved that very owner — if the owner renewed meanwhile, it
-// is put straight back where nobody else can have recreated it (an owner never recreates
-// its generation directory, and the slot directory stays in place). The slot directory
-// itself is only moved when it holds no generation (debris) or a pre-0.3 owner file.
 function tryTakeSlot(index, runId, watch) {
   const dir = path.join(slotsDir(), `slot-${index}`);
-  try {
-    fs.mkdirSync(dir);
-  } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-    const judged = slotOwner(dir);
-    if (!ownerGone(dir, judged, watch)) return null;
-    if (judged?.leasePath) {
-      const generation = judged.leasePath;
-      const tombstone = `${dir}.stale-${randomBytes(4).toString("hex")}`;
-      try {
-        renameRetry(generation, tombstone);
-      } catch {
-        return null; // another reclaimer won, or the owner released it
-      }
-      const moved = readJsonSafe(path.join(tombstone, "owner.json"));
-      const same = judged.partial ? moved === null : sameOwner(moved, judged);
-      if (!same) {
-        try {
-          renameRetry(tombstone, generation); // it renewed after all: give it back
-        } catch {
-          // its owner notices through lost() on its next renewal
-        }
-        return null;
-      }
-      fs.rmSync(tombstone, { recursive: true, force: true });
-      watch.suspects.delete(dir);
-      // the slot directory is now empty and fresh: no other taker judges it gone
-    } else if (judged) {
-      // A pre-0.3 owner file directly in the slot: only that file moves, never the directory.
-      const legacy = path.join(dir, "owner.json");
-      const tombstone = `${dir}.stale-${randomBytes(4).toString("hex")}`;
-      try {
-        renameRetry(legacy, tombstone);
-      } catch {
-        return null;
-      }
-      if (!sameOwner(readJsonSafe(tombstone), judged)) {
-        try {
-          renameRetry(tombstone, legacy);
-        } catch {
-          // an older runner's owner rewrites its file on its next renewal
-        }
-        return null;
-      }
-      fs.rmSync(tombstone, { force: true });
-      watch.suspects.delete(dir);
-    } else {
-      // Empty debris: removed only while still empty (rmdir fails on a directory another
-      // taker has just filled), then taken fresh — the shared directory is never moved.
-      try {
-        fs.rmdirSync(dir);
-      } catch {
-        return null;
-      }
-      watch.suspects.delete(dir);
-      try {
-        fs.mkdirSync(dir);
-      } catch {
-        return null;
-      }
+  if (fs.existsSync(dir) && !freeStaleSlot(dir, watch)) return null;
+  return claimSlot(dir, runId) ? dir : null;
+}
+
+// Renames directory `from` to `to` only while `to` does not exist: true when it did, false
+// when `to` exists. Windows scanners briefly lock fresh directories (EPERM on ~1 % of
+// renames), which is retried while `to` is still absent.
+function renameIntoPlace(from, to) {
+  const until = Date.now() + 1500;
+  for (;;) {
+    if (fs.existsSync(to)) return false;
+    try {
+      fs.renameSync(from, to);
+      return true;
+    } catch (error) {
+      if (fs.existsSync(to)) return false;
+      if (!["EPERM", "EACCES", "EBUSY"].includes(error.code) || Date.now() > until) throw error;
+      sleepSync(20);
     }
   }
+}
+
+// A slot is taken whole: its generation is written before the slot directory exists.
+function claimSlot(dir, runId) {
+  const claim = path.join(path.dirname(dir), `.claim-${runId}-${randomBytes(3).toString("hex")}`);
   try {
-    fs.mkdirSync(leaseDir(dir, runId));
+    fs.mkdirSync(leaseDir(claim, runId), { recursive: true });
+    writeJsonAtomic(path.join(leaseDir(claim, runId), "owner.json"), { runId, pid: process.pid, beatAt: Date.now() });
+    if (TIMING.slotClaimDelayMs) sleepSync(TIMING.slotClaimDelayMs);
+    if (renameIntoPlace(claim, dir)) return true;
   } catch {
-    return null;
+    // a lock that outlasted the retries, or a full disk: not taken this poll
   }
-  // Two takers that judged the same debris can both end up here: one generation wins
-  // (the smaller run id), the other backs out before it runs anything.
-  const rival = generationsIn(dir).find((name) => name !== `lease-${runId}` && name < `lease-${runId}`);
-  if (rival) {
-    fs.rmSync(leaseDir(dir, runId), { recursive: true, force: true });
-    return null;
+  fs.rmSync(claim, { recursive: true, force: true });
+  return false;
+}
+
+// Frees slot `dir` when its owner is provably gone (see ownerGone). It moves out only the
+// one generation it judged gone — and gives it back, reborn whole, if that owner renewed
+// after all — deletes only the files of the pre-0.3 layout, and removes the slot directory
+// only while it is empty, which a slot someone owns never is. True when the slot is gone.
+function freeStaleSlot(dir, watch) {
+  const judged = slotOwner(dir);
+  if (!ownerGone(dir, judged, watch)) return false;
+  watch.suspects.delete(dir);
+  if (judged?.leasePath) {
+    if (!evictGeneration(dir, judged)) return false;
+  } else {
+    removeLegacyFiles(dir);
   }
-  writeJsonAtomic(path.join(leaseDir(dir, runId), "owner.json"), { runId, pid: process.pid, beatAt: Date.now() });
-  return dir;
+  try {
+    fs.rmdirSync(dir);
+  } catch {
+    // not empty (someone else's by now) or already gone
+  }
+  return !fs.existsSync(dir);
+}
+
+function evictGeneration(dir, judged) {
+  const tomb = path.join(path.dirname(dir), `.stale-${randomBytes(4).toString("hex")}`);
+  const moved = path.join(tomb, path.basename(judged.leasePath));
+  try {
+    fs.mkdirSync(tomb);
+    renameRetry(judged.leasePath, moved); // only one reclaimer can win this rename
+  } catch {
+    fs.rmSync(tomb, { recursive: true, force: true });
+    return false; // another reclaimer won, or the owner released it
+  }
+  const now = readJsonSafe(path.join(moved, "owner.json"));
+  if (judged.partial ? now === null : sameOwner(now, judged)) {
+    fs.rmSync(tomb, { recursive: true, force: true });
+    return true;
+  }
+  // It renewed after all: give it back, reborn whole, but only into a slot nobody has taken
+  // since — the slot is empty now, so rmdir succeeds only while it still is.
+  try {
+    try {
+      fs.rmdirSync(dir);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    if (renameIntoPlace(tomb, dir)) return false;
+  } catch {
+    // someone took the slot meanwhile
+  }
+  fs.rmSync(tomb, { recursive: true, force: true }); // its owner notices through lost() on its next renewal
+  return false;
+}
+
+// The pre-0.3 layout kept owner.json (and its temp files) directly in the slot directory.
+// Only those files are deleted: an unknown entry keeps the slot directory, never lost data.
+function removeLegacyFiles(dir) {
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (name === "owner.json" || name.startsWith("owner.json.tmp-")) fs.rmSync(path.join(dir, name), { force: true });
+  }
 }
 
 function generationsIn(dir) {
@@ -1644,8 +1670,8 @@ function generationsIn(dir) {
 // Release touches only this run's own generation: it moves lease-<runId> out of the slot
 // (ENOENT: the slot was reclaimed, so nothing of ours is left in it) and then removes the
 // slot directory only if it is empty — an atomic rmdir that fails when a new owner is in
-// it. An empty slot directory is fresh (its mtime just moved), so nobody reclaims it in
-// between, and a taker's mkdir fails until it is gone. No other owner's lease is ever moved.
+// it. A taker's claim cannot land while the emptied directory exists (on POSIX it may
+// replace it — then it is simply the next owner's). No other owner's lease is ever moved.
 function releaseSlot(dir, runId) {
   const moved = `${dir}.released-${runId}-${randomBytes(3).toString("hex")}`;
   try {
@@ -1854,21 +1880,25 @@ public static class UcxJob {
   }
   // Every member but keep, each terminated through a handle checked to be in this job
   // after it was opened: a PID can be reused, a job membership cannot be faked. Repeated
-  // until no member is left, since a member can start a child while the sweep runs.
+  // until a snapshot holds nothing but keep: a member can start a child and exit before
+  // it is opened, so a round that opened nothing does not mean the job is empty.
   public static string KillAllBut(IntPtr job, int keep) {
     int killed = 0;
     for (int round = 0; round < 8; round++) {
       int[] pids = Members(job);
       if (pids == null) return "error " + Marshal.GetLastWin32Error();
+      bool others = false;
       List<IntPtr> held = new List<IntPtr>();
       foreach (int pid in pids) {
         if (pid == keep) continue;
+        others = true;
         IntPtr h = OpenProcess(0x00100000 | 0x1000 | 0x0001, false, pid);
         if (h == IntPtr.Zero) continue;
         bool member;
         if (IsProcessInJob(h, job, out member) && member) { if (TerminateProcess(h, 1)) killed++; held.Add(h); } else CloseHandle(h);
       }
-      if (held.Count == 0) break;
+      if (!others) break;
+      if (held.Count == 0) { System.Threading.Thread.Sleep(50); continue; }
       foreach (IntPtr h in held) { WaitForSingleObject(h, 3000); CloseHandle(h); }
     }
     int[] after = Members(job);
@@ -1998,7 +2028,7 @@ $held = @{}
 for ($round = 0; $round -lt 5 -and $want.Count -gt 0; $round++) {
   $pinned = @{}
   foreach ($procId in @($want.Keys)) {
-    try { $p = [System.Diagnostics.Process]::GetProcessById([int]$procId); $null = $p.Handle; $pinned[[int]$procId] = $p } catch { Say ('unpinned ' + $procId) }
+    try { $p = [System.Diagnostics.Process]::GetProcessById([int]$procId); $null = $p.Handle; $pinned[[int]$procId] = $p } catch { Say ('unpinned ' + $procId + ' ' + $want[$procId]) }
   }
   $rows = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate | Where-Object { $_.CreationDate })
   $created = @{}
@@ -2017,15 +2047,23 @@ for ($round = 0; $round -lt 5 -and $want.Count -gt 0; $round++) {
     if ($parents.ContainsKey($pp) -and -not $held.ContainsKey($procId) -and -not $parents.ContainsKey($procId) -and $created[$procId] -ge $parents[$pp]) { $want[$procId] = $created[$procId] }
   }
 }
-foreach ($procId in @($held.Keys)) { if ($held[$procId].WaitForExit(3000)) { Say ('killed ' + $procId) } else { Say ('survived ' + $procId) } }
+foreach ($procId in @($held.Keys)) { if ($held[$procId].WaitForExit(3000)) { Say ('killed ' + $procId + ' ' + $parents[$procId]) } else { Say ('survived ' + $procId + ' ' + $parents[$procId]) } }
 Say 'done'`;
 }
 
+// Every line names an identity (PID + creation time), including the descendants the
+// script found during its rounds, so the caller can check each against the final table.
 function runPinnedKill(seeds, pinnedParents) {
   if (!seeds.length && !pinnedParents.length) return { killed: [], survivors: [], ok: true };
   const out = runPowerShell(pinnedKillScript(seeds, pinnedParents));
   const lines = String(out.stdout ?? "").split(/\r?\n/).map((line) => line.trim());
-  const pick = (word) => lines.filter((line) => line.startsWith(`${word} `)).map((line) => Number(line.slice(word.length + 1)));
+  const pick = (word) =>
+    lines
+      .filter((line) => line.startsWith(`${word} `))
+      .map((line) => {
+        const [pid, created] = line.slice(word.length + 1).split(" ");
+        return [Number(pid), /^\d+$/.test(created ?? "") ? BigInt(created) : null];
+      });
   return { killed: pick("killed"), survivors: [...pick("survived"), ...pick("unpinned")], ok: lines.includes("done") };
 }
 
@@ -2052,20 +2090,24 @@ function windowsPinnedStop(child, tracked, { killRoot }) {
   const report = runPinnedKill([...seeds], rootPinned ? [[root.pid, root.created]] : []);
   const after = windowsProcessTable();
   // Reconciled against the final table, whatever the script said: every targeted identity
-  // still present is a survivor — a skipped or failed kill is never reported as clean.
+  // still present is a survivor — the seeds, the root, and the descendants the script found
+  // during its rounds — so a skipped or failed kill is never reported as clean.
   const aimed = new Map(seeds);
   if (rootPinned) aimed.set(root.pid, root.created);
+  for (const [pid, created] of [...report.killed, ...report.survivors]) if (created !== null) aimed.set(pid, created);
+  // a reported survivor the script could not name by identity stays one (and unverified)
+  const unnamed = report.survivors.filter(([, created]) => created === null).map(([pid]) => pid);
   const survivors = after
-    ? [...aimed].filter(([pid, created]) => after.some((proc) => proc.pid === pid && proc.created === created)).map(([pid]) => pid)
-    : [...report.survivors];
+    ? [...new Set([...[...aimed].filter(([pid, created]) => after.some((proc) => proc.pid === pid && proc.created === created)).map(([pid]) => pid), ...unnamed])]
+    : report.survivors.map(([pid]) => pid);
   // Children of tracked processes that died before the teardown: probably ours, but their
   // parent's PID is no longer pinned, so nothing proves it — reported, never killed.
   const dead = [...tracked].filter(([pid, created]) => !(after ?? table).some((proc) => proc.pid === pid && proc.created === created));
-  const handled = new Set([...seeds.keys(), ...report.killed, child.pid]);
+  const handled = new Set([...aimed.keys(), child.pid]);
   const possible = (after ?? []).filter((proc) => !handled.has(proc.pid) && dead.some(([pid, created]) => proc.ppid === pid && proc.created >= created));
-  const result = { targeted: report.killed.length + (rootPinned ? 1 : 0), survivors, method: "pinned" };
+  const result = { targeted: report.killed.length + report.survivors.length + (rootPinned ? 1 : 0), survivors, method: "pinned" };
   if (possible.length) result.possibleLeftovers = possible.map((proc) => proc.pid);
-  if (possible.length || !after || !report.ok) result.unverified = true;
+  if (possible.length || !after || !report.ok || unnamed.length) result.unverified = true;
   return result;
 }
 
@@ -2859,6 +2901,17 @@ function nonceMarker(nonce) {
   return path.join(ucxHome(), "nonces", nonce);
 }
 
+// An announcement younger than EXPECT_TTL_MS. One that vanishes while it is looked at —
+// consumed by a racing upload of the same request — counts as none (never an error).
+function announcementValid(file) {
+  try {
+    const stat = fs.statSync(file);
+    return stat.isFile() && Date.now() - stat.mtimeMs <= EXPECT_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+
 function existingRunForNonce(nonce, { waitMs = 0 } = {}) {
   const marker = nonceMarker(nonce);
   const until = Date.now() + waitMs;
@@ -2920,7 +2973,14 @@ async function startFromRaw(raw, options, { requestDigest = null } = {}) {
     // Otherwise the request must have been announced through the helper's key agent: a frame
     // anyone else composed — even one signed with a key read off the disk — starts nothing.
     registration = expectedPath(requestDigest);
-    if (!isFileSync(registration) || Date.now() - fs.statSync(registration).mtimeMs > EXPECT_TTL_MS) {
+    if (!announcementValid(registration)) {
+      // A racing upload of the same request may have started it and consumed the
+      // announcement since the look above: join that run rather than refuse.
+      const late = existingRunForNonce(request.nonce, { waitMs: TIMING.nonceWaitMs });
+      if (late) {
+        print(startedLine(late, request, readJsonSafe(runPaths(late).state)?.state), options.pretty);
+        return 3;
+      }
       print(rejection("unregistered_request", "the Workflow helper did not announce this request to the runner"), options.pretty);
       return 1;
     }
@@ -3142,12 +3202,13 @@ export function cmdGc({ olderThanDays = 7, pretty = false } = {}) {
   try {
     for (const name of fs.readdirSync(slotsDir())) {
       const dir = path.join(slotsDir(), name);
-      const owner = slotOwner(dir);
-      // gc removes only provably dead leases: tombstones/debris, an owner whose PID is gone,
-      // or a lease generation nobody has renewed for a stale window.
-      const debris = name.includes(".stale-") || name.includes(".released-") || name.includes(".tmp-");
-      const dead = debris || !owner ? debrisIsOld(dir) : owner.partial ? debrisIsOld(owner.leasePath) : Boolean(owner.pid) && !pidAlive(owner.pid);
-      if (dead) {
+      if (/^slot-\d+$/.test(name)) {
+        // A slot goes only through the fenced path takers use, judged at first sight: only
+        // an owner whose PID is gone, or old debris — never a whole-directory delete that
+        // could take a lease someone claimed after the judgment.
+        if (freeStaleSlot(dir, { suspects: new Map(), poll: 1 })) slots.push(name);
+      } else if (debrisIsOld(dir)) {
+        // claims that never landed, tombstones, released generations (all private to one taker)
         fs.rmSync(dir, { recursive: true, force: true });
         slots.push(name);
       }

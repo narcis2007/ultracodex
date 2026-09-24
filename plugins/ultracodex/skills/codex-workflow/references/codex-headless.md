@@ -108,7 +108,7 @@ helper chose, never what the model asks for — and leaves the main conversation
 | --- | --- | --- |
 | `ultracodex:codex-relay` — job relay | `node "<plugin>/scripts/codex-node.mjs" part (new\|ucx-…) K N HASH <<'UCX_P…' … UCX_P…` with a quote- and backslash-free body, `… wait <runId>`, `… page <runId> <k>` | denied, other tools too |
 | `ultracodex:codex-key` — key agent | `… key`, `… expect <64 hex>` | denied, other tools too |
-| `ultracodex:codex-reader` — Claude stages that read reviewed code | one read-only git command: `git [-C <repository root>] diff\|log\|show\|status\|blame\|ls-files\|ls-tree\|grep\|rev-parse\|merge-base\|cat-file\|describe\|shortlog\|diff-tree\|rev-list\|name-rev …` — no shell metacharacters or unquoted globs, no global options, no `--output`/`--ext-diff`/`--no-index`/`--contents`/`--open-files-in-pager`/`--exec` nor any abbreviation of them, no `-O` even bundled, no network paths, nothing under the ultracodex home; `-C` only onto a directory that contains `.git`, and without `-C` only where git would not pick up a bare-looking directory first (Read, Grep, Glob stay available) | denied |
+| `ultracodex:codex-reader` — Claude stages that read reviewed code | one read-only git command: `git [-C <repository root>] diff\|log\|show\|status\|blame\|ls-files\|ls-tree\|grep\|rev-parse\|merge-base\|cat-file\|describe\|shortlog\|diff-tree\|rev-list\|name-rev …` — no shell metacharacters or unquoted globs, no global options, no `--output`/`--ext-diff`/`--no-index`/`--contents`/`--open-files-in-pager`/`--exec` nor any abbreviation of them, no `-O` even bundled, no network paths, nothing under the ultracodex home; `-C` without `..`, and — with or without `-C` — only where git's upward discovery, walked as written and with links resolved, reaches a `.git` before a bare-looking directory (Read, Grep, Glob stay available) | denied |
 | any other subagent | whatever its permissions allow, except the runner's `key` and `expect` | no opinion |
 
 The allowed commands of the three confined types run without a permission prompt. A relay
@@ -119,8 +119,11 @@ Each reader rule closes a way, measured on git 2.55, to make "read-only" git run
 the owner: `git grep -nO<cmd>` and `git grep --open-files=<cmd>` start `<cmd>` as a pager, and
 git run inside an embedded bare repository — `HEAD`, `objects/`, `refs/` and `config` are
 ordinary files a repository can contain — loads that `config`, whose `core.fsmonitor` is a
-program. A tree checked out by git never contains a `.git` of its own, which is why `-C` must
-land on one.
+program. A tree checked out by git never contains a `.git` of its own, so the guard mirrors
+git's discovery and requires it to reach a real `.git` first. git walks up the physical path —
+measured on Windows through a junction into a bare repository's `refs/` — so the walk is done
+with links resolved too, and `..` is refused in `-C` (the kernel follows `hop` in `hop/..`
+before it goes up; a text normalisation would not).
 
 Residual risks: with hooks disabled (`disableAllHooks`) the confined agents keep their plain
 tools. The guard sees Bash only, so a reader can still Read `~/.ultracodex/key` — which no
