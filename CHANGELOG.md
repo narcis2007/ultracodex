@@ -174,6 +174,24 @@ round-4 findings confirmed fixed; six new findings, one high):
   into an embedded bare repository, legacy slot debris, a late-winner upload race and a part
   copied with the next part's lines.
 
+**Round 7 — after the astra@max final gate of round 6** (all six round-5 findings fixed or
+narrowed; five new findings in the new code, two high):
+- Reader guard fails closed: a `-C` start that cannot be resolved is refused (it used to be
+  allowed), on Windows `-C` must be a native path (Git Bash rewrites POSIX-style arguments
+  before git sees them), and any directory with a `HEAD` entry found before a `.git` counts as
+  a repository of its own (git needs no local `objects`/`refs` when `commondir` points
+  elsewhere).
+- Slot give-back: a renewed owner's generation goes straight back into its slot directory,
+  which stays in place (fresh, so no taker touches it) — no window in which another run could
+  claim the slot.
+- Fallback teardown: processes the kill script found but never reached before its round cap
+  are reported (`pending`) and reconciled; every identity it found joins the tracked set, so
+  a child started by one of them is reported; a capped sweep is never reported clean. The
+  reconciliation is a pure function now, unit-tested on synthetic tables.
+- Part prefix matching is one linear pass, and parts beyond 16 KB are refused unscanned
+  (rejected copies are kept bounded).
+- Tests: 122 offline tests.
+
 ## 0.2.1 — 2026-07-10 (fork)
 
 Correctness fixes from a cross-model review; runtime self-test.

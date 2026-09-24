@@ -1614,7 +1614,7 @@ function freeStaleSlot(dir, watch) {
   return !fs.existsSync(dir);
 }
 
-function evictGeneration(dir, judged) {
+export function evictGeneration(dir, judged) {
   const tomb = path.join(path.dirname(dir), `.stale-${randomBytes(4).toString("hex")}`);
   const moved = path.join(tomb, path.basename(judged.leasePath));
   try {
@@ -1629,14 +1629,17 @@ function evictGeneration(dir, judged) {
     fs.rmSync(tomb, { recursive: true, force: true });
     return true;
   }
-  // It renewed after all: give it back, reborn whole, but only into a slot nobody has taken
-  // since — the slot is empty now, so rmdir succeeds only while it still is.
+  // It renewed after all: straight back into the slot directory, which never left — emptied
+  // a moment ago, it is fresh, so no taker claims it (a claim cannot land on it) or removes
+  // it (only old empty debris is removed). Reborn whole only if the directory is gone.
   try {
-    try {
-      fs.rmdirSync(dir);
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
+    renameRetry(moved, judged.leasePath);
+    fs.rmSync(tomb, { recursive: true, force: true });
+    return false;
+  } catch {
+    // the slot directory went away after all
+  }
+  try {
     if (renameIntoPlace(tomb, dir)) return false;
   } catch {
     // someone took the slot meanwhile
@@ -2048,13 +2051,15 @@ for ($round = 0; $round -lt 5 -and $want.Count -gt 0; $round++) {
   }
 }
 foreach ($procId in @($held.Keys)) { if ($held[$procId].WaitForExit(3000)) { Say ('killed ' + $procId + ' ' + $parents[$procId]) } else { Say ('survived ' + $procId + ' ' + $parents[$procId]) } }
+foreach ($procId in @($want.Keys)) { Say ('pending ' + $procId + ' ' + $want[$procId]) }
 Say 'done'`;
 }
 
 // Every line names an identity (PID + creation time), including the descendants the
-// script found during its rounds, so the caller can check each against the final table.
+// script found during its rounds and those it found but never reached (`pending`, when its
+// round cap ran out), so the caller can check each against the final table.
 function runPinnedKill(seeds, pinnedParents) {
-  if (!seeds.length && !pinnedParents.length) return { killed: [], survivors: [], ok: true };
+  if (!seeds.length && !pinnedParents.length) return { killed: [], survivors: [], pending: [], ok: true };
   const out = runPowerShell(pinnedKillScript(seeds, pinnedParents));
   const lines = String(out.stdout ?? "").split(/\r?\n/).map((line) => line.trim());
   const pick = (word) =>
@@ -2064,7 +2069,7 @@ function runPinnedKill(seeds, pinnedParents) {
         const [pid, created] = line.slice(word.length + 1).split(" ");
         return [Number(pid), /^\d+$/.test(created ?? "") ? BigInt(created) : null];
       });
-  return { killed: pick("killed"), survivors: [...pick("survived"), ...pick("unpinned")], ok: lines.includes("done") };
+  return { killed: pick("killed"), survivors: [...pick("survived"), ...pick("unpinned")], pending: pick("pending"), ok: lines.includes("done") };
 }
 
 function windowsPinnedStop(child, tracked, { killRoot }) {
@@ -2088,26 +2093,36 @@ function windowsPinnedStop(child, tracked, { killRoot }) {
   const rootPinned = Boolean(killRoot && root && alive);
   if (rootPinned) child.kill("SIGKILL");
   const report = runPinnedKill([...seeds], rootPinned ? [[root.pid, root.created]] : []);
-  const after = windowsProcessTable();
-  // Reconciled against the final table, whatever the script said: every targeted identity
-  // still present is a survivor — the seeds, the root, and the descendants the script found
-  // during its rounds — so a skipped or failed kill is never reported as clean.
+  return reconcilePinnedStop({ seeds, root: rootPinned ? root : null, report, table, after: windowsProcessTable(), tracked, childPid: child.pid });
+}
+
+// Reconciled against the final table, whatever the script said: every targeted identity
+// still present is a survivor — the seeds, the root, and the descendants the script found
+// during its rounds — so a skipped or failed kill is never reported as clean. `root` is the
+// pinned root (or null), `after` the final table (or null when it could not be read).
+export function reconcilePinnedStop({ seeds, root, report, table, after, tracked, childPid }) {
+  const rootPinned = Boolean(root);
   const aimed = new Map(seeds);
   if (rootPinned) aimed.set(root.pid, root.created);
-  for (const [pid, created] of [...report.killed, ...report.survivors]) if (created !== null) aimed.set(pid, created);
+  const found = [...report.killed, ...report.survivors, ...report.pending];
+  for (const [pid, created] of found) if (created !== null) aimed.set(pid, created);
+  // Everything the script found is ours by identity from here on: a child one of them
+  // started before it died is then reported below, never silently missed.
+  for (const [pid, created] of aimed) tracked.set(pid, created);
   // a reported survivor the script could not name by identity stays one (and unverified)
-  const unnamed = report.survivors.filter(([, created]) => created === null).map(([pid]) => pid);
+  const unnamed = [...report.survivors, ...report.pending].filter(([, created]) => created === null).map(([pid]) => pid);
   const survivors = after
     ? [...new Set([...[...aimed].filter(([pid, created]) => after.some((proc) => proc.pid === pid && proc.created === created)).map(([pid]) => pid), ...unnamed])]
-    : report.survivors.map(([pid]) => pid);
-  // Children of tracked processes that died before the teardown: probably ours, but their
-  // parent's PID is no longer pinned, so nothing proves it — reported, never killed.
+    : [...report.survivors, ...report.pending].map(([pid]) => pid);
+  // Children of tracked processes that died before or during the teardown: probably ours,
+  // but their parent's PID is no longer pinned, so nothing proves it — reported, never killed.
   const dead = [...tracked].filter(([pid, created]) => !(after ?? table).some((proc) => proc.pid === pid && proc.created === created));
-  const handled = new Set([...aimed.keys(), child.pid]);
+  const handled = new Set([...aimed.keys(), childPid]);
   const possible = (after ?? []).filter((proc) => !handled.has(proc.pid) && dead.some(([pid, created]) => proc.ppid === pid && proc.created >= created));
   const result = { targeted: report.killed.length + report.survivors.length + (rootPinned ? 1 : 0), survivors, method: "pinned" };
   if (possible.length) result.possibleLeftovers = possible.map((proc) => proc.pid);
-  if (possible.length || !after || !report.ok || unnamed.length) result.unverified = true;
+  // the script's round cap ran out with processes found but not reached: never clean
+  if (possible.length || !after || !report.ok || unnamed.length || report.pending.length) result.unverified = true;
   return result;
 }
 
@@ -2797,7 +2812,8 @@ function keepRejected(name, text) {
   try {
     const dir = path.join(ucxHome(), "rejected");
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, `${name}-${Date.now()}.txt`), text);
+    // bounded: a hostile relay's megabytes are not worth keeping whole
+    fs.writeFileSync(path.join(dir, `${name}-${Date.now()}.txt`), String(text).slice(0, 64 * 1024));
   } catch {
     // diagnostics only
   }
@@ -2818,14 +2834,26 @@ function keepRejected(name, text) {
 // assembled frame is verified again as a whole (frame hashes, the helper's signature), so a
 // wrong cut can never start a run. null: no match.
 export function matchingPrefix(received, hash) {
-  if (fnv1a(received) === hash) return received;
-  const lines = received.split("\n");
-  for (let count = lines.length - 1; count >= 1; count -= 1) {
-    const prefix = lines.slice(0, count).join("\n");
-    if (fnv1a(prefix) === hash) return prefix;
+  if (received.length > MAX_PART_CHARS) return null;
+  // One pass: the FNV-1a state at a line break is the hash of the prefix before it, so the
+  // scan stays linear whatever a relay sends; the longest matching prefix wins.
+  const hex = (state) => state.toString(16).padStart(8, "0");
+  let state = 0x811c9dc5;
+  let cut = null;
+  for (let index = 0; index < received.length; index += 1) {
+    const code = received.charCodeAt(index);
+    if (code === 10 && index > 0 && hex(state) === hash) cut = index;
+    state ^= code;
+    state = Math.imul(state, 0x01000193) >>> 0;
   }
-  return null;
+  if (hex(state) === hash) return received;
+  return cut === null ? null : received.slice(0, cut);
 }
+
+// An honest part is at most ~2 KB (the helper cuts parts at 1600 characters and lines at
+// 400), and a relay that runs on into the next part about doubles that: anything far beyond
+// is refused before it is scanned or kept.
+export const MAX_PART_CHARS = 16 * 1024;
 
 export async function cmdPart(uploadArg, indexText, totalText, hashText, options = {}) {
   const index = Number(indexText);

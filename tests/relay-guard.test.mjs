@@ -169,6 +169,31 @@ test("a committed link cannot walk a reader's git into an embedded bare reposito
   assert.equal(judge(`git -C "${tree.replace(/\\/g, "/")}" status`), null, "the root itself");
 });
 
+test("git's own view decides: commondir repositories, POSIX spellings and unresolvable starts are refused", (t) => {
+  const READER = "ultracodex:codex-reader";
+  const tree = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-view-"));
+  t.after(() => fs.rmSync(tree, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(tree, ".git"));
+  // a repository with no objects/ or refs/ of its own: git takes HEAD + commondir for one
+  fs.mkdirSync(path.join(tree, "payload"));
+  fs.writeFileSync(path.join(tree, "payload", "HEAD"), "ref: refs/heads/main\n");
+  fs.writeFileSync(path.join(tree, "payload", "commondir"), "../shared\n");
+  for (const dir of ["objects", "refs"]) fs.mkdirSync(path.join(tree, "shared", dir), { recursive: true });
+  fs.writeFileSync(path.join(tree, "shared", "config"), "[core]\n\tfsmonitor = calc\n");
+  const judge = (command, cwd = tree) => checkAgentCommand(READER, command, PLUGIN_ROOT, { cwd });
+  assert.notEqual(judge("git -C payload status"), null, "HEAD + commondir is a repository to git");
+  assert.notEqual(judge("git status", path.join(tree, "payload")), null, "no -C, from inside it");
+  assert.notEqual(judge("git -C does-not-exist log"), null, "a start that cannot be resolved is refused, never guessed");
+  assert.equal(judge("git -C shared log"), null, "objects/ and refs/ without a HEAD are not a repository to git");
+  if (process.platform === "win32") {
+    // C:\x as Git Bash spells it (/c/x) — rewritten to C:/x before git.exe sees it (measured)
+    const posix = "/" + tree[0].toLowerCase() + tree.slice(2).replace(/\\/g, "/");
+    assert.notEqual(judge(`git -C "${posix}/payload" status`), null, "the POSIX spelling is refused");
+    assert.notEqual(judge(`git -C "${posix}" status`), null, "even of a real root: only native paths are judged");
+    assert.equal(judge(`git -C "${tree.replace(/\\/g, "/")}" status`), null, "the native spelling of the root is fine");
+  }
+});
+
 test("the hook judges by agent type — never by what an agent asks for", () => {
   assert.equal(hook({ tool_name: "Bash", tool_input: { command: "rm -rf /" } }), null, "the main conversation is not judged here");
   assert.equal(hook({ agent_type: "general-purpose", tool_name: "Bash", tool_input: { command: "npm test" } }), null, "no opinion on an ordinary agent's ordinary command");

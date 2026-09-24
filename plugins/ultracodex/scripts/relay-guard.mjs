@@ -149,38 +149,45 @@ export function checkReaderCommand(command, { env = process.env, cwd = process.c
   // by git never contains a `.git` of its own, so a `.git` marks a real repository.
   let start = cwd;
   if (at === 3) {
+    const value = words[2];
     // No `..`: path.resolve drops `hop/..` as text, but the kernel follows `hop` first — a
     // committed symlink would put git somewhere this check never looked.
-    if (words[2].split("/").includes("..")) return "-C may not contain .. (name the directory itself)";
-    start = path.resolve(cwd, words[2]);
+    if (value.split("/").includes("..")) return "-C may not contain .. (name the directory itself)";
+    // Git Bash rewrites a POSIX-looking argument before git.exe sees it (/c/x becomes C:/x),
+    // while Node would read it as \c\x on the current drive: only a native path is judged
+    // the way git will see it.
+    if (process.platform === "win32" && value.startsWith("/")) return "-C needs a Windows path (C:/…) here, not a POSIX-style one";
+    start = path.resolve(cwd, value);
   }
-  if (discoversBareDirectory(start)) {
-    return "git would start inside something it takes for a bare repository here, not in a real repository; use git -C <repository root>";
+  return gitStartProblem(start);
+}
+
+// Where git looks for its repository when started in `start`: at each level `<dir>/.git`
+// first, then `<dir>` itself. A directory with a HEAD entry counts as a repository of its own
+// — git needs nothing else there when a `commondir` file sends it elsewhere for objects, refs
+// and config — so one found before any `.git` refuses the command, and so does a start that
+// cannot be resolved (never allowed on a guess). git walks up the physical path (links
+// resolved; measured on Windows through a junction), so both it and the path as written are
+// walked.
+function gitStartProblem(start) {
+  const logical = path.resolve(start);
+  let physical;
+  try {
+    physical = fs.realpathSync.native(logical);
+  } catch {
+    return "that directory cannot be resolved here, so where git would start is unknown";
+  }
+  if (walkFindsHead(logical) || (physical !== logical && walkFindsHead(physical))) {
+    return "git would start inside something it takes for a repository of its own (a HEAD before any .git); use git -C <repository root>";
   }
   return null;
 }
 
-// git's discovery, upwards from its working directory: at each level `<dir>/.git` first,
-// then `<dir>` itself as a bare repository. git walks up the physical path, links resolved
-// (measured on Windows too: `git -C <junction to a bare repository's refs/>` picks that
-// repository); both it and the path as written are walked, and a bare-looking directory
-// found before a `.git` on either walk refuses the command.
-function discoversBareDirectory(start) {
-  const logical = path.resolve(start);
-  let physical = logical;
-  try {
-    physical = fs.realpathSync.native(logical);
-  } catch {
-    return false; // no such directory: git refuses to start there
-  }
-  return walkFindsBare(logical) || (physical !== logical && walkFindsBare(physical));
-}
-
-function walkFindsBare(start) {
+function walkFindsHead(start) {
   let dir = start;
   for (;;) {
     if (fs.existsSync(path.join(dir, ".git"))) return false;
-    if (["HEAD", "objects", "refs"].every((entry) => fs.existsSync(path.join(dir, entry)))) return true;
+    if (fs.existsSync(path.join(dir, "HEAD"))) return true;
     const parent = path.dirname(dir);
     if (parent === dir) return false;
     dir = parent;

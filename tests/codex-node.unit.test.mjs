@@ -27,8 +27,11 @@ import {
   encodeFrameText,
   encodePageText,
   ensureKey,
+  evictGeneration,
   fnv1a,
   matchingPrefix,
+  MAX_PART_CHARS,
+  reconcilePinnedStop,
   framedToRaw,
   keyPath,
   makeClock,
@@ -288,6 +291,38 @@ test("a part with the next part's lines after it matches by its prefix — and o
   assert.equal(matchingPrefix(`alpha on either %+\n betx\n${next}`, fnv1a(part)), null, "an altered part never matches");
   assert.equal(matchingPrefix(next, fnv1a(part)), null);
   assert.equal(matchingPrefix("alpha on either %+", fnv1a(part)), null, "a part missing its last line never matches");
+  // linear, and bounded: 60 000 short lines once took ~33 s through prefix re-hashing
+  const many = `${part}\n${"x\n".repeat(7000)}`;
+  const started = Date.now();
+  assert.equal(matchingPrefix(many, fnv1a(part)), part);
+  assert.ok(Date.now() - started < 200, `scanned ${many.length} characters in ${Date.now() - started} ms`);
+  assert.equal(matchingPrefix(`${part}\n${"x".repeat(MAX_PART_CHARS)}`, fnv1a(part)), null, "a part far beyond any honest size is refused unscanned");
+});
+
+test("fallback teardown: whatever the kill script found — killed, surviving or never reached — is reconciled", () => {
+  const row = (pid, ppid, created) => ({ pid, ppid, created: BigInt(created) });
+  const table = [row(10, 1, 100), row(20, 10, 200)];
+  const report = (fields) => ({ killed: [], survivors: [], pending: [], ok: true, ...fields });
+  // 30 was found (a child of 20) and killed; 40 was found in the last round and never reached;
+  // 50 was started by 30 just before 30 died, unseen by the script
+  const after = [row(40, 30, 400), row(50, 30, 500)];
+  const result = reconcilePinnedStop({
+    seeds: new Map([[20, 200n]]),
+    root: row(10, 1, 100),
+    report: report({ killed: [[20, 200n], [30, 300n]], pending: [[40, 400n]] }),
+    table,
+    after,
+    tracked: new Map([[10, 100n], [20, 200n]]),
+    childPid: 10,
+  });
+  assert.deepEqual(result.survivors, [40], "the never-reached process is still alive: a survivor, not clean");
+  assert.deepEqual(result.possibleLeftovers, [50], "a child of a process found during the teardown is reported");
+  assert.equal(result.unverified, true);
+  const clean = reconcilePinnedStop({ seeds: new Map([[20, 200n]]), root: row(10, 1, 100), report: report({ killed: [[20, 200n]] }), table, after: [], tracked: new Map([[10, 100n], [20, 200n]]), childPid: 10 });
+  assert.deepEqual(clean.survivors, []);
+  assert.equal(clean.unverified, undefined, "a teardown that left nothing is clean");
+  const capped = reconcilePinnedStop({ seeds: new Map(), root: null, report: report({ pending: [[60, 600n]] }), table, after: [], tracked: new Map(), childPid: 10 });
+  assert.equal(capped.unverified, true, "a round cap that ran out is never reported as clean");
 });
 
 test("creation times stay exact: FILETIMEs are far beyond Number precision", () => {
@@ -366,6 +401,22 @@ test("two takers of a freed slot never both own it — even when one lands its c
   const [a, b] = await Promise.all([late, taker("run-B", 600)]);
   assert.deepEqual(a.overlaps, [], "A never held the slot while B did");
   assert.deepEqual(b.overlaps, [], "B never held the slot while A did");
+});
+
+test("an owner that renewed after all gets its generation back in place — its slot is never free meanwhile", (t) => {
+  const home = withHome(t, { ULTRACODEX_MAX_CONCURRENT: "1" });
+  const slot = path.join(home, "slots", "slot-0");
+  const lease = path.join(slot, "lease-run-X");
+  fs.mkdirSync(lease, { recursive: true });
+  fs.writeFileSync(path.join(lease, "owner.json"), JSON.stringify({ runId: "run-X", pid: process.pid, beatAt: 2 }));
+  // the reclaimer judged beatAt 1 stale; the owner renewed (beatAt 2) before the move
+  const evicted = evictGeneration(slot, { runId: "run-X", pid: process.pid, beatAt: 1, leasePath: lease });
+  assert.equal(evicted, false, "a renewed owner is not evicted");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(lease, "owner.json"), "utf8")).beatAt, 2, "its generation is back where it was");
+  assert.deepEqual(fs.readdirSync(path.join(home, "slots")), ["slot-0"], "no tombstone left, and no gap: the slot directory never went away");
+  // and an owner that really stopped is evicted
+  assert.equal(evictGeneration(slot, { runId: "run-X", pid: process.pid, beatAt: 2, leasePath: lease }), true);
+  assert.deepEqual(fs.readdirSync(slot), [], "only its generation moved; the emptied slot directory stays for the caller to remove");
 });
 
 test("stale pre-0.3 debris that is not empty never blocks a slot; unknown content is left alone", async (t) => {
