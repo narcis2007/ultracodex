@@ -11,7 +11,7 @@ export const meta = {
 
 // Generated from tools/src/workflows/judge-panel.js — edit the source, then `npm run build`.
 
-// ── ultracodex helper v0.3.2 ───────────────────────────────────────────────────
+// ── ultracodex helper v0.3.3 ───────────────────────────────────────────────────
 // Generated from tools/src/helper.js in the ultracodex repo — edit the source, then
 // `npm run build`. Needs the ultracodex plugin (its `codex-relay`, `codex-key` and
 // `codex-reader` agents + runner).
@@ -26,7 +26,7 @@ export const meta = {
 // (xhigh for kind 'verify', max otherwise) · 'final' → gpt-6-astra@max. Pin
 // model/effort only to override. Concurrency is capped intrinsically: 4 Codex jobs
 // per workflow, an astra job counting as 2 — do not wrap calls in another gate.
-const UCX_VERSION = '0.3.2'
+const UCX_VERSION = '0.3.3'
 const UCX_RELAY = 'ultracodex:codex-relay'
 const UCX_TIER_MODEL = { light: 'gpt-6-luna', daily: 'gpt-6-sol', final: 'gpt-6-astra' }
 const UCX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
@@ -198,7 +198,7 @@ function ucxKey(call, phase) {
     ucxKeyPromise = (async () => {
       for (let attempt = 0; attempt < 2; attempt++) {
         const raw = await call('ULTRACODEX KEY', {
-          agentType: UCX_KEY_AGENT, label: 'codex:key' + (attempt ? ':retry' : ''), phase, ...(attempt ? { model: 'opus' } : { effort: 'low' }),
+          agentType: UCX_KEY_AGENT, label: 'relay → key' + (attempt ? ':retry' : ''), phase, ...(attempt ? { model: 'opus' } : { effort: 'low' }),
         })
         const env = ucxEnvelope(raw)
         if (env && env.ok === true && /^[0-9a-f]{64}$/.test(String(env.key)) && /^[0-9a-f]{32}$/.test(String(env.nonce))
@@ -221,7 +221,7 @@ async function ucxExpect(call, phase, digest, label) {
   let why = 'the key agent returned no confirmation'
   for (let attempt = 0; attempt < 2; attempt++) {
     const raw = await call('ULTRACODEX EXPECT\nDIGEST: ' + digest, {
-      agentType: UCX_KEY_AGENT, label: label + ':expect' + (attempt ? ':retry' : ''), phase, ...(attempt ? { model: 'opus' } : { effort: 'low' }),
+      agentType: UCX_KEY_AGENT, label: label + (attempt ? ':retry' : ''), phase, ...(attempt ? { model: 'opus' } : { effort: 'low' }),
     })
     const env = ucxEnvelope(raw)
     if (env && env.ok === true && env.expected === digest) return null
@@ -433,7 +433,11 @@ function codexNode(task, opts = {}) {
   if (label) base.label = String(label).replace(/[^\w .:/@#+=-]/g, '_').slice(0, 120)
   if (meta !== undefined) base.meta = meta
   const schemaText = schema ? JSON.stringify(schema) : 'null'
-  const relayLabel = label || 'codex'
+  // Panel labels: these agents are Claude relays (Sonnet) carrying the job to Codex — the label
+  // names the Codex model that does the work, so the panel does not read as a Claude review.
+  const target = (model || UCX_TIER_MODEL[tier]).replace('gpt-6-', '') + '@' +
+    (effort || (tier === 'daily' && kind === 'verify' ? 'xhigh' : 'max'))
+  const relayLabel = 'relay → ' + (label || 'codex') + ' (' + target + ')'
   const weight = (model || UCX_TIER_MODEL[tier]) === 'gpt-6-astra' ? 2 : 1
   // agent() may reject (runtime error, exhausted budget): that is a failed node, never a vanished one.
   const call = async (prompt, callOpts) => {
@@ -452,7 +456,7 @@ function codexNode(task, opts = {}) {
       const digest = ucxSha256Hex(JSON.stringify(header) + '\n' + schemaText + '\n' + text)
       const frame = [JSON.stringify({ ...header, rmac: ucxHmacHex(auth.key, 'ucx-request\n' + digest) }),
         '---ULTRACODEX-SCHEMA---', schemaText, '---ULTRACODEX-TASK---', text].join('\n')
-      const refused = await ucxExpect(call, phase, digest, relayLabel)
+      const refused = await ucxExpect(call, phase, digest, 'relay → announce ' + (label || 'codex'))
       if (refused) return ucxError('register_failed', 'the request could not be announced to the runner: ' + refused, null, true)
       // No separate marker line: relays tended to drop it. `part` uploads are always encoded.
       const lines = ucxEncode(frame).split('\n').flatMap(ucxWrap)

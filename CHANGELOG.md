@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3 — 2026-09-24 (fork)
+
+- Workflow panel labels name what each agent is: `relay → key`, `relay → announce <node>`,
+  `relay → <node> (sol@max)` — Claude (Sonnet) relays that carry the job to Codex, labelled
+  with the Codex model and effort that do the actual work.
+
 ## 0.3.2 — 2026-09-24 (fork)
 
 - `codex-review` picks the tier itself when the owner names none, from the measured diff:
