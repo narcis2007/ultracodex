@@ -42,7 +42,9 @@ Workflow({ name: 'ultracodex:codex-review', args: {
 ```
 
 It runs one Codex review per lens (hermetic, read-only, astra ≤2 at a time), has Claude check
-every finding in the code (confirmed / refuted / needs-info), sends the high/critical findings
+every finding in the code (confirmed / refuted / needs-info) and rate its severity itself —
+Codex tends to rate findings above their real impact, so the ranking and the verdict follow
+Claude's rating, with every change listed (`severityChanges`) — sends the high/critical findings
 Claude refuted or could not settle to gpt-6-astra in one run (`escalate`, default on below the
 final tier) and writes the report. A lens that failed makes the result `incomplete` — say
 which lens and why. **Disputed** findings (Claude doubted them, astra upheld them) go to the
@@ -80,16 +82,22 @@ together (the runner queues beyond its machine-wide cap).
 
 For every finding: open the file and the callers, and decide **confirmed** (defect real,
 failure scenario reachable), **refuted** (say why), or **needs-info** (what must be checked).
-Codex is evidence, not authority. When you and a sol review disagree on something important,
+Codex is evidence, not authority — also on severity: it tends to rate findings higher than
+their real impact. Rate each one yourself (impact × likelihood under the threat model): lower
+it when the failure needs conditions that practically never occur, is caught or harmless, or
+an existing control covers it; keep it when someone the threat model includes can trigger it
+at will. Note every change as "Codex: high → medium — <the precondition or control>". When you and a sol review disagree on something important,
 re-check those findings on the final tier in **one** request (`tier: 'final'`, `kind: 'verify'`,
 the multi-claim schema from the `codex-ask` skill, `workItems: N`) — the workflow does this
 itself (`escalate`).
 
 ## 5. Report
 
-Confirmed findings ranked by severity (file:line, failure scenario, fix), then needs-info, then
-a one-line list of refuted ones; per-lens verdicts; the tier used; an overall line
-(ship / ship after fixes / do not ship). If any lens failed, the review is **incomplete** —
+Confirmed findings ranked by your severity (file:line, failure scenario, fix; Codex's rating
+beside it where you changed it), then needs-info, then a one-line list of refuted ones;
+per-lens verdicts; the tier used; an overall line that follows your ratings: do not ship for a
+confirmed critical/high (or one still unresolved), ship after fixes when the worst is medium,
+ship when only low ones remain. If any lens failed, the review is **incomplete** —
 say so first. Do not merge anything on the strength of the review alone; the owner decides.
 
 ## Rules

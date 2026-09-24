@@ -850,6 +850,42 @@ test("codex-review escalates high/critical disagreements to astra in one run: up
   assert.equal(result.status, "complete");
 });
 
+test("codex-review ranks by Claude's own severity, keeps Codex's beside it, and still escalates by Codex's", async () => {
+  let reportPrompt = null;
+  let escalated = null;
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      if (request.label === "codex:escalate") {
+        escalated = JSON.parse(request.task.slice(request.task.indexOf("INPUT ITEMS (JSON):") + "INPUT ITEMS (JSON):".length));
+        return okEnvelope(request, { results: [{ id: "code:3", refuted: true, confidence: 0.9, reasoning: "guarded upstream" }] });
+      }
+      const f = (id, severity) => ({ id, severity, category: "c", title: "t-" + id, file: "x.rs", line: 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.7 });
+      return okEnvelope(request, { verdict: "blocked", summary: "sum", findings: [f("a", "high"), f("b", "low"), f("c", "critical")] });
+    }
+    if (opts.label === "triage:code:1") {
+      assert.match(prompt, /rate its severity yourself/);
+      return { verdict: "confirmed", severity: "medium", severityReason: "needs a 60 s stall inside a microsecond window", reasoning: "real" };
+    }
+    if (opts.label === "triage:code:2") return { verdict: "confirmed", severity: "high", severityReason: "any caller can trigger it", reasoning: "real" };
+    if (opts.label === "triage:code:3") return { verdict: "refuted", severity: "low", severityReason: "", reasoning: "Claude: guarded" };
+    if (opts.label === "report") {
+      reportPrompt = prompt;
+      return "FINAL";
+    }
+    return null;
+  };
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"] } });
+  assert.deepEqual(result.confirmed.map((f) => [f.id, f.severity, f.codexSeverity]), [["code:2", "high", "low"], ["code:1", "medium", "high"]], "ranked by Claude's rating, Codex's kept beside it");
+  assert.deepEqual(result.severityChanges.map((c) => [c.id, c.codex, c.claude, c.why]), [
+    ["code:2", "low", "high", "any caller can trigger it"],
+    ["code:1", "high", "medium", "needs a 60 s stall inside a microsecond window"],
+  ]);
+  assert.match(reportPrompt, /Codex: <codexSeverity> → <severity>/);
+  assert.match(reportPrompt, /"ship after fixes" when the worst is medium/);
+  assert.deepEqual(escalated.map((item) => item.id), ["code:3"], "a critical finding Claude refuted still gets its astra tiebreak, whatever Claude rated it");
+});
+
 test("judge-panel reports a failed Codex generation instead of hiding it", async () => {
   const agent = async (prompt, opts) => {
     if (opts.agentType === RELAY) {

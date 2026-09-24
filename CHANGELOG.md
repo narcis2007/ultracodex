@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.1 — 2026-09-24 (fork)
+
+- `codex-review`: Claude's triage also rates each finding's **severity** itself — Codex tends
+  to rate findings above their real impact. It judges impact × likelihood under the owner's
+  context: lower when the failure needs conditions that practically never occur, is caught or
+  harmless, or an existing control covers it; kept or raised when someone the threat model
+  includes can trigger it at will. The report ranks by, and the ship verdict follows, Claude's
+  rating ("do not ship" only for a confirmed, disputed or unresolved critical/high; "ship
+  after fixes" when the worst is medium); Codex's rating stays beside it (`codexSeverity`) and
+  every change is listed with its reason (`severityChanges`). The astra tiebreak still keys on
+  Codex's severity, so a high/critical finding Claude refutes is always settled. The skill's
+  by-hand path follows the same rule.
+
 ## 0.3.0 — 2026-09-23 (fork)
 
 Merged upstream KingGyuSuh/ultracodex v0.1.3 and rebuilt the Codex path around a Node runner.

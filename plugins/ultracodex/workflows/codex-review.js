@@ -12,7 +12,7 @@ export const meta = {
 
 // Generated from tools/src/workflows/codex-review.js — edit the source, then `npm run build`.
 
-// ── ultracodex helper v0.3.0 ───────────────────────────────────────────────────
+// ── ultracodex helper v0.3.1 ───────────────────────────────────────────────────
 // Generated from tools/src/helper.js in the ultracodex repo — edit the source, then
 // `npm run build`. Needs the ultracodex plugin (its `codex-relay`, `codex-key` and
 // `codex-reader` agents + runner).
@@ -27,7 +27,7 @@ export const meta = {
 // (xhigh for kind 'verify', max otherwise) · 'final' → gpt-6-astra@max. Pin
 // model/effort only to override. Concurrency is capped intrinsically: 4 Codex jobs
 // per workflow, an astra job counting as 2 — do not wrap calls in another gate.
-const UCX_VERSION = '0.3.0'
+const UCX_VERSION = '0.3.1'
 const UCX_RELAY = 'ultracodex:codex-relay'
 const UCX_TIER_MODEL = { light: 'gpt-6-luna', daily: 'gpt-6-sol', final: 'gpt-6-astra' }
 const UCX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
@@ -587,13 +587,19 @@ ${LENSES[key]}
 Read the diff, then the surrounding code of every changed hunk. Report only real defects, each with file, line, evidence from the code, a reachable failure scenario and a recommendation.
 Do not report style nits unless they hide a defect. Give each finding a short unique id. Use verdict "blocked" only for defects that must not ship.${CONTEXT}${LESSONS}`
 
+// Claude also rates each finding's severity itself: Codex tends to rate findings above their
+// real impact, and the report ranks and decides by Claude's rating (every change is shown).
+const SEVERITIES = ['critical', 'high', 'medium', 'low']
 const TRIAGE_SCHEMA = {
-  type: 'object', additionalProperties: false, required: ['verdict', 'reasoning'],
+  type: 'object', additionalProperties: false, required: ['verdict', 'severity', 'severityReason', 'reasoning'],
   properties: {
     verdict: { type: 'string', enum: ['confirmed', 'refuted', 'needs_info'] },
+    severity: { type: 'string', enum: SEVERITIES },
+    severityReason: { type: 'string' },
     reasoning: { type: 'string' },
   },
 }
+const TRIAGE_SEVERITY = `Then rate its severity yourself (critical / high / medium / low) — Codex tends to rate findings higher than their real impact. Judge realistic impact times likelihood under the owner's context and threat model (above, when given): lower it when the failure needs conditions that practically never occur, when it is caught, logged or harmless, or when an existing control already covers it; keep or raise it when someone the threat model includes can trigger it at will. If your severity differs from Codex's, give the reason in severityReason (one sentence naming the precondition or the control); otherwise leave severityReason empty. For a refuted or needs-info finding, rate it as if it were real.`
 
 phase('Review')
 const lensResults = await pipeline(
@@ -609,7 +615,8 @@ const lensResults = await pipeline(
     const failedTriage = reason => ({ verdict: 'needs_info', reasoning: 'Claude triage failed (' + reason + ') — check this finding by hand', failed: true })
     const triaged = await parallel(findings.map(f => () =>
       agent(`A Codex reviewer reported this finding about ${SCOPE}${CWD ? ' in ' + CWD : ''}. Check it yourself against the code (read the file and its callers; run git if needed).${ucxWhere(CWD)}
-Decide: "confirmed" (the defect is real and the failure scenario is reachable), "refuted" (it is not — explain why), or "needs_info" (it depends on something you cannot see).
+Decide: "confirmed" (the defect is real and the failure scenario is reachable), "refuted" (it is not — explain why), or "needs_info" (it depends on something you cannot see).${CONTEXT}
+${TRIAGE_SEVERITY}
 FINDING (JSON): ${JSON.stringify(f)}`, { label: 'triage:' + f.id, phase: 'Triage', schema: TRIAGE_SCHEMA, agentType: UCX_READER })
         .then(t => ({ ...f, triage: t || failedTriage('no answer') }), e => ({ ...f, triage: failedTriage(String((e && e.message) || e)) }))))
     return { lens: key, verdict: review.verdict, summary: review.summary, findings: findings.map((f, i) => triaged[i] || { ...f, triage: failedTriage('stage failed') }) }
@@ -669,17 +676,30 @@ const by = v => (TRIAGE ? findings.filter(f => f.triage && bucketOf(f) === v) : 
 const confirmed = by('confirmed'), refuted = by('refuted'), needsInfo = by('needs_info'), disputed = by('disputed')
 const untriaged = TRIAGE ? [] : findings
 const whyRefuted = f => (f.escalation && !f.escalation.error ? 'gpt-6-astra: ' + f.escalation.reasoning : f.triage.reasoning)
+// Confirmed findings carry Claude's own severity from triage; Codex's stays as codexSeverity
+// and every change is listed. (The escalation above still keys on Codex's severity: a
+// high/critical finding Claude refuted gets its astra tiebreak whatever Claude rated it.)
+const RANK = { critical: 0, high: 1, medium: 2, low: 3 }
+const rated = f => ({
+  ...f,
+  severity: f.triage && SEVERITIES.includes(f.triage.severity) ? f.triage.severity : f.severity,
+  codexSeverity: f.severity,
+  severityReason: (f.triage && f.triage.severityReason) || '',
+})
+const confirmedRated = confirmed.map(rated).sort((a, b) => (RANK[a.severity] ?? 9) - (RANK[b.severity] ?? 9))
+const severityChanges = confirmedRated.filter(f => f.severity !== f.codexSeverity)
+  .map(f => ({ id: f.id, title: f.title, codex: f.codexSeverity, claude: f.severity, why: f.severityReason }))
 
 phase('Report')
 const report = await agent(`Write the final review report for ${SCOPE}${CWD ? ' in ' + CWD : ''}.${ucxWhere(CWD)}
 ${failedLenses.length ? 'At the very top, state that these lenses FAILED and were not reviewed: ' + JSON.stringify(failedLenses.map(l => ({ lens: l.lens, error: l.error.kind, message: l.error.message }))) : ''}
 Per-lens Codex verdicts: ${JSON.stringify(lenses.filter(l => !l.error).map(l => ({ lens: l.lens, verdict: l.verdict, summary: l.summary })))}
-CONFIRMED findings (rank by severity; file:line, failure scenario, fix): ${JSON.stringify(confirmed)}
+CONFIRMED findings, ranked by "severity" — Claude's own rating after checking the code; "codexSeverity" is what Codex said. Where they differ, show "Codex: <codexSeverity> → <severity>" with the severityReason. For each: file:line, failure scenario, fix: ${JSON.stringify(confirmedRated)}
 ${disputed.length ? 'DISPUTED findings (Claude doubted them, the gpt-6-astra escalation upheld them — present both sides and say the owner must decide): ' + JSON.stringify(disputed.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, severity: f.severity, claude: f.triage.reasoning, astra: f.escalation.reasoning }))) : ''}
 ${untriaged.length ? 'UNTRIAGED Codex findings (triage was off — present them as unverified claims, not as confirmed defects): ' + JSON.stringify(untriaged) : ''}
 NEEDS-INFO findings (say what must be checked; those with an "escalation.error" are high/critical findings Claude doubted whose gpt-6-astra tiebreak FAILED — say so plainly, they are unresolved): ${JSON.stringify(needsInfo)}
 REFUTED findings (one line each, with the reason): ${JSON.stringify(refuted.map(f => ({ id: f.id, title: f.title, why: whyRefuted(f) })))}
-End with a one-line overall verdict: ship / ship after fixes / do not ship.`, { label: 'report', phase: 'Report', agentType: UCX_READER })
+End with a one-line overall verdict that follows these ratings: "do not ship" when a confirmed or disputed finding is critical/high, or a critical/high one is still unresolved (needs-info); "ship after fixes" when the worst is medium; "ship" when only low ones remain.`, { label: 'report', phase: 'Report', agentType: UCX_READER })
 
 if (failedTriages.length) log('⚠ ' + failedTriages.length + ' findings could not be triaged — kept as needs-info')
 
@@ -689,7 +709,7 @@ return {
   tier: TIER,
   report,
   lenses: lenses.map(l => ({ lens: l.lens, verdict: l.verdict || null, error: l.error ? l.error.kind : null })),
-  confirmed, disputed, needsInfo, untriaged,
+  confirmed: confirmedRated, severityChanges, disputed, needsInfo, untriaged,
   refuted: refuted.map(f => ({ id: f.id, title: f.title, why: whyRefuted(f) })),
   escalation: ESCALATE ? escalation : null,
   codexUsage: ucxUsage(),

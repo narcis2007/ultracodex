@@ -1,4 +1,4 @@
-// ── ultracodex helper v0.3.0 ───────────────────────────────────────────────────
+// ── ultracodex helper v0.3.1 ───────────────────────────────────────────────────
 // Generated from tools/src/helper.js in the ultracodex repo — edit the source, then
 // `npm run build`. Needs the ultracodex plugin (its `codex-relay`, `codex-key` and
 // `codex-reader` agents + runner).
@@ -13,7 +13,7 @@
 // (xhigh for kind 'verify', max otherwise) · 'final' → gpt-6-astra@max. Pin
 // model/effort only to override. Concurrency is capped intrinsically: 4 Codex jobs
 // per workflow, an astra job counting as 2 — do not wrap calls in another gate.
-const UCX_VERSION = '0.3.0'
+const UCX_VERSION = '0.3.1'
 const UCX_RELAY = 'ultracodex:codex-relay'
 const UCX_TIER_MODEL = { light: 'gpt-6-luna', daily: 'gpt-6-sol', final: 'gpt-6-astra' }
 const UCX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
