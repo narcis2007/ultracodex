@@ -138,10 +138,10 @@ if (gated.length) {
 phase('Synthesize')
 const report = await agent(`Write a code-review report for ${TARGET}${WHERE}.${ucxWhere(CWD)}
 ${failedDims.length ? 'At the very top, state that these dimensions were NOT reviewed (their finder failed): ' + JSON.stringify(failedDims.map(x => ({ dimension: x.dimension, why: x.failed }))) : ''}
-${gate.failed ? 'At the top, state that the gpt-6-astra final gate FAILED for ' + gate.failed + ' finding(s) (those with finalGate.error): they are confirmed by gpt-6-sol only, and the review is incomplete.' : ''}
-CONFIRMED findings (a second model family could not refute them; finalGate, when present, is gpt-6-astra's verdict on top of gpt-6-sol's) — rank by severity, give file:line, the failure scenario and a fix:
+${gate.failed ? 'At the top, state that the gpt-6-astra final gate FAILED for ' + gate.failed + ' finding(s) (those with finalGate.error): they are confirmed by gpt-6.1-sol only, and the review is incomplete.' : ''}
+CONFIRMED findings (a second model family could not refute them; finalGate, when present, is gpt-6-astra's verdict on top of gpt-6.1-sol's) — rank by severity, give file:line, the failure scenario and a fix:
 ${JSON.stringify(confirmed)}
-${disputed.length ? 'DISPUTED findings (gpt-6-sol confirmed them, the gpt-6-astra final gate refuted them — present both reasonings and say the owner must decide):\n' + JSON.stringify(disputed.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, severity: f.severity, sol: f.verdict.reasoning, astra: f.finalGate.reasoning }))) : ''}
+${disputed.length ? 'DISPUTED findings (gpt-6.1-sol confirmed them, the gpt-6-astra final gate refuted them — present both reasonings and say the owner must decide):\n' + JSON.stringify(disputed.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, severity: f.severity, sol: f.verdict.reasoning, astra: f.finalGate.reasoning }))) : ''}
 UNVERIFIED findings (the Codex verifier failed — state this plainly at the top; they are neither confirmed nor refuted):
 ${JSON.stringify(part.unverified.map(f => ({ id: f.id, title: f.title, file: f.file, why: f.verdict && f.verdict.kind })))}
 REFUTED count: ${part.refuted.length} (list their titles briefly at the end).`, { label: 'synthesize', phase: 'Synthesize', agentType: UCX_READER })

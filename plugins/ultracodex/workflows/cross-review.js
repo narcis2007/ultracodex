@@ -12,7 +12,7 @@ export const meta = {
 
 // Generated from tools/src/workflows/cross-review.js — edit the source, then `npm run build`.
 
-// ── ultracodex helper v0.3.3 ───────────────────────────────────────────────────
+// ── ultracodex helper v0.3.6 ───────────────────────────────────────────────────
 // Generated from tools/src/helper.js in the ultracodex repo — edit the source, then
 // `npm run build`. Needs the ultracodex plugin (its `codex-relay`, `codex-key` and
 // `codex-reader` agents + runner).
@@ -23,13 +23,13 @@ export const meta = {
 //   • the final text when there is no schema;
 //   • or { _codex_error: true, kind, message, retryable, runId } — "no data", never a
 //     pass or a refutation. Test with isCodexError(x) before using a result.
-// Routing (runner policy): tier 'light' → gpt-6-luna@max · 'daily' → gpt-6-sol
-// (xhigh for kind 'verify', max otherwise) · 'final' → gpt-6-astra@max. Pin
-// model/effort only to override. Concurrency is capped intrinsically: 4 Codex jobs
+// Routing (runner policy): tier 'light' → gpt-6-luna@max · 'daily' → gpt-6.1-sol@xhigh
+// for every kind · 'final' → gpt-6-astra@max for exceptional critical work. Pin
+// model/effort only to override with a reason. Concurrency is capped intrinsically: 4 Codex jobs
 // per workflow, an astra job counting as 2 — do not wrap calls in another gate.
-const UCX_VERSION = '0.3.3'
+const UCX_VERSION = '0.3.6'
 const UCX_RELAY = 'ultracodex:codex-relay'
-const UCX_TIER_MODEL = { light: 'gpt-6-luna', daily: 'gpt-6-sol', final: 'gpt-6-astra' }
+const UCX_TIER_MODEL = { light: 'gpt-6-luna', daily: 'gpt-6.1-sol', final: 'gpt-6-astra' }
 const UCX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
 const UCX_KINDS = ['verify', 'ask', 'review']
 const UCX_PRESETS = ['verdict', 'score', 'review', 'implement']
@@ -436,10 +436,12 @@ function codexNode(task, opts = {}) {
   const schemaText = schema ? JSON.stringify(schema) : 'null'
   // Panel labels: these agents are Claude relays (Sonnet) carrying the job to Codex — the label
   // names the Codex model that does the work, so the panel does not read as a Claude review.
-  const target = (model || UCX_TIER_MODEL[tier]).replace('gpt-6-', '') + '@' +
-    (effort || (tier === 'daily' && kind === 'verify' ? 'xhigh' : 'max'))
+  const targetModel = model || UCX_TIER_MODEL[tier]
+  const targetTier = Object.keys(UCX_TIER_MODEL).find(t => UCX_TIER_MODEL[t] === targetModel) || tier
+  const target = targetModel.replace(/^gpt-6(?:\.(\d+))?-/, (_, minor) => minor ? '6.' + minor + '-' : '') + '@' +
+    (effort || (targetTier === 'daily' ? 'xhigh' : 'max'))
   const relayLabel = 'relay → ' + (label || 'codex') + ' (' + target + ')'
-  const weight = (model || UCX_TIER_MODEL[tier]) === 'gpt-6-astra' ? 2 : 1
+  const weight = targetModel === 'gpt-6-astra' ? 2 : 1
   // agent() may reject (runtime error, exhausted budget): that is a failed node, never a vanished one.
   const call = async (prompt, callOpts) => {
     try { return await agent(prompt, callOpts) } catch (e) { return { __ucxRejected: String((e && e.message) || e) } }
@@ -686,10 +688,10 @@ if (gated.length) {
 phase('Synthesize')
 const report = await agent(`Write a code-review report for ${TARGET}${WHERE}.${ucxWhere(CWD)}
 ${failedDims.length ? 'At the very top, state that these dimensions were NOT reviewed (their finder failed): ' + JSON.stringify(failedDims.map(x => ({ dimension: x.dimension, why: x.failed }))) : ''}
-${gate.failed ? 'At the top, state that the gpt-6-astra final gate FAILED for ' + gate.failed + ' finding(s) (those with finalGate.error): they are confirmed by gpt-6-sol only, and the review is incomplete.' : ''}
-CONFIRMED findings (a second model family could not refute them; finalGate, when present, is gpt-6-astra's verdict on top of gpt-6-sol's) — rank by severity, give file:line, the failure scenario and a fix:
+${gate.failed ? 'At the top, state that the gpt-6-astra final gate FAILED for ' + gate.failed + ' finding(s) (those with finalGate.error): they are confirmed by gpt-6.1-sol only, and the review is incomplete.' : ''}
+CONFIRMED findings (a second model family could not refute them; finalGate, when present, is gpt-6-astra's verdict on top of gpt-6.1-sol's) — rank by severity, give file:line, the failure scenario and a fix:
 ${JSON.stringify(confirmed)}
-${disputed.length ? 'DISPUTED findings (gpt-6-sol confirmed them, the gpt-6-astra final gate refuted them — present both reasonings and say the owner must decide):\n' + JSON.stringify(disputed.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, severity: f.severity, sol: f.verdict.reasoning, astra: f.finalGate.reasoning }))) : ''}
+${disputed.length ? 'DISPUTED findings (gpt-6.1-sol confirmed them, the gpt-6-astra final gate refuted them — present both reasonings and say the owner must decide):\n' + JSON.stringify(disputed.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, severity: f.severity, sol: f.verdict.reasoning, astra: f.finalGate.reasoning }))) : ''}
 UNVERIFIED findings (the Codex verifier failed — state this plainly at the top; they are neither confirmed nor refuted):
 ${JSON.stringify(part.unverified.map(f => ({ id: f.id, title: f.title, file: f.file, why: f.verdict && f.verdict.kind })))}
 REFUTED count: ${part.refuted.length} (list their titles briefly at the end).`, { label: 'synthesize', phase: 'Synthesize', agentType: UCX_READER })

@@ -1,6 +1,6 @@
 export const meta = {
   name: 'codex-review',
-  description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude; high/critical disagreements go to astra@max. Daily tier sol@max, final gate astra@max. Fails closed.',
+  description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude; high/critical disagreements go to astra@max. Defaults to 6.1-sol@xhigh, security lens to astra@max; an explicit tier overrides every lens. Fails closed.',
   whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: light|daily|final, context, lessons, triage, escalate, fast }',
   phases: [
     { title: 'Review', detail: 'one Codex review per lens (read-only, hermetic)' },
@@ -14,10 +14,9 @@ export const meta = {
 
 const A = args || {}
 const CWD = A.cwd || null
+const EXPLICIT_TIER = ['light', 'daily', 'final'].includes(A.tier)
 const TIER = A.tier === 'final' ? 'final' : A.tier === 'light' ? 'light' : 'daily'
 const TRIAGE = A.triage !== false
-// Escalate disagreements, astra last (off with escalate: false; moot when astra reviewed)
-const ESCALATE = TRIAGE && TIER !== 'final' && A.escalate !== false
 // fast: true → the Fast service tier for the astra nodes only (more usage, less waiting)
 const FAST = A.fast === true ? { serviceTier: 'priority' } : {}
 const CONTEXT = A.context ? '\nWHAT THE CHANGE IS FOR / DOMAIN RULES (from the owner):\n' + A.context : ''
@@ -37,6 +36,10 @@ const LENSES = {
 }
 const lensKeys = (Array.isArray(A.lenses) && A.lenses.length ? A.lenses : ['code', 'domain']).filter(k => LENSES[k])
 if (!lensKeys.length) throw new Error('codex-review: no known lens in args.lenses (use code, domain, security, tests, performance)')
+// Reserve Astra for the security lens by default; the owner's explicit tier always wins.
+const lensTier = key => !EXPLICIT_TIER && key === 'security' ? 'final' : TIER
+// Only findings from non-Astra lenses can need an Astra tiebreak.
+const ESCALATE = TRIAGE && A.escalate !== false && lensKeys.some(key => lensTier(key) !== 'final')
 
 const lensTask = key => `You are reviewing ${SCOPE} in your working directory. Be adversarial and concrete.
 ${LENSES[key]}
@@ -60,13 +63,14 @@ const TRIAGE_SEVERITY = `Then rate its severity yourself (critical / high / medi
 phase('Review')
 const lensResults = await pipeline(
   lensKeys,
-  key => codexNode(lensTask(key), { schemaPreset: 'review', tier: TIER, kind: 'review', cwd: CWD || undefined, label: 'codex:' + key, phase: 'Review', ...(TIER === 'final' ? FAST : {}) }),
+  key => codexNode(lensTask(key), { schemaPreset: 'review', tier: lensTier(key), kind: 'review', cwd: CWD || undefined, label: 'codex:' + key, phase: 'Review', ...(lensTier(key) === 'final' ? FAST : {}) }),
   async (review, key) => {
-    if (isCodexError(review)) return { lens: key, error: review, findings: [] }
+    const tier = lensTier(key)
+    if (isCodexError(review)) return { lens: key, tier, error: review, findings: [] }
     // Positional ids: Codex-chosen ids can collide or be empty, and must never cost a
     // finding (or break the escalation batch). Codex's own id is kept as sourceId.
     const findings = (review.findings || []).map((f, i) => ({ ...f, sourceId: f.id, id: key + ':' + (i + 1), lens: key }))
-    if (!TRIAGE) return { lens: key, verdict: review.verdict, summary: review.summary, findings }
+    if (!TRIAGE) return { lens: key, tier, verdict: review.verdict, summary: review.summary, findings }
     // A triage that fails keeps its finding, as needs_info — it is never dropped.
     const failedTriage = reason => ({ verdict: 'needs_info', reasoning: 'Claude triage failed (' + reason + ') — check this finding by hand', failed: true })
     const triaged = await parallel(findings.map(f => () =>
@@ -75,12 +79,12 @@ Decide: "confirmed" (the defect is real and the failure scenario is reachable), 
 ${TRIAGE_SEVERITY}
 FINDING (JSON): ${JSON.stringify(f)}`, { label: 'triage:' + f.id, phase: 'Triage', schema: TRIAGE_SCHEMA, agentType: UCX_READER })
         .then(t => ({ ...f, triage: t || failedTriage('no answer') }), e => ({ ...f, triage: failedTriage(String((e && e.message) || e)) }))))
-    return { lens: key, verdict: review.verdict, summary: review.summary, findings: findings.map((f, i) => triaged[i] || { ...f, triage: failedTriage('stage failed') }) }
+    return { lens: key, tier, verdict: review.verdict, summary: review.summary, findings: findings.map((f, i) => triaged[i] || { ...f, triage: failedTriage('stage failed') }) }
   },
 )
 
 // Every requested lens is accounted for: a lens whose stage died is a failed lens.
-const lenses = lensKeys.map((key, i) => lensResults[i] || { lens: key, error: ucxError('stage_failed', 'the review stage for this lens failed'), findings: [] })
+const lenses = lensKeys.map((key, i) => lensResults[i] || { lens: key, tier: lensTier(key), error: ucxError('stage_failed', 'the review stage for this lens failed'), findings: [] })
 const failedLenses = lenses.filter(l => l.error)
 const findings = lenses.flatMap(l => l.findings)
 const failedTriages = findings.filter(f => f.triage && f.triage.failed)
@@ -93,7 +97,7 @@ if (failedLenses.length) log('⚠ ' + failedLenses.length + '/' + lensKeys.lengt
 // and the review incomplete.
 const escalation = { ran: false, checked: 0, upheld: 0, settled: 0, failed: 0 }
 const contested = ESCALATE
-  ? findings.filter(f => ['critical', 'high'].includes(f.severity) && f.triage && ['refuted', 'needs_info'].includes(f.triage.verdict))
+  ? lenses.filter(l => l.tier !== 'final').flatMap(l => l.findings).filter(f => ['critical', 'high'].includes(f.severity) && f.triage && ['refuted', 'needs_info'].includes(f.triage.verdict))
   : []
 if (contested.length) {
   phase('Escalate')
@@ -149,7 +153,7 @@ const severityChanges = confirmedRated.filter(f => f.severity !== f.codexSeverit
 phase('Report')
 const report = await agent(`Write the final review report for ${SCOPE}${CWD ? ' in ' + CWD : ''}.${ucxWhere(CWD)}
 ${failedLenses.length ? 'At the very top, state that these lenses FAILED and were not reviewed: ' + JSON.stringify(failedLenses.map(l => ({ lens: l.lens, error: l.error.kind, message: l.error.message }))) : ''}
-Per-lens Codex verdicts: ${JSON.stringify(lenses.filter(l => !l.error).map(l => ({ lens: l.lens, verdict: l.verdict, summary: l.summary })))}
+Per-lens Codex verdicts (include the model used for each lens): ${JSON.stringify(lenses.filter(l => !l.error).map(l => ({ lens: l.lens, tier: l.tier, model: UCX_TIER_MODEL[l.tier], verdict: l.verdict, summary: l.summary })))}
 CONFIRMED findings, ranked by "severity" — Claude's own rating after checking the code; "codexSeverity" is what Codex said. Where they differ, show "Codex: <codexSeverity> → <severity>" with the severityReason. For each: file:line, failure scenario, fix: ${JSON.stringify(confirmedRated)}
 ${disputed.length ? 'DISPUTED findings (Claude doubted them, the gpt-6-astra escalation upheld them — present both sides and say the owner must decide): ' + JSON.stringify(disputed.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, severity: f.severity, claude: f.triage.reasoning, astra: f.escalation.reasoning }))) : ''}
 ${untriaged.length ? 'UNTRIAGED Codex findings (triage was off — present them as unverified claims, not as confirmed defects): ' + JSON.stringify(untriaged) : ''}
@@ -164,7 +168,7 @@ return {
   status: failedLenses.length || failedTriages.length || escalation.failed ? 'incomplete' : 'complete',
   tier: TIER,
   report,
-  lenses: lenses.map(l => ({ lens: l.lens, verdict: l.verdict || null, error: l.error ? l.error.kind : null })),
+  lenses: lenses.map(l => ({ lens: l.lens, tier: l.tier, model: UCX_TIER_MODEL[l.tier], verdict: l.verdict || null, error: l.error ? l.error.kind : null })),
   confirmed: confirmedRated, severityChanges, disputed, needsInfo, untriaged,
   refuted: refuted.map(f => ({ id: f.id, title: f.title, why: whyRefuted(f) })),
   escalation: ESCALATE ? escalation : null,

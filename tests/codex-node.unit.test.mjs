@@ -12,6 +12,7 @@ const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url)); // import.meta.d
 import {
   FRAME_SCHEMA_MARK,
   FRAME_TASK_MARK,
+  KINDS,
   MAX_TIMEOUT_SEC,
   PAGED_THRESHOLD,
   PAGE_CHARS,
@@ -62,7 +63,7 @@ const CATALOG = {
   fetchedAt: new Date().toISOString(),
   models: [
     { slug: "gpt-6-astra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
-    { slug: "gpt-6-sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { slug: "gpt-6.1-sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { slug: "gpt-6-luna", efforts: ["low", "medium", "high", "xhigh", "max"] },
   ],
 };
@@ -154,15 +155,19 @@ test("validateValue enforces types, enums, required, extras, items and anyOf", (
 
 test("policy follows the owner's routing rule", () => {
   assert.equal(POLICY.models.light, "gpt-6-luna");
-  assert.equal(POLICY.models.daily, "gpt-6-sol");
+  assert.equal(POLICY.models.daily, "gpt-6.1-sol");
   assert.equal(POLICY.models.final, "gpt-6-astra");
   for (const row of policyTable()) {
     if (row.model === "gpt-6-luna") assert.equal(row.effort, "max", "luna is always max");
     if (row.model === "gpt-6-astra") assert.equal(row.effort, "max");
-    if (row.model === "gpt-6-sol") assert.equal(row.effort, row.kind === "verify" ? "xhigh" : "max");
+    if (row.model === "gpt-6.1-sol") assert.equal(row.effort, "xhigh", "Sol defaults to xhigh for every workload");
     assert.notEqual(row.effort, "ultra", "ultra is never implicit");
   }
   assert.equal(resolvePolicy({ model: "gpt-6-luna", kind: "verify" }).effort, "max", "an explicit luna still defaults to max");
+  for (const kind of KINDS) {
+    assert.equal(resolvePolicy({ tier: "final", model: "gpt-6.1-sol", kind }).effort, "xhigh", "an explicit Sol uses its own effort defaults");
+    assert.equal(resolvePolicy({ tier: "daily", kind, effort: "max" }).effort, "max", "an exceptional explicit max override is preserved");
+  }
   assert.equal(resolvePolicy({ tier: "final", kind: "review" }).weight, 2);
   assert.equal(computeDeadlineSec("gpt-6-astra", "max", "implement"), 8100);
   assert.equal(computeDeadlineSec("gpt-6-luna", "max", "verify"), 750);
@@ -172,7 +177,7 @@ test("validateRequest applies defaults and rejects what codex would reject later
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-req-"));
   t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
   const request = validateRequest({ task: "check it", cwd, schemaPreset: "verdict", kind: "verify" }, { catalog: CATALOG });
-  assert.equal(request.model, "gpt-6-sol");
+  assert.equal(request.model, "gpt-6.1-sol");
   assert.equal(request.effort, "xhigh");
   assert.equal(request.hermetic, true);
   assert.equal(request.ephemeral, true);
@@ -181,7 +186,7 @@ test("validateRequest applies defaults and rejects what codex would reject later
 
   const implement = validateRequest({ task: "build it", cwd, sandbox: "workspace-write" }, { catalog: CATALOG });
   assert.equal(implement.kind, "implement");
-  assert.equal(implement.effort, "max");
+  assert.equal(implement.effort, "xhigh");
   assert.equal(implement.ephemeral, false, "implementation sessions stay resumable");
 
   const reject = (raw, kind, pattern) => {
@@ -593,7 +598,7 @@ test("buildCodexArgs: hermetic read-only exec carries the Windows sandbox and re
     task: "t",
     sandbox: "read-only",
     cwd: "C:/repo",
-    model: "gpt-6-sol",
+    model: "gpt-6.1-sol",
     effort: "xhigh",
     ephemeral: true,
     hermetic: true,
@@ -615,7 +620,7 @@ test("buildCodexArgs: hermetic read-only exec carries the Windows sandbox and re
     "-o",
     "L",
     "-m",
-    "gpt-6-sol",
+    "gpt-6.1-sol",
     "-c",
     'model_reasoning_effort="xhigh"',
     "--output-schema",
@@ -663,7 +668,7 @@ test("buildCodexArgs: review and resume modes use their own flag sets", () => {
     task: "",
     sandbox: "read-only",
     cwd: "/repo",
-    model: "gpt-6-sol",
+    model: "gpt-6.1-sol",
     effort: "max",
     ephemeral: true,
     hermetic: true,

@@ -3,7 +3,7 @@ export const meta = {
   description: 'Several Claude approaches plus one Codex approach, scored by a Claude+Codex jury; only candidates judged by the other model family are ranked. Claude synthesizes.',
   whenToUse: 'Design decisions with a wide solution space. args: { problem, angles: [{key, prompt}], cwd, codexCandidate }',
   phases: [
-    { title: 'Generate', detail: 'Claude angles + one Codex candidate (sol@max)' },
+    { title: 'Generate', detail: 'Claude angles + one Codex candidate (sol@xhigh)' },
     { title: 'Judge', detail: 'each candidate scored by a Claude juror and a Codex juror (sol@xhigh)' },
     { title: 'Synthesize', detail: 'winner plus the best ideas of the runners-up' },
   ],
@@ -11,7 +11,7 @@ export const meta = {
 
 // Generated from tools/src/workflows/judge-panel.js — edit the source, then `npm run build`.
 
-// ── ultracodex helper v0.3.3 ───────────────────────────────────────────────────
+// ── ultracodex helper v0.3.6 ───────────────────────────────────────────────────
 // Generated from tools/src/helper.js in the ultracodex repo — edit the source, then
 // `npm run build`. Needs the ultracodex plugin (its `codex-relay`, `codex-key` and
 // `codex-reader` agents + runner).
@@ -22,13 +22,13 @@ export const meta = {
 //   • the final text when there is no schema;
 //   • or { _codex_error: true, kind, message, retryable, runId } — "no data", never a
 //     pass or a refutation. Test with isCodexError(x) before using a result.
-// Routing (runner policy): tier 'light' → gpt-6-luna@max · 'daily' → gpt-6-sol
-// (xhigh for kind 'verify', max otherwise) · 'final' → gpt-6-astra@max. Pin
-// model/effort only to override. Concurrency is capped intrinsically: 4 Codex jobs
+// Routing (runner policy): tier 'light' → gpt-6-luna@max · 'daily' → gpt-6.1-sol@xhigh
+// for every kind · 'final' → gpt-6-astra@max for exceptional critical work. Pin
+// model/effort only to override with a reason. Concurrency is capped intrinsically: 4 Codex jobs
 // per workflow, an astra job counting as 2 — do not wrap calls in another gate.
-const UCX_VERSION = '0.3.3'
+const UCX_VERSION = '0.3.6'
 const UCX_RELAY = 'ultracodex:codex-relay'
-const UCX_TIER_MODEL = { light: 'gpt-6-luna', daily: 'gpt-6-sol', final: 'gpt-6-astra' }
+const UCX_TIER_MODEL = { light: 'gpt-6-luna', daily: 'gpt-6.1-sol', final: 'gpt-6-astra' }
 const UCX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
 const UCX_KINDS = ['verify', 'ask', 'review']
 const UCX_PRESETS = ['verdict', 'score', 'review', 'implement']
@@ -435,10 +435,12 @@ function codexNode(task, opts = {}) {
   const schemaText = schema ? JSON.stringify(schema) : 'null'
   // Panel labels: these agents are Claude relays (Sonnet) carrying the job to Codex — the label
   // names the Codex model that does the work, so the panel does not read as a Claude review.
-  const target = (model || UCX_TIER_MODEL[tier]).replace('gpt-6-', '') + '@' +
-    (effort || (tier === 'daily' && kind === 'verify' ? 'xhigh' : 'max'))
+  const targetModel = model || UCX_TIER_MODEL[tier]
+  const targetTier = Object.keys(UCX_TIER_MODEL).find(t => UCX_TIER_MODEL[t] === targetModel) || tier
+  const target = targetModel.replace(/^gpt-6(?:\.(\d+))?-/, (_, minor) => minor ? '6.' + minor + '-' : '') + '@' +
+    (effort || (targetTier === 'daily' ? 'xhigh' : 'max'))
   const relayLabel = 'relay → ' + (label || 'codex') + ' (' + target + ')'
-  const weight = (model || UCX_TIER_MODEL[tier]) === 'gpt-6-astra' ? 2 : 1
+  const weight = targetModel === 'gpt-6-astra' ? 2 : 1
   // agent() may reject (runtime error, exhausted budget): that is a failed node, never a vanished one.
   const call = async (prompt, callOpts) => {
     try { return await agent(prompt, callOpts) } catch (e) { return { __ucxRejected: String((e && e.message) || e) } }

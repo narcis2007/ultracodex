@@ -3,7 +3,7 @@ export const meta = {
   description: 'Several Claude approaches plus one Codex approach, scored by a Claude+Codex jury; only candidates judged by the other model family are ranked. Claude synthesizes.',
   whenToUse: 'Design decisions with a wide solution space. args: { problem, angles: [{key, prompt}], cwd, codexCandidate }',
   phases: [
-    { title: 'Generate', detail: 'Claude angles + one Codex candidate (sol@max)' },
+    { title: 'Generate', detail: 'Claude angles + one Codex candidate (sol@xhigh)' },
     { title: 'Judge', detail: 'each candidate scored by a Claude juror and a Codex juror (sol@xhigh)' },
     { title: 'Synthesize', detail: 'winner plus the best ideas of the runners-up' },
   ],

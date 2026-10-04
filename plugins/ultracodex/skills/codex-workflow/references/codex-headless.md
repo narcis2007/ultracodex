@@ -202,7 +202,7 @@ only when a job genuinely needs the user's config.
 | slug | efforts | note |
 | --- | --- | --- |
 | `gpt-6-astra` | low · medium · high · xhigh · max · ultra | frontier; Fast tier 2× |
-| `gpt-6-sol` | low · medium · high · xhigh · max · ultra | workhorse |
+| `gpt-6.1-sol` | low · medium · high · xhigh · max · ultra | workhorse |
 | `gpt-6-luna` | low · medium · high · xhigh · max | easier tasks; `ultra` is silently accepted by the CLI — the runner refuses it |
 | `gpt-5.6-sol/terra/luna` | as above | "older" |
 | `gpt-5.5` | low…xhigh | retires 2026-10-14 |

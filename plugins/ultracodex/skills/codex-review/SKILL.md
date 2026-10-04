@@ -6,8 +6,8 @@ description: >-
   every finding then verified by Claude in the code before it is reported. Use when the user
   asks for a Codex review, a second-model / cross-model / adversarial review, "have codex
   review this", "review with astra / sol / luna", a final review gate before merge or deploy,
-  or a specific review lens. Day-to-day reviews run on gpt-6-sol@max, the final gate on
-  gpt-6-astra@max, a quick sanity pass on gpt-6-luna@max.
+  or a specific review lens. Routine reviews run on gpt-6.1-sol@xhigh, security and final
+  critical reviews on gpt-6-astra@max, a quick sanity pass on gpt-6-luna@max.
 ---
 
 # Codex adversarial review
@@ -24,7 +24,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" preflight
 Settle before starting: the repo (absolute path), the scope (`base` branch, one `commit`, or
 `uncommitted`), the lenses (default `code` + `domain`), and the tier:
 
-- `daily` → gpt-6-sol@max — the normal review of a change;
+- `daily` → gpt-6.1-sol@xhigh — the normal review of a change;
 - `final` → gpt-6-astra@max — "at the end": the last gate before merge/deploy, and any change
   touching security, money, concurrency, data migrations or irreversible external effects;
 - `light` → gpt-6-luna@max — a quick pass on a small or mechanical change.
@@ -34,9 +34,17 @@ When the owner named no tier, pick it from the change itself — measure it firs
 
 - **`final`** if it touches security, auth, money, concurrency, data migrations or
   irreversible external effects, or it is the last gate before a merge/deploy — whatever its size;
-- else **`light`** if it is small (about 50 changed lines or fewer, in at most 3 files) or
-  mechanical (docs, comments, renames, formatting, config values, test scaffolding only);
-- else **`daily`**.
+- else **`light`** if no security lens was requested and the change is either small (about
+  50 changed lines or fewer, in at most 3 files) or mechanical (docs, comments, renames,
+  formatting, config values, test scaffolding only);
+- else **omit `tier`**: the workflow uses `daily` on ordinary lenses and `final` on `security`.
+
+An explicit owner-selected tier applies to every lens, including security. For a critical
+final gate, pass `tier: 'final'` so Astra reviews every requested lens.
+
+Keep routine Sol reviews at `xhigh`, including large diffs. Use Sol at `max` only as an
+explicit request-field override in a direct run or `codexNode` call for an exceptional
+unresolved problem after an `xhigh` attempt, or at the owner's request; state the reason.
 
 Say which tier you picked and why in one line, so the owner can override it ("use sol",
 "use astra").
@@ -49,16 +57,21 @@ keep. If the project keeps a recurring-defects checklist (e.g. `REVIEW_LESSONS.m
 
 ```
 Workflow({ name: 'ultracodex:codex-review', args: {
-  cwd: '<abs repo path>', base: 'main', lenses: ['code', 'domain'], tier: 'daily',
+  cwd: '<abs repo path>', base: 'main', lenses: ['code', 'domain'],
   context: '<what the change is for>', lessons: '<abs path or omit>' } })
 ```
+
+Add `tier` when selected above or explicitly requested by the owner. With no tier, ordinary
+lenses use Sol 6.1 and the security lens uses Astra; `lenses[].tier` and `lenses[].model` record
+the model used, including failed lenses.
 
 It runs one Codex review per lens (hermetic, read-only, astra ≤2 at a time), has Claude check
 every finding in the code (confirmed / refuted / needs-info) and rate its severity itself —
 Codex tends to rate findings above their real impact, so the ranking and the verdict follow
 Claude's rating, with every change listed (`severityChanges`) — sends the high/critical findings
-Claude refuted or could not settle to gpt-6-astra in one run (`escalate`, default on below the
-final tier) and writes the report. A lens that failed makes the result `incomplete` — say
+Claude refuted or could not settle to gpt-6-astra in one run (`escalate`, default on for findings
+from non-Astra lenses) and writes the report. Astra findings are not sent to Astra again.
+A lens that failed makes the result `incomplete` — say
 which lens and why. **Disputed** findings (Claude doubted them, astra upheld them) go to the
 owner with both reasonings. Mention `codexUsage` (runs and tokens per model) in the summary.
 
@@ -80,7 +93,9 @@ backslashes break Bash commands on Windows):
 
 The brief = the lens text from `references/lenses.md` + the scope sentence ("Review the changes
 on the current branch against main: `git diff main...HEAD`, plus uncommitted changes") + context
-+ lessons. Then:
++ lessons. Set the request's tier per lens: `final` for security, `daily` for routine lenses,
+or `light` when selected above. An explicit owner-selected tier or final critical gate
+overrides that choice. Then:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" start --request "<request.json>"
@@ -107,7 +122,7 @@ itself (`escalate`).
 
 Confirmed findings ranked by your severity (file:line, failure scenario, fix; Codex's rating
 beside it where you changed it), then needs-info, then a one-line list of refuted ones;
-per-lens verdicts; the tier used; an overall line that follows your ratings: do not ship for a
+per-lens verdicts and models used; an overall line that follows your ratings: do not ship for a
 confirmed critical/high (or one still unresolved), ship after fixes when the worst is medium,
 ship when only low ones remain. If any lens failed, the review is **incomplete** —
 say so first. Do not merge anything on the strength of the review alone; the owner decides.

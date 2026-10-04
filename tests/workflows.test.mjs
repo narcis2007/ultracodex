@@ -53,7 +53,7 @@ const withKey = (agent) => async (prompt, opts) => {
 const CATALOG = {
   models: [
     { slug: "gpt-6-astra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
-    { slug: "gpt-6-sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { slug: "gpt-6.1-sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { slug: "gpt-6-luna", efforts: ["low", "medium", "high", "xhigh", "max"] },
   ],
 };
@@ -232,6 +232,34 @@ test("codexNode frames hostile text byte-exactly through parts the runner accept
   assert.equal(seen.request.effort, "max");
   assert.ok(seen.request.task.includes("C:" + bs + "Users" + bs + "x"), "backslashes survive");
   assert.ok(seen.request.task.includes(String.fromCharCode(0x2028)), "invisible characters survive");
+});
+
+test("relay labels match runner effort defaults and explicit model/effort overrides", async () => {
+  const routes = [
+    ...["verify", "ask", "review"].flatMap(kind => [
+      [{ tier: "daily", kind }, "gpt-6.1-sol", "xhigh", "6.1-sol"],
+      [{ tier: "light", kind }, "gpt-6-luna", "max", "luna"],
+      [{ tier: "final", kind }, "gpt-6-astra", "max", "astra"],
+    ]),
+    [{ tier: "daily", kind: "ask", effort: "max" }, "gpt-6.1-sol", "max", "6.1-sol"],
+    [{ tier: "final", model: "gpt-6.1-sol", kind: "review" }, "gpt-6.1-sol", "xhigh", "6.1-sol"],
+    [{ tier: "daily", model: "gpt-6-astra", kind: "ask" }, "gpt-6-astra", "max", "astra"],
+    [{ tier: "daily", model: "gpt-6-luna", kind: "verify" }, "gpt-6-luna", "max", "luna"],
+  ];
+  for (const [opts, model, effort, displayModel] of routes) {
+    const agent = async (prompt, callOpts) => {
+      const { request } = receive(prompt);
+      assert.equal(request.model, model);
+      assert.equal(request.effort, effort);
+      assert.ok(callOpts.label.endsWith(`(${displayModel}@${effort})`), callOpts.label);
+      return okEnvelope(request, { refuted: false, confidence: 1, reasoning: "checked" });
+    };
+    const result = await runHelper([
+      `return codexNode('check routing', { schemaPreset: 'verdict', ...${JSON.stringify(opts)} })`,
+    ], agent);
+    assert.equal(result._codex.model, model);
+    assert.equal(result._codex.effort, effort);
+  }
 });
 
 test("a corrupted upload is retried once by an opus relay", async () => {
@@ -619,7 +647,7 @@ test("batch nodes declare their size, workflow nodes get a 15-minute orphan wind
   assert.equal(single.workItems, 1);
   assert.ok(batch.timeoutSec > validateRequest({ task: "x", kind: "verify", tier: "daily" }, { catalog: CATALOG }).timeoutSec, "a batch gets a longer deadline");
   assert.equal(batch.orphanAfterSec, 900);
-  assert.deepEqual(usage["gpt-6-sol"], { runs: 1, failed: 0, input_tokens: 100, cached_input_tokens: 0, output_tokens: 7, reasoning_output_tokens: 0 });
+  assert.deepEqual(usage["gpt-6.1-sol"], { runs: 1, failed: 0, input_tokens: 100, cached_input_tokens: 0, output_tokens: 7, reasoning_output_tokens: 0 });
   assert.deepEqual([usage["gpt-6-astra"].runs, usage["gpt-6-astra"].failed, usage["gpt-6-astra"].output_tokens], [2, 1, 7], "a run killed mid-turn counts, with no tokens");
   assert.deepEqual(usage["gpt-6-luna"], { runs: 1, failed: 1, input_tokens: 50, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0 });
 });
@@ -655,7 +683,7 @@ test("cross-review partitions fail-closed and keeps unverified findings visible"
         assert.equal(request.effort, "max");
         return okEnvelope(request, { results: [{ id: "correctness:1", refuted: false, confidence: 0.95, reasoning: "astra agrees" }] });
       }
-      assert.equal(request.model, "gpt-6-sol");
+      assert.equal(request.model, "gpt-6.1-sol");
       assert.equal(request.effort, "xhigh");
       return okEnvelope(request, {
         results: [
@@ -678,7 +706,7 @@ test("cross-review partitions fail-closed and keeps unverified findings visible"
   assert.deepEqual(result.unverified.map((f) => [f.id, f.error]), [["security:1", "rate_limit"]]);
   assert.ok(logs.some((line) => line.includes("UNVERIFIED")));
   assert.deepEqual(result.finalGate, { ran: true, checked: 1, upheld: 1, disputed: 0, failed: 0 });
-  assert.equal(result.codexUsage["gpt-6-sol"].runs, 1, "the failed security batch reported no usage");
+  assert.equal(result.codexUsage["gpt-6.1-sol"].runs, 1, "the failed security batch reported no usage");
   assert.equal(result.codexUsage["gpt-6-astra"].runs, 1);
 });
 
@@ -738,6 +766,96 @@ test("cross-review: an ambiguous batch answer is unverified and a dead finder ma
   assert.deepEqual(result.confirmed.map((f) => f.id), ["correctness:2"]);
   assert.deepEqual(result.unverified, [{ id: "correctness:1", title: "t1", error: "ambiguous_verdict" }]);
   assert.deepEqual(result.failedDimensions.map((x) => x.dimension), ["security"]);
+});
+
+test("codex-review defaults only the security lens to Astra and reports each model", async () => {
+  const requests = [];
+  let reportPrompt = null;
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      requests.push(request);
+      return okEnvelope(request, { verdict: "approve", summary: "clean", findings: [] });
+    }
+    if (opts.label === "report") {
+      reportPrompt = prompt;
+      return "FINAL";
+    }
+    return null;
+  };
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "security"], fast: true } });
+  assert.equal(result.status, "complete");
+  assert.deepEqual(requests.map(r => [r.label, r.model, r.effort, r.serviceTier]).sort(), [
+    ["codex:code", "gpt-6.1-sol", "xhigh", null],
+    ["codex:security", "gpt-6-astra", "max", "priority"],
+  ]);
+  assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [
+    ["code", "daily", "gpt-6.1-sol"],
+    ["security", "final", "gpt-6-astra"],
+  ]);
+  assert.match(reportPrompt, /"lens":"security","tier":"final","model":"gpt-6-astra"/);
+});
+
+test("codex-review respects explicit daily, light and final tiers for every lens", async () => {
+  for (const [tier, model] of [["daily", "gpt-6.1-sol"], ["light", "gpt-6-luna"], ["final", "gpt-6-astra"]]) {
+    const requests = [];
+    const agent = async (prompt, opts) => {
+      if (opts.agentType === RELAY) {
+        const { request } = receive(prompt);
+        requests.push(request);
+        return okEnvelope(request, { verdict: "approve", summary: "clean", findings: [] });
+      }
+      return opts.label === "report" ? "FINAL" : null;
+    };
+    const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "security"], tier, triage: false } });
+    assert.equal(result.status, "complete");
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests.map(r => r.model), [model, model], tier + " overrides security routing");
+    assert.deepEqual(requests.map(r => r.effort), Array(2).fill(tier === "daily" ? "xhigh" : "max"));
+    assert.deepEqual(result.lenses.map(l => [l.tier, l.model]), [[tier, model], [tier, model]]);
+  }
+});
+
+test("a mixed Codex review escalates only non-Astra findings", async () => {
+  const requests = [];
+  let escalated = null;
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      requests.push(request);
+      if (request.label === "codex:escalate") {
+        escalated = JSON.parse(request.task.slice(request.task.indexOf("INPUT ITEMS (JSON):") + "INPUT ITEMS (JSON):".length));
+        return okEnvelope(request, { results: [{ id: "code:1", refuted: false, confidence: 0.9, reasoning: "reachable" }] });
+      }
+      const finding = { id: "a", severity: "high", category: "c", title: "defect", file: "a.ts", line: 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.8 };
+      return okEnvelope(request, { verdict: "request_changes", summary: "sum", findings: [finding] });
+    }
+    if (opts.label?.startsWith("triage:")) return { verdict: "refuted", reasoning: "guarded" };
+    return opts.label === "report" ? "FINAL" : null;
+  };
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "security"] } });
+  assert.equal(result.status, "complete");
+  assert.equal(requests.length, 3, "two reviews and one narrow tiebreak");
+  assert.deepEqual(escalated.map(f => f.id), ["code:1"], "the security lens was already reviewed by Astra");
+  assert.deepEqual(result.disputed.map(f => f.id), ["code:1"]);
+  assert.deepEqual(result.refuted.map(f => f.id), ["security:1"]);
+});
+
+test("a failed default security lens keeps its Astra routing and reports incomplete", async () => {
+  const requests = [];
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      requests.push(request);
+      return JSON.stringify({ ultracodex: 1, ok: false, state: "timeout", runId: RUN_ID, error: { kind: "timeout", message: "deadline" } });
+    }
+    return opts.label === "report" ? "FINAL" : null;
+  };
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["security"] } });
+  assert.equal(result.status, "incomplete");
+  assert.deepEqual(requests.map(r => r.model), ["gpt-6-astra"]);
+  assert.deepEqual(result.lenses, [{ lens: "security", tier: "final", model: "gpt-6-astra", verdict: null, error: "timeout" }]);
+  assert.equal(result.escalation, null, "no second Astra run for an Astra lens");
 });
 
 test("codex-review keeps a finding whose triage failed, as needs-info, and reports incomplete", async () => {
@@ -810,7 +928,7 @@ test("fast: true puts only the astra nodes on the priority service tier", async 
     return { findings: [] };
   };
   await runWorkflow("cross-review", { agent, args: { dimensions: ["correctness"], fast: true } });
-  assert.deepEqual(seen, [["gpt-6-sol", null], ["gpt-6-astra", "priority"]]);
+  assert.deepEqual(seen, [["gpt-6.1-sol", null], ["gpt-6-astra", "priority"]]);
 });
 
 test("codex-review escalates high/critical disagreements to astra in one run: upheld → DISPUTED, refuted → settled", async () => {
@@ -828,7 +946,7 @@ test("codex-review escalates high/critical disagreements to astra in one run: up
           ],
         });
       }
-      assert.equal(request.model, "gpt-6-sol");
+      assert.equal(request.model, "gpt-6.1-sol");
       // two findings share Codex's id "dup": positional ids keep both
       const f = (id, severity) => ({ id, severity, category: "c", title: "t-" + severity, file: "x.rs", line: 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.7 });
       return okEnvelope(request, { verdict: "request_changes", summary: "sum", findings: [f("dup", "critical"), f("dup", "high"), f("z", "low"), f("y", "high")] });
@@ -925,8 +1043,8 @@ test("codex-review marks a failed lens as incomplete and routes findings through
   const { result } = await runWorkflow("codex-review", { agent, args: { tier: "final", base: "main" } });
   assert.equal(result.status, "incomplete");
   assert.deepEqual(result.lenses, [
-    { lens: "code", verdict: "request_changes", error: null },
-    { lens: "domain", verdict: null, error: "timeout" },
+    { lens: "code", tier: "final", model: "gpt-6-astra", verdict: "request_changes", error: null },
+    { lens: "domain", tier: "final", model: "gpt-6-astra", verdict: null, error: "timeout" },
   ]);
   assert.deepEqual(result.confirmed.map((f) => f.id), ["code:1"]);
   assert.deepEqual(result.refuted.map((f) => f.id), ["code:2"]);
@@ -953,6 +1071,8 @@ test("judge-panel ranks only candidates judged by the other model family", async
   const agent = async (prompt, opts) => {
     if (opts.agentType === RELAY) {
       const { request } = receive(prompt);
+      assert.equal(request.model, "gpt-6.1-sol");
+      assert.equal(request.effort, "xhigh", "both candidate generation and judging use xhigh");
       if (request.label === "gen:codex") return okEnvelope(request, { approach: "codex way", plan: "p", risks: "r" });
       // the Codex juror is down for every candidate
       return JSON.stringify({ ultracodex: 1, ok: false, state: "failed", error: { kind: "server", message: "503" } });

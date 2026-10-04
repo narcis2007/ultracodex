@@ -15,8 +15,14 @@ Codex (GPT-6 via `codex exec`) inside Claude Code.
   `part`/`wait`/`page` commands, the key agent to `key`/`expect` and the reader to read-only
   git; other subagents only lose the runner's `key`/`expect` (the main conversation is untouched).
 
-Tier policy: `light` → gpt-6-luna@max · `daily` → gpt-6-sol (xhigh verify / max) ·
+Tier policy: `light` → gpt-6-luna@max · `daily` → gpt-6.1-sol@xhigh (all workloads) ·
 `final` → gpt-6-astra@max. See `skills/codex-workflow/references/model-policy.md`.
+
+Sol 6.1 implements complex code by default; Astra handles security and final critical review.
+Use Sol at `max` only as an explicit override for an exceptional unresolved problem or
+an owner request, with a stated reason. Task complexity or duration alone does not justify it.
+`codex-review` without `tier` routes ordinary lenses to Sol and `security` to Astra.
+An explicit tier overrides every lens; results name each lens's actual tier and model.
 
 Requires the Codex CLI (logged in) and Node.js 18+. Check with
 `node scripts/codex-node.mjs preflight --pretty`.

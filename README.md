@@ -34,10 +34,18 @@ see [CHANGELOG.md](CHANGELOG.md) for what changed.
 | Tier | Model | For | Effort |
 | --- | --- | --- | --- |
 | `light` | gpt-6-luna | light work: triage, dedupe, mechanical edits, wide fan-outs of small checks | always `max` |
-| `daily` | gpt-6-sol | day-to-day: verification, jurors, second opinions, review lenses, normal implementation | `xhigh` for verify fan-outs, `max` otherwise |
-| `final` | gpt-6-astra | very advanced work and the last word: final review gate, critical code, hard problems | `max` |
+| `daily` | gpt-6.1-sol | implementation including complex code, debugging, architecture analysis, verification, jurors, routine review | `xhigh` for every workload |
+| `final` | gpt-6-astra | security review, final critical review gates, load-bearing verdicts, unresolved issues escalated from Sol | `max` |
 
-Cascade with astra last; `ultra` only on explicit request, once per run. Details:
+Sol 6.1 is the default implementer, including complex modules. Astra reviews security and
+critical changes at the end. In `codex-review`, omitting `tier` uses Sol on ordinary lenses
+and Astra on `security`; an explicit tier applies to every lens. Actual models are reported
+in `lenses[].model`, and Astra findings are not sent to Astra again for a tiebreak.
+
+Prefer Sol 6.1 at `xhigh`, including complex and long tasks. Use Sol at `max` only with an
+explicit effort override for an exceptional unresolved problem or at the owner's request;
+state the reason. Astra at `max` remains reserved for security and critical gates, and
+Luna stays at `max` for light work. `ultra` only on explicit request, once per run. Details:
 [model-policy.md](plugins/ultracodex/skills/codex-workflow/references/model-policy.md).
 
 Cost, in short: ask directly (`codex-ask`) when one answer is enough; batch small items into

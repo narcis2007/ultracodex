@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.6 — 2026-10-01 (fork)
+
+- Prefer `xhigh` for every GPT-6.1 Sol workload: verification, analysis, reviews and
+  implementation, including complex code. Sol at `max` is an explicit exceptional
+  override; Luna remains always at `max`, and Astra at `max` handles critical gates.
+- Align workflow descriptions, relay labels, skills and model-policy guidance with
+  the new defaults. Relay labels also follow explicit model overrides across tiers.
+
+## 0.3.5 — 2026-09-30 (fork)
+
+- Route implementation, including complex modules, debugging and design analysis to
+  Sol 6.1 by default. Reserve Astra for security, final critical review and concrete
+  unresolved issues escalated from Sol; explicit owner-selected tiers still override.
+- `codex-review` without an explicit tier now uses Astra for the security lens and
+  Sol 6.1 for ordinary lenses. Results and the report name each lens's actual tier and
+  model, including failed lenses. Only non-Astra findings can need an Astra tiebreak;
+  `fast: true` continues to apply only to Astra nodes.
+- Document the benchmark evidence behind this routing in the central model policy.
+
+## 0.3.4 — 2026-09-30 (fork)
+
+- Upgrade the `daily` tier from `gpt-6-sol` to `gpt-6.1-sol` across the runner,
+  workflow helper, skills, references and generated workflows. Keep `xhigh` for
+  verification and `max` for ask, review and implementation.
+- Workflow relay labels identify GPT-6.1 Sol explicitly. Luna and Astra keep their
+  existing roles; explicitly selected older Sol models remain supported.
+
 ## 0.3.3 — 2026-09-24 (fork)
 
 - Workflow panel labels name what each agent is: `relay → key`, `relay → announce <node>`,

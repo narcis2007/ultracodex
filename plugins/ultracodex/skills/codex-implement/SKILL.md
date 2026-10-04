@@ -6,8 +6,9 @@ description: >-
   merged — optionally followed by a Codex or cross-model review and Codex follow-up fixes in
   the same session. Use when the user asks to have Codex implement / build / fix / refactor /
   migrate something, "give this to codex", "let codex write it", "use codex as the
-  implementer or subagent", or any implement-then-review combination. Tiers: gpt-6-sol@max by
-  default, gpt-6-astra@max for hard or critical modules, gpt-6-luna@max for mechanical changes.
+  implementer or subagent", or any implement-then-review combination. Tiers: gpt-6.1-sol@xhigh by
+  default, including complex code; gpt-6-astra@max for an explicit escalation or final critical
+  review, gpt-6-luna@max for mechanical changes.
 ---
 
 # Delegate implementation to Codex
@@ -24,10 +25,19 @@ have checked it yourself, and nothing is merged without the owner's OK.
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" preflight
 ```
 
-- `daily` → gpt-6-sol@max: normal features, fixes, refactors from a clear brief;
-- `final` → gpt-6-astra@max: hard or critical code (concurrency, money, security, migrations,
-  cross-module designs) — the expensive, slow, strongest option;
+- `daily` → gpt-6.1-sol@xhigh: features, fixes, debugging, refactors and cross-module designs
+  from a clear brief, including complex implementation;
+- `final` → gpt-6-astra@max: implementation only when the owner explicitly requests Astra,
+  or when a concrete unresolved issue justifies escalation after a Sol attempt;
 - `light` → gpt-6-luna@max: mechanical work (renames, boilerplate, docs, test scaffolding).
+
+Complexity alone does not switch the implementer to Astra. For security, money, concurrency,
+data migrations or irreversible effects, use Sol to implement and Astra for the final critical
+review of the resulting diff, unless the owner chose another model.
+
+Keep Sol at `xhigh`, including long implementations. Set `"effort": "max"` only for an
+exceptional unresolved problem after an `xhigh` attempt or when the owner requests it;
+state the reason. Complexity or duration alone does not justify `max`.
 
 ## 2. Isolate — a worktree outside the repo
 
@@ -70,7 +80,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" start --request "<request.js
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" wait <runId> --max-wait 9000   # run_in_background: true
 ```
 
-`attached: false` lets the run continue while you do other work; the deadline (sol@max ≈ 90 min,
+`attached: false` lets the run continue while you do other work; the deadline (sol@xhigh ≈ 90 min,
 astra@max ≈ 135 min) still applies. Implementation runs are **never retried automatically**
 (a replay could apply its changes twice): after a transient failure, inspect the worktree and
 resume the session or start a new brief deliberately. The background `wait` notifies you when it finishes;

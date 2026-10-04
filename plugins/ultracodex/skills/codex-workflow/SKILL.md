@@ -46,10 +46,12 @@ an echo check with no independent angle, not for open-ended ideation with nothin
 | tier | model @ effort | for |
 | --- | --- | --- |
 | `light` | gpt-6-luna @ max | light work: triage, dedupe, wide fan-outs of small checks, summaries |
-| `daily` | gpt-6-sol @ xhigh (verify) / max (ask, review) | day-to-day verification, jurors, second opinions, review lenses |
-| `final` | gpt-6-astra @ max | very advanced work and the last word: final gate, load-bearing verdicts, security/money/concurrency |
+| `daily` | gpt-6.1-sol @ xhigh (every kind) | implementation including complex code, debugging, design, verification, jurors, routine review lenses |
+| `final` | gpt-6-astra @ max | security review, final critical gates, load-bearing verdicts, unresolved issues escalated from Sol |
 
 Cascade with astra last; never fan astra out wide; `ultra` only by explicit request, once.
+Sol stays at `xhigh`, including long or complex tasks. Use `effort: 'max'` only for an
+exceptional unresolved problem after an `xhigh` attempt or an owner request, with a reason.
 
 ## Pick the mode — the cheapest one that does the job
 
@@ -67,8 +69,9 @@ Cost levers, in order of effect:
    what would block a merge — `cross-review` does it by default (`finalGate`), `codex-review`
    sends only high/critical Claude-vs-Codex disagreements to astra (`escalate`). Both report
    an astra disagreement as **disputed** for the owner, never as silently dropped.
-3. **luna@max** for triage, dedupe and quick sanity passes; **sol** for day-to-day; **astra**
-   once, at the end. `ultra` and `serviceTier: 'priority'` only on explicit request.
+3. **luna@max** for triage, dedupe and quick sanity passes; **Sol 6.1@xhigh** for coding including
+   complex implementation; **astra** for security lenses and final critical review.
+   `ultra` and `serviceTier: 'priority'` only on explicit request.
 4. **Read `codexUsage`** in every shipped workflow's result (runs and tokens per model, failed
    runs included) and mention it when reporting.
 
@@ -82,7 +85,9 @@ Run by name with `args` (JSON values, not strings):
   `args: { target, cwd, dimensions, verifyTier: 'daily'|'final', finalGate, context, lessons, batch }`
 - **`ultracodex:codex-review`** — Codex reviews through lenses (`code`, `domain`, `security`,
   `tests`, `performance`) → Claude checks every finding in the code → high/critical findings
-  Claude refuted or could not settle go to astra in one run → report.
+  from non-Astra lenses that Claude refuted or could not settle go to astra in one run → report.
+  Omit `tier` for Sol 6.1 on ordinary lenses and Astra on `security`; an explicit tier applies
+  to every lens. `lenses[].tier` and `lenses[].model` report actual routing.
   `args: { cwd, base | commit | uncommitted, lenses, tier: 'light'|'daily'|'final', escalate, context, lessons, triage }`
 - **`ultracodex:crosscheck`** — one Codex attempt (astra@max) to refute one claim.
   `args: { claim, evidence, cwd, tier }`

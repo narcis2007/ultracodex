@@ -23,7 +23,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const RUNNER_VERSION = "0.3.3";
+export const RUNNER_VERSION = "0.3.6";
 export const RUNNER_FILE = fileURLToPath(import.meta.url);
 
 export const EFFORTS = Object.freeze(["low", "medium", "high", "xhigh", "max", "ultra"]);
@@ -31,26 +31,26 @@ export const SANDBOXES = Object.freeze(["read-only", "workspace-write"]);
 export const TIERS = Object.freeze(["light", "daily", "final"]);
 export const KINDS = Object.freeze(["verify", "ask", "review", "implement"]);
 
-// Routing policy (owner's rule, 2026-09-23): luna always at max; sol at xhigh for
-// fan-out verification and max for single long tasks; astra at max for the final
-// or hardest work. `ultra` is never chosen implicitly — a caller must ask for it.
+// Routing policy (owner's rule, updated 2026-10-01): Luna always at max; 6.1 Sol
+// at xhigh for every workload, including complex implementation. Sol max needs
+// an explicit exceptional override; Astra max handles critical work. `ultra` is never implicit.
 export const POLICY = Object.freeze({
-  models: Object.freeze({ light: "gpt-6-luna", daily: "gpt-6-sol", final: "gpt-6-astra" }),
+  models: Object.freeze({ light: "gpt-6-luna", daily: "gpt-6.1-sol", final: "gpt-6-astra" }),
   efforts: Object.freeze({
     light: Object.freeze({ verify: "max", ask: "max", review: "max", implement: "max" }),
-    daily: Object.freeze({ verify: "xhigh", ask: "max", review: "max", implement: "max" }),
+    daily: Object.freeze({ verify: "xhigh", ask: "xhigh", review: "xhigh", implement: "xhigh" }),
     final: Object.freeze({ verify: "max", ask: "max", review: "max", implement: "max" }),
   }),
   // Per-attempt deadline = base(kind) × model factor × effort factor. Generous on
   // purpose: a deadline is a runaway guard, not an estimate (measured on this
   // machine: astra@max review lens 25–35 min, implementation 30–60 min).
   baseDeadlineSec: Object.freeze({ verify: 1500, ask: 1800, review: 2700, implement: 5400 }),
-  modelFactor: Object.freeze({ "gpt-6-luna": 0.5, "gpt-6-sol": 1, "gpt-6-astra": 1.5 }),
+  modelFactor: Object.freeze({ "gpt-6-luna": 0.5, "gpt-6.1-sol": 1, "gpt-6-sol": 1, "gpt-6-astra": 1.5 }),
   effortFactor: Object.freeze({ low: 0.5, medium: 0.6, high: 0.8, xhigh: 1, max: 1, ultra: 1.5 }),
   // Concurrency weight: an astra run counts as two slots.
   weight: Object.freeze({ "gpt-6-astra": 2 }),
   // Models whose catalog entry lists `ultra` (used when no catalog cache exists yet).
-  ultraModels: Object.freeze(["gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra"]),
+  ultraModels: Object.freeze(["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra"]),
 });
 
 export const MAX_TIMEOUT_SEC = 4 * 3600;
@@ -269,7 +269,7 @@ export function computeDeadlineSec(model, effort, kind) {
 export function resolvePolicy({ tier = "daily", kind = "ask", model, effort, timeoutSec } = {}) {
   const resolvedModel = model ?? POLICY.models[tier] ?? POLICY.models.daily;
   const effectiveTier = tierForModel(resolvedModel) ?? tier;
-  const resolvedEffort = effort ?? POLICY.efforts[effectiveTier]?.[kind] ?? "max";
+  const resolvedEffort = effort ?? POLICY.efforts[effectiveTier]?.[kind] ?? "xhigh";
   return {
     tier: effectiveTier,
     kind,

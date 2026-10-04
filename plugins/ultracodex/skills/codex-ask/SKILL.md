@@ -7,8 +7,8 @@ description: >-
   read-only and hermetic, and Claude reads the answer directly (no relay agent: the cheapest
   way to consult Codex). Use for "ask codex", "what does codex / gpt think", "second opinion
   from codex", "double-check this with astra / sol / luna", "have codex refute this",
-  "cross-check before we do X". Tier by difficulty: gpt-6-luna@max for light questions,
-  gpt-6-sol for day-to-day ones, gpt-6-astra@max for the hardest or final calls.
+  "cross-check before we do X". Tier by role and risk: gpt-6-luna@max for light questions,
+  gpt-6.1-sol@xhigh for coding analysis and design, gpt-6-astra@max for security and final critical calls.
 ---
 
 # Ask Codex directly
@@ -25,7 +25,7 @@ for a branch review, `codex-review`.
 | the question is… | tier → model | kind + output |
 | --- | --- | --- |
 | light: "where is X handled", a quick sanity check, a small factual claim about the code | `light` → luna@max | `verify` + `schemaPreset: "verdict"`, or `ask` (text) |
-| day-to-day: a bug hypothesis, a design second opinion, "is this change safe" | `daily` → sol (xhigh for verify, max for ask) | as above |
+| coding analysis: a bug hypothesis, complex debugging, a design second opinion, routine checks | `daily` → 6.1-sol@xhigh | as above |
 | load-bearing: security / money / concurrency / data migration, an irreversible step, the last word before acting | `final` → astra@max | usually `verify` + `verdict` |
 
 Decide what you want before writing the brief:
@@ -33,6 +33,10 @@ Decide what you want before writing the brief:
 - an **independent** answer → do *not* include your own conclusion (it anchors Codex);
 - a **refutation attempt** → state the claim and ask Codex to try to refute it
   (`verdict`: `refuted` true unless the evidence is airtight).
+
+Keep Sol at `xhigh` for both `ask` and `verify`. Set `"effort": "max"` only for an
+exceptional unresolved problem after an `xhigh` attempt or when the owner requests it;
+state the reason. A long or complex question alone does not justify `max`.
 
 ## 2. Write the brief and the request (Write tool — never a heredoc)
 
