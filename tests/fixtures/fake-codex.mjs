@@ -5,6 +5,7 @@
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 
 const argv = process.argv.slice(2);
 
@@ -60,11 +61,13 @@ if (argv[0] !== "exec") {
 let out = null;
 let schemaFile = null;
 let fromStdin = false;
+let resumeId = null;
 const valued = new Set(["-s", "-C", "--add-dir", "-i", "-p", "--base", "--commit", "--title", "-m", "-c", "-o", "--output-schema"]);
 for (let index = 1; index < argv.length; index += 1) {
   const arg = argv[index];
   if (arg === "review") continue;
   if (arg === "resume") {
+    resumeId = argv[index + 1];
     index += 1;
     continue;
   }
@@ -95,8 +98,25 @@ const apiFailure = (status, error) => {
   process.exit(1);
 };
 
-emit({ type: "thread.started", thread_id: `01a0fake-0000-7000-8000-${String(process.pid).padStart(12, "0")}` });
+emit({ type: "thread.started", thread_id: resumeId ?? `01a0fake-0000-7000-8000-${String(process.pid).padStart(12, "0")}` });
 emit({ type: "turn.started" });
+
+// A quota failure after observable work; account-switch tests must resume this
+// thread rather than run the original task (and its side effects) a second time.
+const quotaWork = directive("QUOTA_WORK");
+if (resumeId && process.env.FAKE_CODEX_ENCRYPTED_RESUME === "1") {
+  apiFailure(400, { code: "invalid_encrypted_content", message: "The encrypted content could not be verified" });
+}
+if (quotaWork && !resumeId) {
+  fs.appendFileSync(quotaWork, "applied once\n");
+  emit({ type: "item.completed", item: { id: "effect", type: "command_execution", command: "fixture effect", aggregated_output: "applied once", exit_code: 0, status: "completed" } });
+  emit({ type: "item.completed", item: { id: "hidden", type: "reasoning", text: "PRIVATE_REASONING_MUST_NOT_BE_COPIED", encrypted_content: "PRIVATE_ENCRYPTED_BLOB" } });
+  if (process.env.FAKE_CODEX_ACCOUNT_AFTER_FAILURE) {
+    const file = path.join(process.env.CODEX_HOME, "auth.json");
+    fs.writeFileSync(file, JSON.stringify({ auth_mode: "chatgpt", tokens: { account_id: process.env.FAKE_CODEX_ACCOUNT_AFTER_FAILURE } }));
+  }
+  apiFailure(429, { code: "usage_limit_reached", message: "You have hit your usage limit" });
+}
 
 const failFirst = Number(directive("FAIL_FIRST") ?? 0);
 if (failFirst > 0) {

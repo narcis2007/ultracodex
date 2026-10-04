@@ -33,7 +33,7 @@ Request fields (unknown fields are rejected): `task` or `taskFile`; `schema` / `
 for a batch); `maxAttempts` (default 2 for read-only work, **1 for writing tasks** — workspace-write
 or resume — which may only retry with `replaySafe: true`, since a replay could apply effects
 twice); `attached` (default true — torn down when nobody polls
-for `orphanAfterSec`, default 300; the Workflow helper sends 900); `ephemeral` (default: true except implement/resume);
+for `orphanAfterSec`, default 300; the Workflow helper sends 900); `ephemeral` (default false to retain resumable thread history);
 `label`; `meta` (echoed back); `serviceTier` (`priority` = Fast); `addDirs`; `images`;
 `profile`; `review: {base|commit|uncommitted, title}`; `resume: {sessionId}`.
 
@@ -177,7 +177,7 @@ the Codex binary (only the operator's `ULTRACODEX_CODEX_PATH`).
 | `--output-schema FILE` | strict JSON Schema for the final message |
 | `-o FILE` | clean final message (stdout carries events/chrome) |
 | `--json` | JSONL events → thread id, usage, structured errors |
-| `--ephemeral` | no session files (verify/review) |
+| `--ephemeral` | explicit opt-out of session files and account continuation |
 | `--ignore-user-config` (+ `-c windows.sandbox="…"`) | hermetic: no user MCP servers, profiles or defaults; the Windows sandbox setting is carried over |
 | `-c sandbox_workspace_write.network_access=true` | implement with network |
 | `--skip-git-repo-check` | exec/resume outside a repo |
@@ -190,6 +190,31 @@ Other 0.156 additions: `--worktree` (Codex-managed worktree), `-p <profile>` (la
 `$CODEX_HOME/<name>.config.toml`), `--ignore-rules`, `codex exec fork`.
 
 ## Hermetic by default
+
+### Account continuation
+
+When a persistent ChatGPT job fails with a usage limit, the runner waits up to
+15 minutes, within its original deadline, for the selected account to change.
+It resumes the exact saved thread using a fixed continuation instruction, not
+the original task prompt. The same run id, request digest, final schema, sandbox,
+network permissions and working directory are preserved. `wait` reports
+`backoff` with `waitingForAccount: true`, so already-loaded Claude relays keep
+polling. Cancellation and orphan detection remain active while waiting.
+
+Native `codex exec` cannot reload accounts during an active request; an account
+change alone never interrupts a tool command. Continuation is bounded to eight
+handoffs and requires a thread id, managed ChatGPT authentication and verified
+cleanup. Auth/rate-limit errors continue only if the account already changed.
+Explicit ephemeral jobs and external authentication are never continued.
+
+If the resumed thread fails with `invalid_encrypted_content`, continue once per
+handoff in a fresh thread using the exact thread's visible rollout messages and
+tool records (or this job's completed event records). Hidden reasoning, encrypted
+compaction and config are excluded, the source rollout is left intact, and the
+checkpoint is bounded to about 192 KB. This retains work context, but may omit
+older history; the fixed instruction requires inspecting current files and asking
+for missing essential context. Provenance records `contextRestarts` separately.
+
 
 A normal `codex exec` loads every MCP server from `~/.codex/config.toml` — on this machine
 eight of them, including production business APIs and a computer-use REPL. `-s read-only`

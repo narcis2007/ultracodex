@@ -36,6 +36,7 @@ import {
   framedToRaw,
   keyPath,
   makeClock,
+  managedAccountIdentity,
   mustEscape,
   normalizeText,
   pageBody,
@@ -56,6 +57,7 @@ import {
   summarizeEvents,
   validateRequest,
   validateValue,
+  visibleAccountCheckpoint,
   windowsDescendants,
 } from "../plugins/ultracodex/scripts/codex-node.mjs";
 
@@ -67,6 +69,57 @@ const CATALOG = {
     { slug: "gpt-6-luna", efforts: ["low", "medium", "high", "xhigh", "max"] },
   ],
 };
+
+test("visible account checkpoints select the exact thread and omit encrypted reasoning and config", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-checkpoint-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const threadId = "01a0-test-checkpoint";
+  const directory = path.join(home, "sessions", "2026", "10", "05");
+  const job = path.join(home, "owned-job");
+  fs.mkdirSync(directory, { recursive: true });
+  fs.mkdirSync(job);
+  const rows = [
+    { type: "session_meta", payload: { id: threadId, config: "PRIVATE_CONFIG", tokens: "PRIVATE_AUTH" } },
+    { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "original goal" }] } },
+    { type: "response_item", payload: { type: "reasoning", encrypted_content: "PRIVATE_REASONING", summary: [{ text: "PRIVATE_SUMMARY" }] } },
+    { type: "compacted", payload: { replacement_history: [{ type: "compaction", encrypted_content: "PRIVATE_COMPACTION" }] } },
+    { type: "response_item", payload: { type: "function_call_output", call_id: "done", output: { text: "edited once", encrypted_content: "PRIVATE_NESTED" } } },
+  ];
+  const file = path.join(directory, `rollout-timestamp-${threadId}.jsonl`);
+  fs.writeFileSync(file, rows.map(JSON.stringify).join("\n") + "\npartial-last-line");
+  fs.writeFileSync(path.join(directory, "rollout-unrelated.jsonl"), JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "UNRELATED_THREAD" }] } }));
+  const checkpoint = visibleAccountCheckpoint(threadId, { dir: job }, { CODEX_HOME: home });
+  assert.equal(checkpoint.truncated, false);
+  assert.equal(checkpoint.items.length, 2);
+  assert.match(JSON.stringify(checkpoint), /original goal/);
+  assert.match(JSON.stringify(checkpoint), /edited once/);
+  assert.doesNotMatch(JSON.stringify(checkpoint), /PRIVATE_|UNRELATED_THREAD/);
+  fs.writeFileSync(file, JSON.stringify({ type: "session_meta", payload: { id: "wrong-thread" } }) + "\n" + JSON.stringify(rows[1]));
+  assert.equal(visibleAccountCheckpoint(threadId, { dir: job }, { CODEX_HOME: home }), null, "a filename alone never proves transcript ownership");
+  assert.equal(visibleAccountCheckpoint("../outside", { dir: job }, { CODEX_HOME: home }), null);
+});
+
+test("account changes ignore rotations and never expose credentials or workspace ids", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-account-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const env = { CODEX_HOME: home };
+  const file = path.join(home, "auth.json");
+  const save = (id, token) => fs.writeFileSync(file, JSON.stringify({ auth_mode: "chatgpt", tokens: { account_id: id, access_token: token } }));
+  assert.equal(managedAccountIdentity(env), null);
+  save("workspace-a-secret-sentinel", "token-a-secret-sentinel");
+  const a = managedAccountIdentity(env);
+  assert.match(a, /^[a-f0-9]{64}$/);
+  save("workspace-a-secret-sentinel", "rotated-secret-sentinel");
+  assert.equal(managedAccountIdentity(env), a);
+  save("workspace-b-secret-sentinel", "token-b-secret-sentinel");
+  assert.notEqual(managedAccountIdentity(env), a);
+  assert.equal(managedAccountIdentity({ ...env, CODEX_API_KEY: "" }), null);
+  fs.writeFileSync(file, "{broken");
+  assert.equal(managedAccountIdentity(env), null);
+  fs.writeFileSync(file, JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: "sk-secret-sentinel", tokens: { account_id: "workspace-a" } }));
+  assert.equal(managedAccountIdentity(env), null);
+  assert.equal(validateRequest({ task: "private", cwd: home, ephemeral: true }, { catalog: CATALOG }).ephemeral, true);
+});
 
 test("normalizeText is stable across line endings, tabs, trailing space and NFC", () => {
   const a = normalizeText("\n\nline one\t\r\nline two   \r\n\n");
@@ -180,7 +233,7 @@ test("validateRequest applies defaults and rejects what codex would reject later
   assert.equal(request.model, "gpt-6.1-sol");
   assert.equal(request.effort, "xhigh");
   assert.equal(request.hermetic, true);
-  assert.equal(request.ephemeral, true);
+  assert.equal(request.ephemeral, false, "jobs keep a thread so account switches can resume them");
   assert.equal(request.mode, "exec");
   assert.equal(request.taskHash, fnv1a("check it"));
 

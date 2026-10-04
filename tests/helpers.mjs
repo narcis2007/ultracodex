@@ -51,11 +51,13 @@ export function fastEnv(home, extra = {}) {
   return {
     ...process.env,
     ULTRACODEX_HOME: home,
+    CODEX_HOME: home, // every fixture, including account-change detection, stays isolated
     ULTRACODEX_CODEX_PATH: FAKE_CODEX,
     ULTRACODEX_POLL_MS: "100",
     ULTRACODEX_ALIVE_MS: "200",
     ULTRACODEX_LOST_AFTER_MS: "20000",
     ULTRACODEX_BACKOFF_MS: "100",
+    ULTRACODEX_ACCOUNT_WAIT_MS: "2000",
     ULTRACODEX_SLOT_POLL_MS: "100",
     ULTRACODEX_SLOT_STALE_MS: "20000",
     ULTRACODEX_KILL_GRACE_MS: "300",
@@ -117,7 +119,7 @@ export async function startAndWait(env, request, { home, maxRounds = 60 } = {}) 
   for (let round = 0; round < maxRounds; round += 1) {
     const waited = await runCli(["wait", started.json.runId, "--max-wait", "5"], { env });
     final = waited.json;
-    if (final && final.state !== "running" && final.state !== "queued" && final.state !== "backoff") break;
+    if (final && !["running", "queued", "backoff", "account_wait"].includes(final.state)) break;
   }
   return { started, final };
 }

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.7 — 2026-10-05 (PrimerSwitch compatibility)
+
+- Keep Codex thread history by default so quota-limited jobs can continue after
+  PrimerSwitch changes the selected ChatGPT account. Resume the exact thread
+  under the same run id, request authentication, schema and sandbox constraints.
+- Wait up to 15 minutes for a changed account, within the original job deadline;
+  preserve cancellation, orphan cleanup and bounded handoffs. Running tool
+  commands are never stopped just because an account changed.
+- Keep existing Claude relays polling through the compatible `backoff` state.
+  Already-launched durable 0.3.6 jobs can be adopted once after their supervisor
+  exits with a quota error, if their deadline and caller heartbeat remain valid.
+- If cross-account resumption rejects encrypted reasoning, continue once per
+  handoff from bounded visible messages and completed tool records in a fresh
+  thread. Leave the original rollout intact and exclude hidden reasoning/config.
+- Explicit `ephemeral: true` opts out of history and account continuation. Native
+  `codex exec` has no supported live account reload; recovery resumes a saved
+  thread after a terminal quota/auth error, rather than moving an active request.
+
 ## 0.3.6 — 2026-10-01 (fork)
 
 - Prefer `xhigh` for every GPT-6.1 Sol workload: verification, analysis, reviews and

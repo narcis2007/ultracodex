@@ -7,7 +7,7 @@ export const meta = {
 
 // Generated from tools/src/workflows/crosscheck.js — edit the source, then `npm run build`.
 
-// ── ultracodex helper v0.3.6 ───────────────────────────────────────────────────
+// ── ultracodex helper v0.3.7 ───────────────────────────────────────────────────
 // Generated from tools/src/helper.js in the ultracodex repo — edit the source, then
 // `npm run build`. Needs the ultracodex plugin (its `codex-relay`, `codex-key` and
 // `codex-reader` agents + runner).
@@ -22,7 +22,7 @@ export const meta = {
 // for every kind · 'final' → gpt-6-astra@max for exceptional critical work. Pin
 // model/effort only to override with a reason. Concurrency is capped intrinsically: 4 Codex jobs
 // per workflow, an astra job counting as 2 — do not wrap calls in another gate.
-const UCX_VERSION = '0.3.6'
+const UCX_VERSION = '0.3.7'
 const UCX_RELAY = 'ultracodex:codex-relay'
 const UCX_TIER_MODEL = { light: 'gpt-6-luna', daily: 'gpt-6.1-sol', final: 'gpt-6-astra' }
 const UCX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
@@ -376,7 +376,7 @@ function ucxUnwrap(env, raw, expected = {}) {
       return ucxError('unauthenticated_result', 'the result is not signed by this machine\'s runner for this request — not trusted', env.runId)
     }
     const prov = { runId: env.runId, threadId: p.threadId, model: p.model, effort: p.effort, tier: p.tier,
-      usage: p.usageTotal || p.usage, durationMs: p.durationMs, attempts: p.attempts, codexVersion: p.codexVersion, slotLost: p.slotLost || false }
+      usage: p.usageTotal || p.usage, durationMs: p.durationMs, attempts: p.attempts, accountHandoffs: p.accountHandoffs || 0, contextRestarts: p.contextRestarts || 0, codexVersion: p.codexVersion, slotLost: p.slotLost || false }
     ucxRecordUsage(prov)
     if (wantsResult) {
       Object.defineProperty(env.result, '_codex', { value: prov, enumerable: false })

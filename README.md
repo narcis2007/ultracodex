@@ -59,6 +59,30 @@ workflow returns `codexUsage` — runs and tokens per model.
 - Codex CLI, logged in (`codex login`; tested on 0.156.1)
 - Node.js 18+
 
+## Account switching with PrimerSwitch
+
+Jobs retain their Codex thread history by default. If a ChatGPT job reaches a
+usage limit, the supervisor waits for PrimerSwitch to select another account,
+then runs `codex exec resume` for that exact thread. Claude keeps polling the
+same job and receives its original authenticated result. The continuation keeps
+the original model, schema, directory, sandbox and network permissions.
+
+The supervisor lets active commands finish. Native `codex exec` does not support
+live account reload, so an already-running request may use the old account until
+it finishes or fails; continuation handles the terminal quota error. Waiting is
+bounded to 15 minutes and the original deadline, and cancellation still works.
+Explicit `ephemeral: true`, external API-key authentication, a missing saved
+thread or an unverified process teardown prevent continuation. An already-polled
+durable job from the installed 0.3.6 runner can be adopted once after a quota
+failure; completed or abandoned jobs are left alone.
+
+If the new account rejects the saved encrypted reasoning, the runner continues
+in a fresh thread using visible messages and completed tool records from that
+job. The original rollout stays intact. This fallback excludes hidden reasoning
+and configuration, keeps the same permissions, and runs once per account
+handoff. Bounded transcripts can omit older context; Codex must inspect current
+work and request missing essential information instead of guessing.
+
 ## Install
 
 ```text
@@ -119,8 +143,9 @@ Workflow script ──agent({agentType:'ultracodex:codex-key'})────▶ k
   anything else. Reviewed content that hijacks a relay or a reader can neither run a program
   nor sign or announce a request (the reader's git is checked word by word against the ways,
   measured on git 2.55, to make "read-only" git run one).
-  Workflow nodes are read-only and hermetic by construction, and writing tasks are never
-  retried automatically.
+  Workflow nodes are read-only and hermetic by construction. Writing tasks are
+  never replayed from their initial prompt automatically; account continuation
+  uses their saved thread and instructs Codex to inspect existing work first.
 
 ## Development
 

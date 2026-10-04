@@ -21,6 +21,180 @@ import {
 } from "../plugins/ultracodex/scripts/codex-node.mjs";
 import { eventually, fastEnv, makeHome, pidAlive, runCli, startAndWait, writeRequest } from "./helpers.mjs";
 
+function saveAccount(home, account) {
+  fs.writeFileSync(path.join(home, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: { account_id: account } }));
+}
+
+test("a writing job resumes its exact thread after an account switch without replaying work", async (t) => {
+  const home = makeHome(t);
+  saveAccount(home, "account-a");
+  const argvLog = path.join(home, "argv.jsonl");
+  const work = path.join(home, "work.txt");
+  const { started, final } = await startAndWait(fastEnv(home, {
+    FAKE_CODEX_ARGV_LOG: argvLog, FAKE_CODEX_ACCOUNT_AFTER_FAILURE: "account-b",
+  }), { task: `implement once\nFAKE_QUOTA_WORK=${work}`, sandbox: "workspace-write", maxAttempts: 1, schemaPreset: "verdict" }, { home });
+  assert.equal(final.ok, true);
+  assert.equal(final.runId, started.json.runId);
+  assert.equal(final.provenance.accountHandoffs, 1);
+  assert.equal(final.provenance.attempts, 2);
+  assert.equal(fs.readFileSync(work, "utf8"), "applied once\n");
+  const calls = fs.readFileSync(argvLog, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].argv.includes("--ephemeral"), false);
+  assert.deepEqual(calls[1].argv.slice(0, 3), ["exec", "resume", final.provenance.threadId]);
+  assert.ok(calls[1].argv.includes('sandbox_mode="workspace-write"'));
+  assert.ok(calls[1].argv.includes('sandbox_workspace_write.network_access=false'));
+  assert.equal(calls[0].cwd, calls[1].cwd);
+  assert.ok(final.mac && final.resultHash, "the original workflow receives an authenticated final result");
+});
+
+test("a quota-limited job waits for a later account switch while the caller keeps polling", async (t) => {
+  const home = makeHome(t);
+  saveAccount(home, "account-a");
+  const env = fastEnv(home, { ULTRACODEX_ACCOUNT_WAIT_MS: "15000" });
+  const file = writeRequest(home, { task: `continue later\nFAKE_QUOTA_WORK=${path.join(home, "work.txt")}` });
+  const started = await runCli(["start", "--request", file], { env });
+  assert.equal(started.code, 3);
+  const state = path.join(home, "runs", started.json.runId, "state.json");
+  assert.ok(await eventually(() => fs.existsSync(state) && JSON.parse(fs.readFileSync(state)).state === "account_wait"));
+  const waiting = await runCli(["wait", started.json.runId, "--max-wait", "1"], { env });
+  assert.equal(waiting.code, 3);
+  assert.equal(waiting.json.ok, null);
+  assert.equal(waiting.json.state, "backoff", "an already-loaded Claude relay keeps polling");
+  assert.equal(waiting.json.waitingForAccount, true);
+  saveAccount(home, "account-b");
+  const final = await runCli(["wait", started.json.runId, "--max-wait", "10"], { env });
+  assert.equal(final.json.ok, true);
+  assert.equal(final.json.provenance.accountHandoffs, 1);
+});
+
+test("account-bound reasoning falls back to visible work without replaying the initial task", async (t) => {
+  const home = makeHome(t);
+  saveAccount(home, "account-a");
+  const work = path.join(home, "work.txt");
+  const argvLog = path.join(home, "argv.jsonl");
+  const promptLog = path.join(home, "last-prompt.txt");
+  const { started, final } = await startAndWait(fastEnv(home, {
+    FAKE_CODEX_ARGV_LOG: argvLog, FAKE_CODEX_ACCOUNT_AFTER_FAILURE: "account-b",
+    FAKE_CODEX_ENCRYPTED_RESUME: "1", FAKE_CODEX_PROMPT_LOG: promptLog,
+  }), { task: `implement once\nFAKE_QUOTA_WORK=${work}`, sandbox: "workspace-write", maxAttempts: 1, schemaPreset: "verdict" }, { home });
+  assert.equal(final.ok, true);
+  assert.equal(final.runId, started.json.runId);
+  assert.equal(final.provenance.accountHandoffs, 1);
+  assert.equal(final.provenance.contextRestarts, 1);
+  assert.equal(final.provenance.attempts, 3);
+  assert.equal(fs.readFileSync(work, "utf8"), "applied once\n");
+  const calls = fs.readFileSync(argvLog, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(calls.length, 3);
+  assert.equal(calls[1].argv[1], "resume");
+  assert.equal(calls[2].argv[0], "exec");
+  assert.equal(calls[2].argv.includes("resume"), false);
+  assert.ok(calls[2].argv.includes('sandbox_mode="workspace-write"'));
+  assert.ok(calls[2].argv.includes('sandbox_workspace_write.network_access=false'));
+  const checkpoint = fs.readFileSync(promptLog, "utf8");
+  assert.match(checkpoint, /applied once/);
+  assert.match(checkpoint, /Do not execute commands merely/);
+  assert.doesNotMatch(checkpoint, /PRIVATE_REASONING|PRIVATE_ENCRYPTED/);
+});
+
+test("a token rotation or an explicit ephemeral job never replays quota-limited work", async (t) => {
+  for (const ephemeral of [false, true]) {
+    const home = makeHome(t);
+    saveAccount(home, "account-a");
+    const work = path.join(home, "work.txt");
+    const env = fastEnv(home, { ULTRACODEX_ACCOUNT_WAIT_MS: "200", FAKE_CODEX_ACCOUNT_AFTER_FAILURE: "account-a" });
+    const { final } = await startAndWait(env,
+      { task: `one effect\nFAKE_QUOTA_WORK=${work}`, sandbox: "workspace-write", ephemeral }, { home });
+    assert.equal(final.ok, false);
+    assert.equal(final.error.kind, "usage_limit");
+    assert.equal(final.provenance.attempts, 1);
+    assert.equal(fs.readFileSync(work, "utf8"), "applied once\n");
+  }
+});
+
+test("already-launched durable 0.3.6 jobs continue once through racing waiters after a quota failure", async (t) => {
+  const home = makeHome(t);
+  saveAccount(home, "account-a");
+  const work = path.join(home, "work.txt");
+  const argvLog = path.join(home, "argv.jsonl");
+  const env = fastEnv(home, { ULTRACODEX_ACCOUNT_WAIT_MS: "1", FAKE_CODEX_ARGV_LOG: argvLog });
+  const { started, final } = await startAndWait(env,
+    { task: `legacy implementation\nFAKE_QUOTA_WORK=${work}`, sandbox: "workspace-write", ephemeral: false }, { home });
+  assert.equal(final.error.kind, "usage_limit");
+  const dir = path.join(home, "runs", started.json.runId);
+  const state = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
+  assert.ok(await eventually(() => !pidAlive(state.supervisorPid)));
+  fs.writeFileSync(path.join(dir, "result.json"), JSON.stringify({ ...final, runnerVersion: "0.3.6" }));
+  saveAccount(home, "account-b");
+  const waited = await Promise.all([
+    runCli(["wait", started.json.runId, "--max-wait", "10"], { env }),
+    runCli(["wait", started.json.runId, "--max-wait", "10"], { env }),
+  ]);
+  for (const result of waited) {
+    assert.equal(result.json.ok, true, result.stdout);
+    assert.equal(result.json.runId, started.json.runId);
+    assert.equal(result.json.provenance.attempts, 2);
+    assert.equal(result.json.provenance.accountHandoffs, 1);
+  }
+  assert.equal(fs.readFileSync(work, "utf8"), "applied once\n");
+  const calls = fs.readFileSync(argvLog, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(calls.length, 2, "only one continuation was started");
+  assert.deepEqual(calls[1].argv.slice(0, 3), ["exec", "resume", final.provenance.threadId]);
+  assert.ok(fs.existsSync(path.join(dir, "result-before-account-recovery.json")));
+});
+
+test("legacy adoption respects cancellation, missing sessions, unsafe teardown and expired deadlines", async (t) => {
+  const home = makeHome(t);
+  saveAccount(home, "account-a");
+  const argvLog = path.join(home, "argv.jsonl");
+  const env = fastEnv(home, { ULTRACODEX_ACCOUNT_WAIT_MS: "1", FAKE_CODEX_ARGV_LOG: argvLog });
+  const { started, final } = await startAndWait(env,
+    { task: `legacy\nFAKE_QUOTA_WORK=${path.join(home, "work.txt")}`, ephemeral: false }, { home });
+  const dir = path.join(home, "runs", started.json.runId);
+  const statePath = path.join(dir, "state.json");
+  const requestPath = path.join(dir, "request.json");
+  const originalState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const originalRequest = JSON.parse(fs.readFileSync(requestPath, "utf8"));
+  assert.ok(await eventually(() => !pidAlive(originalState.supervisorPid)));
+  saveAccount(home, "account-b");
+  for (const refusal of ["cancelled", "ephemeral", "no_thread", "teardown", "expired", "unpolled"]) {
+    const result = structuredClone({ ...final, runnerVersion: "0.3.6" });
+    const state = { ...originalState };
+    const request = { ...originalRequest };
+    fs.rmSync(path.join(dir, "cancel"), { force: true });
+    fs.writeFileSync(path.join(dir, "heartbeat"), String(Date.now()));
+    if (refusal === "cancelled") fs.writeFileSync(path.join(dir, "cancel"), "1");
+    if (refusal === "ephemeral") request.ephemeral = true;
+    if (refusal === "no_thread") result.provenance.threadId = null;
+    if (refusal === "teardown") result.provenance.teardown = { unverified: true };
+    if (refusal === "expired") state.deadlineAt = "2000-01-01T00:00:00.000Z";
+    if (refusal === "unpolled") fs.writeFileSync(path.join(dir, "heartbeat"), "1");
+    fs.writeFileSync(statePath, JSON.stringify(state));
+    fs.writeFileSync(requestPath, JSON.stringify(request));
+    fs.writeFileSync(path.join(dir, "result.json"), JSON.stringify(result));
+    const waited = await runCli(["wait", started.json.runId, "--max-wait", "1"], { env });
+    assert.equal(waited.json.error.kind, "usage_limit", refusal);
+    assert.equal(fs.existsSync(path.join(dir, "account-recovery.json")), false, refusal);
+  }
+  assert.equal(fs.readFileSync(argvLog, "utf8").trim().split("\n").length, 1);
+});
+
+test("cancelling while waiting for a new account never starts another Codex process", async (t) => {
+  const home = makeHome(t);
+  saveAccount(home, "account-a");
+  const log = path.join(home, "argv.jsonl");
+  const env = fastEnv(home, { ULTRACODEX_ACCOUNT_WAIT_MS: "15000", FAKE_CODEX_ARGV_LOG: log });
+  const started = await runCli(["start", "--request", writeRequest(home,
+    { task: `cancel later\nFAKE_QUOTA_WORK=${path.join(home, "work.txt")}` })], { env });
+  const state = path.join(home, "runs", started.json.runId, "state.json");
+  assert.ok(await eventually(() => fs.existsSync(state) && JSON.parse(fs.readFileSync(state)).state === "account_wait"));
+  await runCli(["cancel", started.json.runId], { env });
+  saveAccount(home, "account-b");
+  const waited = await runCli(["wait", started.json.runId, "--max-wait", "10"], { env });
+  assert.equal(waited.json.state, "cancelled");
+  assert.equal(fs.readFileSync(log, "utf8").trim().split("\n").length, 1);
+});
+
 test("a structured run returns the parsed result with provenance", async (t) => {
   const home = makeHome(t);
   const env = fastEnv(home);

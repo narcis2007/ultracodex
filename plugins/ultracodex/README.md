@@ -27,4 +27,15 @@ An explicit tier overrides every lens; results name each lens's actual tier and 
 Requires the Codex CLI (logged in) and Node.js 18+. Check with
 `node scripts/codex-node.mjs preflight --pretty`.
 
+Jobs retain thread history by default. After a ChatGPT quota failure, the runner
+waits for PrimerSwitch to select another account and resumes the saved thread
+under the same job id and permissions. Existing Claude relays keep polling.
+The wait is limited to 15 minutes and the original deadline; cancellation works.
+Active tool commands finish normally. Native `codex exec` cannot reload accounts
+mid-request. Explicit `ephemeral: true` opts out of history and continuation;
+external API-key authentication and missing thread history cannot be recovered.
+If cross-account resumption rejects encrypted reasoning, the runner continues
+from visible messages and completed tool records in a fresh thread, leaving the
+original rollout intact. This fallback runs once per handoff and keeps permissions.
+
 Fork of KingGyuSuh/ultracodex — Apache-2.0.
