@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.8 — 2026-10-08 (Haiku 5.5)
+
+- `codex-review` triage runs on Claude Haiku 5.5 at `high` effort by default; `triageModel`
+  (`haiku` | `sonnet` | `opus` | `inherit`) and `triageEffort` override it, and the result
+  reports what ran (`triage: { model, effort }`). Measured on 249 recorded triage cases
+  replayed at their reviewed commits, every disagreement judged blind by astra@max: Haiku 5.5
+  missed 1 real defect (low), Sonnet 5.5 missed 4, the original Opus 5.5 triage 11. Haiku leans
+  towards confirming and towards higher severity (stricter ship verdicts, never looser);
+  `high` behaved like `max` at about 1/15 of the cost and 1/8 of the time. The astra tiebreak
+  for doubted high/critical findings is unchanged.
+- The key agent (`codex-key`: `key`, `expect`) runs on Haiku: every call succeeded in the
+  relay benchmark, at about 1/19 of the Sonnet cost; the Opus retry stays. Job relays stay
+  on Sonnet — Haiku needed the Opus retry on 3 of 16 uploads.
+- Direct runs (`codex-ask`, `codex-implement`) default to `orphanAfterSec` 1800 instead of
+  300, so a background `wait` that Claude Code stops (memory pressure) can be restarted
+  before the run is torn down. Workflow relays keep sending 900.
+- Documented a known limit: very large paged results (~60 000 characters) failed to come
+  back through every relay model; read them from `result.json` in the main conversation.
+
 ## 0.3.7 — 2026-10-05 (PrimerSwitch compatibility)
 
 - Keep Codex thread history by default so quota-limited jobs can continue after

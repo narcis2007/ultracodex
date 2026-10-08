@@ -23,7 +23,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const RUNNER_VERSION = "0.3.7";
+export const RUNNER_VERSION = "0.3.8";
 export const RUNNER_FILE = fileURLToPath(import.meta.url);
 
 export const EFFORTS = Object.freeze(["low", "medium", "high", "xhigh", "max", "ultra"]);
@@ -848,7 +848,10 @@ export function validateRequest(raw, { catalog = null, requestDigest: signedDige
     maxAttempts,
     replaySafe,
     attached: expectBoolean(raw, "attached", true),
-    orphanAfterSec: expectInteger(raw, "orphanAfterSec", orphanFloor, 3600, Math.max(orphanFloor, 300)),
+    // 30 min by default: a direct caller (codex-ask, codex-implement) polls from a background
+    // `wait` that Claude Code may stop (memory pressure, a closed session); restarting the wait
+    // within this window keeps the run. Workflow relays send their own value (900).
+    orphanAfterSec: expectInteger(raw, "orphanAfterSec", orphanFloor, 3600, Math.max(orphanFloor, 1800)),
     // Durable threads let an exhausted job continue on a newly selected account.
     // An explicit ephemeral request still opts out of saving/recovery.
     ephemeral: expectBoolean(raw, "ephemeral", false),

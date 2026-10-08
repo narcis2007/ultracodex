@@ -1,10 +1,10 @@
 export const meta = {
   name: 'codex-review',
-  description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude; high/critical disagreements go to astra@max. Defaults to 6.1-sol@xhigh, security lens to astra@max; an explicit tier overrides every lens. Fails closed.',
-  whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: light|daily|final, context, lessons, triage, escalate, fast }',
+  description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude (Haiku 5.5 @high by default); high/critical disagreements go to astra@max. Defaults to 6.1-sol@xhigh, security lens to astra@max; an explicit tier overrides every lens. Fails closed.',
+  whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: light|daily|final, context, lessons, triage, triageModel: haiku|sonnet|opus|inherit, triageEffort, escalate, fast }',
   phases: [
     { title: 'Review', detail: 'one Codex review per lens (read-only, hermetic)' },
-    { title: 'Triage', detail: 'Claude checks each Codex finding against the code' },
+    { title: 'Triage', detail: 'Claude (Haiku 5.5 @high unless triageModel says otherwise) checks each Codex finding against the code' },
     { title: 'Escalate', detail: 'astra@max settles the high/critical findings Claude refuted or could not settle, in one run' },
     { title: 'Report', detail: 'confirmed / disputed / refuted / needs-info / unverified' },
   ],
@@ -27,7 +27,7 @@ export const meta = {
 // for every kind · 'final' → gpt-6-astra@max for exceptional critical work. Pin
 // model/effort only to override with a reason. Concurrency is capped intrinsically: 4 Codex jobs
 // per workflow, an astra job counting as 2 — do not wrap calls in another gate.
-const UCX_VERSION = '0.3.7'
+const UCX_VERSION = '0.3.8'
 const UCX_RELAY = 'ultracodex:codex-relay'
 const UCX_TIER_MODEL = { light: 'gpt-6-luna', daily: 'gpt-6.1-sol', final: 'gpt-6-astra' }
 const UCX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
@@ -567,6 +567,16 @@ const CWD = A.cwd || null
 const EXPLICIT_TIER = ['light', 'daily', 'final'].includes(A.tier)
 const TIER = A.tier === 'final' ? 'final' : A.tier === 'light' ? 'light' : 'daily'
 const TRIAGE = A.triage !== false
+// Triage runs on Haiku 5.5 at high effort unless the owner names another model. Measured on
+// 249 recorded triage cases replayed at their reviewed commits, disagreements judged blind by
+// astra@max: Haiku missed 1 real defect (Sonnet 5.5: 4, the original Opus 5.5 triage: 11). It
+// leans towards confirming and towards higher severity — never a looser ship verdict — and the
+// astra tiebreak below still covers the high/critical findings it doubts. 'inherit' = the
+// session's model.
+const TRIAGE_MODEL = ['haiku', 'sonnet', 'opus', 'inherit'].includes(A.triageModel) ? A.triageModel : 'haiku'
+const TRIAGE_EFFORT = ['low', 'medium', 'high', 'xhigh', 'max'].includes(A.triageEffort) ? A.triageEffort
+  : TRIAGE_MODEL === 'inherit' ? null : 'high'
+const TRIAGE_OPTS = { ...(TRIAGE_MODEL === 'inherit' ? {} : { model: TRIAGE_MODEL }), ...(TRIAGE_EFFORT ? { effort: TRIAGE_EFFORT } : {}) }
 // fast: true → the Fast service tier for the astra nodes only (more usage, less waiting)
 const FAST = A.fast === true ? { serviceTier: 'priority' } : {}
 const CONTEXT = A.context ? '\nWHAT THE CHANGE IS FOR / DOMAIN RULES (from the owner):\n' + A.context : ''
@@ -627,7 +637,7 @@ const lensResults = await pipeline(
       agent(`A Codex reviewer reported this finding about ${SCOPE}${CWD ? ' in ' + CWD : ''}. Check it yourself against the code (read the file and its callers; run git if needed).${ucxWhere(CWD)}
 Decide: "confirmed" (the defect is real and the failure scenario is reachable), "refuted" (it is not — explain why), or "needs_info" (it depends on something you cannot see).${CONTEXT}
 ${TRIAGE_SEVERITY}
-FINDING (JSON): ${JSON.stringify(f)}`, { label: 'triage:' + f.id, phase: 'Triage', schema: TRIAGE_SCHEMA, agentType: UCX_READER })
+FINDING (JSON): ${JSON.stringify(f)}`, { label: 'triage:' + f.id, phase: 'Triage', schema: TRIAGE_SCHEMA, agentType: UCX_READER, ...TRIAGE_OPTS })
         .then(t => ({ ...f, triage: t || failedTriage('no answer') }), e => ({ ...f, triage: failedTriage(String((e && e.message) || e)) }))))
     return { lens: key, tier, verdict: review.verdict, summary: review.summary, findings: findings.map((f, i) => triaged[i] || { ...f, triage: failedTriage('stage failed') }) }
   },
@@ -719,6 +729,7 @@ return {
   tier: TIER,
   report,
   lenses: lenses.map(l => ({ lens: l.lens, tier: l.tier, model: UCX_TIER_MODEL[l.tier], verdict: l.verdict || null, error: l.error ? l.error.kind : null })),
+  triage: TRIAGE ? { model: TRIAGE_MODEL, effort: TRIAGE_EFFORT } : null,
   confirmed: confirmedRated, severityChanges, disputed, needsInfo, untriaged,
   refuted: refuted.map(f => ({ id: f.id, title: f.title, why: whyRefuted(f) })),
   escalation: ESCALATE ? escalation : null,

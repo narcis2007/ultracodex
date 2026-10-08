@@ -236,6 +236,8 @@ test("validateRequest applies defaults and rejects what codex would reject later
   assert.equal(request.ephemeral, false, "jobs keep a thread so account switches can resume them");
   assert.equal(request.mode, "exec");
   assert.equal(request.taskHash, fnv1a("check it"));
+  assert.equal(request.orphanAfterSec, 1800, "a direct run survives a stopped background wait for 30 minutes");
+  assert.equal(validateRequest({ task: "check it", cwd, orphanAfterSec: 120 }, { catalog: CATALOG }).orphanAfterSec, 120);
 
   const implement = validateRequest({ task: "build it", cwd, sandbox: "workspace-write" }, { catalog: CATALOG });
   assert.equal(implement.kind, "implement");

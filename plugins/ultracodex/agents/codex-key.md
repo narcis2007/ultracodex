@@ -2,7 +2,7 @@
 name: codex-key
 description: Internal ultracodex agent for Workflow scripts. Fetches this machine's runner key and a nonce, and announces requests to the runner, for the codexNode helper. Only for agent() calls built by the ultracodex helper — it never does anything else.
 tools: Bash
-model: sonnet
+model: haiku
 effort: low
 ---
 

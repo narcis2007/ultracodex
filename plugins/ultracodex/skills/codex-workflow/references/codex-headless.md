@@ -33,7 +33,7 @@ Request fields (unknown fields are rejected): `task` or `taskFile`; `schema` / `
 for a batch); `maxAttempts` (default 2 for read-only work, **1 for writing tasks** — workspace-write
 or resume — which may only retry with `replaySafe: true`, since a replay could apply effects
 twice); `attached` (default true — torn down when nobody polls
-for `orphanAfterSec`, default 300; the Workflow helper sends 900); `ephemeral` (default false to retain resumable thread history);
+for `orphanAfterSec`, default 1800 so a stopped background `wait` can be restarted; the Workflow helper sends 900); `ephemeral` (default false to retain resumable thread history);
 `label`; `meta` (echoed back); `serviceTier` (`priority` = Fast); `addDirs`; `images`;
 `profile`; `review: {base|commit|uncommitted, title}`; `resume: {sessionId}`.
 
@@ -85,6 +85,13 @@ as `%22`, so a page line contains no quote and no backslash and its JSON needs n
 row.) Each page has its own hash, so the helper keeps the good pages of every reply and a
 re-collect only has to bring the rest; `resultHash` and `mac` still cover the whole decoded
 body. From the main conversation, simply read `paged.file` with the Read tool.
+
+Known limit: a relay copies every page back verbatim, and very large results (measured at
+60 000 characters, 10 pages) failed to come back through every relay model — Haiku 5.5
+miscopied pages, Sonnet 5.5 declined to repeat the output, and the Opus 5.5 recollect was
+stopped by the API's `reasoning_extraction` safeguard. Such a node fails closed; the run's
+result stays in `~/.ultracodex/runs/<runId>/result.json`. Keep workflow results compact
+(structured fields, not transcripts) and read large ones from the main conversation.
 
 Runs live in `~/.ultracodex/runs/<runId>/` (request, task, schema, state, per-attempt
 `events.jsonl` / `stderr.log` / `last.txt`, `supervisor.log`, `result.json`). `gc` removes

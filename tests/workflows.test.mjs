@@ -858,6 +858,46 @@ test("a failed default security lens keeps its Astra routing and reports incompl
   assert.equal(result.escalation, null, "no second Astra run for an Astra lens");
 });
 
+test("codex-review triages on Haiku at high effort by default, and the owner can change it", async () => {
+  const run = async (args) => {
+    const triage = [];
+    const agent = async (prompt, opts) => {
+      if (opts.agentType === RELAY) {
+        const { request } = receive(prompt);
+        const f = (id) => ({ id, severity: "medium", category: "c", title: "t" + id, file: "x.rs", line: 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.7 });
+        return okEnvelope(request, { verdict: "request_changes", summary: "sum", findings: [f("a"), f("b")] });
+      }
+      if (opts.label?.startsWith("triage:")) { triage.push(opts); return { verdict: "confirmed", severity: "medium", severityReason: "", reasoning: "seen" } }
+      if (opts.label === "report") return "FINAL";
+      return null;
+    };
+    const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"], escalate: false, ...args } });
+    return { triage, result };
+  };
+  const byDefault = await run({});
+  assert.equal(byDefault.triage.length, 2);
+  for (const opts of byDefault.triage) {
+    assert.equal(opts.model, "haiku");
+    assert.equal(opts.effort, "high");
+    assert.equal(opts.agentType, "ultracodex:codex-reader", "the reader confinement is kept");
+  }
+  assert.deepEqual(byDefault.result.triage, { model: "haiku", effort: "high" });
+
+  const sonnet = await run({ triageModel: "sonnet", triageEffort: "xhigh" });
+  assert.deepEqual(sonnet.triage.map((o) => [o.model, o.effort]), [["sonnet", "xhigh"], ["sonnet", "xhigh"]]);
+
+  const inherit = await run({ triageModel: "inherit" });
+  for (const opts of inherit.triage) assert.ok(!("model" in opts) && !("effort" in opts), "inherit leaves model and effort to the session");
+  assert.deepEqual(inherit.result.triage, { model: "inherit", effort: null });
+
+  const unknown = await run({ triageModel: "gpt-6-astra", triageEffort: "ultra" });
+  assert.deepEqual(unknown.triage.map((o) => [o.model, o.effort]), [["haiku", "high"], ["haiku", "high"]], "unknown values fall back to the default");
+
+  const off = await run({ triage: false });
+  assert.equal(off.triage.length, 0);
+  assert.equal(off.result.triage, null);
+});
+
 test("codex-review keeps a finding whose triage failed, as needs-info, and reports incomplete", async () => {
   const agent = async (prompt, opts) => {
     if (opts.agentType === RELAY) {

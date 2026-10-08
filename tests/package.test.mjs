@@ -79,6 +79,7 @@ test("the key agent is a separate Bash-only agent that runs only key and expect"
   const { fields, body } = frontmatter(path.join(PLUGIN, "agents", "codex-key.md"));
   assert.equal(fields.name, "codex-key");
   assert.equal(fields.tools, "Bash");
+  assert.equal(fields.model, "haiku", "two fixed commands and an echoed line: the cheapest model (the helper retries on opus)");
   assert.ok(body.includes('node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" key'));
   assert.ok(body.includes('node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" expect'));
   assert.match(body, /ULTRACODEX EXPECT/);

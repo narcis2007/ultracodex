@@ -58,7 +58,7 @@ exceptional unresolved problem after an `xhigh` attempt or an owner request, wit
 | mode | how | Claude-side cost | use for |
 | --- | --- | --- | --- |
 | **direct** | the main conversation writes a request file and runs the runner (`start` + background `wait`); skills `codex-ask`, `codex-review` by hand, `codex-implement` | none beyond reading the answer | one question, one claim, one review, any implementation |
-| **shipped workflow** | `Workflow({ name: 'ultracodex:…', args })` | a relay agent (Sonnet, low effort) per Codex call + Claude finders/triage | reviews and panels that need several Codex calls plus Claude checking them |
+| **shipped workflow** | `Workflow({ name: 'ultracodex:…', args })` | a relay agent (Sonnet, low effort) per Codex call, a key agent (Haiku) per workflow + Claude finders/triage | reviews and panels that need several Codex calls plus Claude checking them |
 | **custom workflow** | a script with the helper block (`references/workflow-templates.md`) | as above | orchestration the shipped workflows do not cover |
 
 Cost levers, in order of effect:
@@ -84,11 +84,12 @@ Run by name with `args` (JSON values, not strings):
   high/critical findings → Claude report (confirmed / disputed / refuted / unverified).
   `args: { target, cwd, dimensions, verifyTier: 'daily'|'final', finalGate, context, lessons, batch }`
 - **`ultracodex:codex-review`** — Codex reviews through lenses (`code`, `domain`, `security`,
-  `tests`, `performance`) → Claude checks every finding in the code → high/critical findings
+  `tests`, `performance`) → Claude checks every finding in the code (Haiku 5.5 @high by default;
+  `triageModel` / `triageEffort` override it, `'inherit'` = the session's model) → high/critical findings
   from non-Astra lenses that Claude refuted or could not settle go to astra in one run → report.
   Omit `tier` for Sol 6.1 on ordinary lenses and Astra on `security`; an explicit tier applies
   to every lens. `lenses[].tier` and `lenses[].model` report actual routing.
-  `args: { cwd, base | commit | uncommitted, lenses, tier: 'light'|'daily'|'final', escalate, context, lessons, triage }`
+  `args: { cwd, base | commit | uncommitted, lenses, tier: 'light'|'daily'|'final', escalate, context, lessons, triage, triageModel, triageEffort }`
 - **`ultracodex:crosscheck`** — one Codex attempt (astra@max) to refute one claim.
   `args: { claim, evidence, cwd, tier }`
 - **`ultracodex:judge-panel`** — Claude angles + a Codex candidate, Claude+Codex jury,
