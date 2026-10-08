@@ -21,8 +21,10 @@ const TRIAGE = A.triage !== false
 // 249 recorded triage cases replayed at their reviewed commits, disagreements judged blind by
 // astra@max: Haiku missed 1 real defect (Sonnet 5.5: 4, the original Opus 5.5 triage: 11). It
 // leans towards confirming and towards higher severity — never a looser ship verdict — and the
-// astra tiebreak below still covers the high/critical findings it doubts. 'inherit' = the
-// session's model.
+// astra tiebreak below still covers the high/critical findings it doubts. 'inherit' leaves the
+// model unset, so Claude Code picks it as for any workflow agent: the session's model, or
+// CLAUDE_CODE_SUBAGENT_MODEL when the owner set it. (agent() documents no 'inherit' value, so
+// none is passed.)
 const TRIAGE_MODEL = ['haiku', 'sonnet', 'opus', 'inherit'].includes(A.triageModel) ? A.triageModel : 'haiku'
 const TRIAGE_EFFORT = ['low', 'medium', 'high', 'xhigh', 'max'].includes(A.triageEffort) ? A.triageEffort
   : TRIAGE_MODEL === 'inherit' ? null : 'high'

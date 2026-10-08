@@ -85,7 +85,7 @@ Run by name with `args` (JSON values, not strings):
   `args: { target, cwd, dimensions, verifyTier: 'daily'|'final', finalGate, context, lessons, batch }`
 - **`ultracodex:codex-review`** — Codex reviews through lenses (`code`, `domain`, `security`,
   `tests`, `performance`) → Claude checks every finding in the code (Haiku 5.5 @high by default;
-  `triageModel` / `triageEffort` override it, `'inherit'` = the session's model) → high/critical findings
+  `triageModel` / `triageEffort` override it, `'inherit'` = Claude Code's default for workflow agents: the session's model, or `CLAUDE_CODE_SUBAGENT_MODEL` when set) → high/critical findings
   from non-Astra lenses that Claude refuted or could not settle go to astra in one run → report.
   Omit `tier` for Sol 6.1 on ordinary lenses and Astra on `security`; an explicit tier applies
   to every lens. `lenses[].tier` and `lenses[].model` report actual routing.

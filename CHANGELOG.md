@@ -3,7 +3,8 @@
 ## 0.3.8 — 2026-10-08 (Haiku 5.5)
 
 - `codex-review` triage runs on Claude Haiku 5.5 at `high` effort by default; `triageModel`
-  (`haiku` | `sonnet` | `opus` | `inherit`) and `triageEffort` override it, and the result
+  (`haiku` | `sonnet` | `opus` | `inherit` — Claude Code's default for workflow agents: the
+  session's model, or `CLAUDE_CODE_SUBAGENT_MODEL` when set) and `triageEffort` override it, and the result
   reports what ran (`triage: { model, effort }`). Measured on 249 recorded triage cases
   replayed at their reviewed commits, every disagreement judged blind by astra@max: Haiku 5.5
   missed 1 real defect (low), Sonnet 5.5 missed 4, the original Opus 5.5 triage 11. Haiku leans
