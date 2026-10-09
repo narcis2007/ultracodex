@@ -78,6 +78,16 @@ The final line is the envelope: `result` (or `text`) plus `provenance` (model, e
 tokens, duration). A large result prints as a compact line with `paged.file` — read that
 file with the Read tool.
 
+### Several questions in a row: `"session": true`
+
+The default is one-shot: one question, one run. When you expect to **follow up** (a second angle,
+"now check X", pressing on a disagreement), add `"session": true` to the request. The run then keeps
+its Codex thread: `wait` returns the first answer and the session goes idle; `send <runId> --message
+"…"` asks the next question in the same thread (same context, effort and schema, no new run), and the
+next `wait <runId>` returns that answer. `close <runId>` when you are done (an idle session sleeps by
+itself and the next `send` revives it). Sessions stay read-only and hermetic here, and they are for
+direct asks only — never a Workflow node. The command reference is the `codex-steer` skill.
+
 ## 4. Use the answer
 
 - Codex is evidence, not authority: check what it cites in the code before relying on it.
@@ -90,4 +100,4 @@ file with the Read tool.
 
 - Read-only and hermetic: never `workspace-write` here (that is `codex-implement`).
 - Never stop Codex processes this plugin did not start; `cancel <runId>` only for your own
-  run and only when the owner asks.
+  run and only when the owner asks (`close <runId>` ends a session of yours normally).

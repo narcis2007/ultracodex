@@ -14,7 +14,8 @@ description: >-
 # Delegate implementation to Codex
 
 Runner: `${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs` · brief template: `references/brief-template.md` ·
-tier policy: `${CLAUDE_PLUGIN_ROOT}/skills/codex-workflow/references/model-policy.md`
+tier policy: `${CLAUDE_PLUGIN_ROOT}/skills/codex-workflow/references/model-policy.md` ·
+talking to the running job: the `codex-steer` skill
 
 Codex writes the draft; **Claude owns the result**. Nothing Codex reports counts until you
 have checked it yourself, and nothing is merged without the owner's OK.
@@ -57,7 +58,7 @@ resource limits for this machine: e.g. `cargo … -j 1`, one test binary at a ti
 rules (Codex does not commit or push unless the brief says otherwise). Save it next to the
 request, e.g. in the session scratchpad.
 
-## 4. Start it
+## 4. Start it — as a session
 
 Request file (Write tool):
 
@@ -70,49 +71,74 @@ Request file (Write tool):
   "kind": "implement",
   "tier": "daily",
   "schemaPreset": "implement",
+  "session": true,
   "attached": false,
   "label": "implement:<slug>"
 }
 ```
 
+`"session": true` makes the run a **steerable session**: Codex runs on a private app-server, and you can
+steer it, send follow-ups, answer its questions and see what it does (the `codex-steer` skill has the
+command reference). `timeoutSec` (default sol@xhigh ≈ 90 min, astra@max ≈ 135 min) is the deadline of
+**each turn**. The cwd and `addDirs` of a writable run must not contain or lie inside the runner's home
+(`~/.ultracodex`): a Codex job must never be able to write its own inbox.
+
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" start --request "<request.json>"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" events <runId> --follow   # Monitor tool: one notification per event
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" wait <runId> --max-wait 9000   # run_in_background: true
 ```
 
-`attached: false` lets the run continue while you do other work; the deadline (sol@xhigh ≈ 90 min,
-astra@max ≈ 135 min) still applies. Implementation runs are **never retried automatically**
-(a replay could apply its changes twice): after a transient failure, inspect the worktree and
-resume the session or start a new brief deliberately. The background `wait` notifies you when it finishes;
-`status <runId>` shows progress at any time. Keep at most one or two implementation runs at once
-on this machine, and do not run heavy builds in parallel with them.
+- Follow progress with `events <runId> --follow` (the Monitor tool, re-armed with `--since <lastSeq>` when
+  it ends) or with the background `wait`, which also returns when Codex **asks a question**.
+- A `question` event is Codex blocked on you: `answer <runId> <questionId> --text "…"`.
+- Steer with `send <runId> --message "…"` (lands at Codex's next step; one clear instruction at a
+  time), `interrupt <runId>` to stop the turn now.
+- The turn's end shows as `idle` (`wait` prints that turn's envelope — the `implement` report). The
+  session sleeps by itself after `idleTtlSec` (default 20 min) and the next `send` revives it, also
+  after a reboot.
+
+`attached: false` lets the run continue while you do other work. Implementation turns are **never
+retried automatically** (a replay could apply its changes twice): after a transient failure, inspect the
+worktree and send a follow-up deliberately. Keep at most one or two implementation sessions at once on this
+machine, and do not run heavy builds in parallel with them. A session holds a machine-wide slot only while a
+turn runs.
+
+*Fallback, one line:* leave `"session"` out for the old one-shot run (`wait` returns its single result;
+a follow-up is then a new run with `"resume": { "sessionId": "<provenance.threadId>" }` — see section 6).
 
 ## 5. Verify — trust nothing unverified
 
-1. Read the `implement` report (status, tasks, files, commands, tests, open questions, risks).
+1. Read the `implement` report of the turn (status, tasks, files, commands, tests, open questions, risks):
+   `wait <runId>` once the session is idle, or `result <runId> [--turn N]`.
 2. `git -C <worktree> status` and `git -C <worktree> diff` — read the actual change.
 3. Run the verification commands yourself. "Tests passed" in the report is a claim, not evidence.
 4. Check every task marked `done` against the diff; list anything missing or partial.
-5. If the run ended in `timeout`, `abandoned`, `cancelled` or `usage_limit`, the tree may hold a
+5. If the run ended in `timeout`, `abandoned`, `cancelled`, `interrupted` or `usage_limit`, the tree may hold a
    half-written change: inspect it before building on it. (A usage-limited run first waits up to
    `limitWaitSec`, 24 h by default, for the limit to reset and then resumes by itself; `status`
    shows `waitingForLimit` and `resumesAt`.)
 
 ## 6. Iterate or review (combinations)
 
-- **Follow-up in the same Codex session** (keeps its context; the runner restates the sandbox on
-  every resume — `codex exec resume` alone runs read-only — so a follow-up that must write says
-  `"sandbox": "workspace-write"`):
-  `{ "resume": { "sessionId": "<provenance.threadId>" }, "sandbox": "workspace-write", "taskFile": "<fix brief>", "cwd": "<worktree>", "kind": "implement", "tier": "daily", "schemaPreset": "implement", "attached": false }`
+- **Follow-up in the same Codex session** (same thread, same context, no new run): `send <runId> --message-file
+  "<fix brief>"` — the effort, schema and sandbox of the session apply, and nothing needs restating. Give it as
+  a complete instruction (list the findings to fix). `wait <runId>` returns the follow-up turn's report.
+  *One-shot fallback:* `{ "resume": { "sessionId": "<provenance.threadId>" }, "sandbox": "workspace-write", "taskFile": "<fix brief>", "cwd": "<worktree>", "kind": "implement", "tier": "daily", "schemaPreset": "implement", "attached": false }`
+  (the runner restates the sandbox on every resume — `codex exec resume` alone runs read-only — so a follow-up that
+  must write says `"sandbox": "workspace-write"`).
 - **Adversarial review of the result**: the `codex-review` skill (or the
   `ultracodex:codex-review` workflow) on the worktree branch — typically on a *different* tier
   than the implementer (sol implements → astra reviews at the end), or
   `ultracodex:cross-review` so Claude finds and Codex verifies.
 - Fix confirmed findings (yourself or via a resume brief), then re-verify.
 
-## 7. Hand over
+## 7. Close and hand over
 
-Summarize what was built, what you verified and how, the open items, and where the branch is.
+After verification, `close <runId>` (`--archive` when the work is merged or abandoned: it also archives the Codex
+thread; without it the thread stays in Codex's history). An idle session would sleep by itself, but a session you
+are done with should be closed. Then summarize what was built, what you verified and how, the open items, and where
+the branch is.
 **Do not merge or push to shared branches without the owner's explicit OK** — they review
 locally first.
 
@@ -120,7 +146,8 @@ locally first.
 
 - Never stop Codex processes this plugin did not start (the owner runs parallel Codex
   sessions). `cancel <runId>` only for your own run and only when the owner asks. A
-  `supervisor_lost` run is reported with its PID, never killed.
+  `supervisor_lost` run is reported with its PID, never killed. `close` is the normal way to end your own
+  session; `interrupt` stops a turn but keeps the session.
 - Hermetic by default (the owner's MCP servers are not loaded). Pass `"hermetic": false` only if
   the task truly needs the user's Codex config.
 - A strict schema is required for structured reports; the `implement` preset already is.

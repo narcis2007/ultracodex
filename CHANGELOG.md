@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.4.0 — 2026-10-09 (sessions)
+
+Claude can talk to a running Codex job. Opt-in, for direct runs only (`codex-implement`, `codex-ask`); Workflow
+nodes and the relay path are untouched, and the one-shot behaviour of 0.3.9 is unchanged.
+
+- **Steerable sessions.** `"session": true` makes the supervisor drive a private
+  `codex app-server --listen stdio://` (JSON-RPC 2.0 over stdio, new module `scripts/session.mjs`) instead of
+  `codex exec`. One session = one Codex thread. New commands: `send RUN (--message TEXT | --message-file FILE)
+  [--mode auto|steer|queue]` (steer the running turn — Codex reads it at its next step boundary — start a
+  follow-up turn on the same thread, or queue one), `interrupt RUN`, `answer RUN QUESTION_ID (--text|--file)`,
+  `events RUN [--since SEQ] [--follow] [--max-wait SEC]` (the compact event feed, built for Claude Code's Monitor
+  tool) and `close RUN [--force] [--archive]`; `result RUN --turn N`, `status`, `wait` and `gc` know sessions.
+  New request fields: `session`, `idleTtlSec` (default 1200), `askOrchestrator` (default true), `askTimeoutSec`
+  (default 1800). `timeoutSec` is the deadline of each turn. A relayed (framed) request with `session` is
+  refused, as are `review` and `profile` with it.
+- **State model.** `queued` → `running` → `idle` (app-server up for `idleTtlSec`) → `dormant` (no process; the
+  thread is on disk) → revived by the next `send` — a new supervisor resumes the thread with the requested
+  sandbox, also after a reboot — until `close`. `result.json` only exists once a session ended for good
+  (closed, cancelled, failed, hermetic violation); each turn's signed envelope is `turns/<n>.json` and `wait`
+  returns the latest as soon as the session is idle, or at once when a question is waiting. One supervisor per
+  session (an exclusive `supervisor.lock`).
+- **`ask_orchestrator`.** Codex gets a client-side tool to ask the orchestrating agent a question; the call is a
+  `question` event, `wait` / `events --follow` return early, and it stays blocked until `answer` or an automatic
+  "proceed with your best judgement" after `askTimeoutSec`.
+- **Phase 1 inside sessions.** The usage-limit wait, account handoff (the app-server is restarted on the new
+  account, the thread resumed and continued), checkpoint fallback, spacing and eight-continuation budget apply to
+  a session's turns; limit waits no longer hold a slot, and `close` / `interrupt` / `cancel` act during one. Slots
+  are held only while a turn runs. `onOrphan` applies while a turn runs; an idle session is never abandoned.
+- **Event feed** (`events.jsonl`): `session_started`, `turn_started`, `message`, `command_started`, `command`,
+  `file_change` (relative paths, no diffs), `plan`, `tool`, `question`, `answer`, `steer`, `followup`, `interrupt`,
+  `error`, `turn_completed`, `limit_wait`, `resumed`, `idle`, `dormant`, `closed`, `cancelled`,
+  `hermetic_violation`; `seq` strictly increasing across revives. Reasoning, auth data and account ids are never
+  written; past 8 MB only structural events are kept.
+- **Hermetic sessions fail closed.** `codex app-server` has no `--ignore-user-config`, so the spawn disables
+  plugins, apps, notify and every MCP server the user's config declares, and after `thread/start|resume` the
+  runner asks `mcpServerStatus/list`: a server that still reports tools (or a list that cannot be read) stops the
+  app-server and ends the run as `hermetic_violation` before any turn.
+- **Security.** A writable request (session or not) whose `cwd` or any `addDirs` entry contains, or lies inside, the
+  runner's home (`~/.ultracodex`, links resolved) is refused: a Codex job must never write its own inbox. The relay
+  guard is unchanged and gives relays and readers none of the session commands.
+- Skills: new `codex-steer` (the command reference and the etiquette); `codex-implement` starts as a session and
+  follows up with `send`; `codex-ask` mentions `session: true` for multi-turn questions.
+- New failure kinds: `interrupted` (a turn interrupted on request), `context` (`contextWindowExceeded`),
+  `hermetic_violation`.
+
 ## 0.3.9 — 2026-10-09 (limits)
 
 Stop losing Codex work at usage limits.

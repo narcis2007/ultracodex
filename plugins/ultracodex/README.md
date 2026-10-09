@@ -6,11 +6,14 @@ Codex (GPT-6 via `codex exec`) inside Claude Code.
   `ultracodex:judge-panel` (`workflows/`).
 - **Skills**: `codex-ask` (one question or claim, straight to the runner — no relay),
   `codex-workflow` (modes, cost levers, Codex nodes in custom Workflow scripts), `codex-review`
-  (adversarial review with triage), `codex-implement` (delegate to Codex in a worktree, verify).
+  (adversarial review with triage), `codex-implement` (delegate to Codex in a worktree, verify),
+  `codex-steer` (talk to a running Codex session: steer, follow up, answer its questions, close).
 - **Agents**: `codex-relay` — internal relay for Workflow nodes; `codex-key` — internal, fetches
   the runner key and a nonce and announces requests for the helper; `codex-reader` — the
   confined type for Claude stages that read reviewed code (Read, Grep, Glob, read-only git).
-- **Runner**: `scripts/codex-node.mjs` — run `node scripts/codex-node.mjs help`.
+- **Runner**: `scripts/codex-node.mjs` (the session driver is `scripts/session.mjs`) — run
+  `node scripts/codex-node.mjs help`. A direct run with `"session": true` is a steerable session on a
+  private `codex app-server`: `send` / `interrupt` / `answer` / `events --follow` / `close` (README: "Sessions").
 - **Hook**: `hooks/hooks.json` → `scripts/relay-guard.mjs` — confines the job relay to the runner's
   `part`/`wait`/`page` commands, the key agent to `key`/`expect` and the reader to read-only
   git; other subagents only lose the runner's `key`/`expect` (the main conversation is untouched).

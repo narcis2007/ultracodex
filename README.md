@@ -24,10 +24,11 @@ see [CHANGELOG.md](CHANGELOG.md) for what changed.
 | Skill `codex-workflow` | Modes and cost levers; how to blend Codex nodes into custom Workflow scripts (the `codexNode` helper). |
 | Skill `codex-review` | Standalone adversarial review of a branch / commit / uncommitted change, with triage. |
 | Skill `codex-implement` | Delegate implementation to Codex in a worktree, verify, iterate, review. |
+| Skill `codex-steer` | Talk to a running Codex session: steer it, send follow-ups, see what it does, answer its questions, close it. |
 | Agent `codex-relay` | Internal: the Bash-only relay that runs one Codex job for a Workflow node. |
 | Agent `codex-key` | Internal: fetches the runner key and a nonce once per workflow, and announces each request to the runner (no task text in its prompt). |
 | Agent `codex-reader` | Internal: the confined type for Claude stages that read reviewed code — Read, Grep, Glob and read-only git. |
-| Runner `scripts/codex-node.mjs` | Validates requests, runs `codex exec` under a detached supervisor with deadlines, process-tree teardown, retries, machine-wide slots and a provenance envelope. |
+| Runner `scripts/codex-node.mjs` (+ `session.mjs`) | Validates requests, runs `codex exec` — or, for a steerable session, a private `codex app-server` — under a detached supervisor with deadlines, process-tree teardown, retries, machine-wide slots and a provenance envelope. |
 
 ## Model policy — astra, sol, luna
 
@@ -56,7 +57,7 @@ workflow returns `codexUsage` — runs and tokens per model.
 ## Requirements
 
 - Claude Code with dynamic workflows (tested on 2.1.280)
-- Codex CLI, logged in (`codex login`; tested on 0.156.1)
+- Codex CLI, logged in (`codex login`; tested on 0.156.1; sessions drive `codex app-server`, tested on 0.163.0-alpha.2)
 - Node.js 18+
 
 ## Usage limits and account switching
@@ -107,6 +108,57 @@ and gets the result. `status` and `wait` show `orphaned: true` while no poller i
 seen. `onOrphan: "stop"` restores the old rule (`abandoned` after `orphanAfterSec`
 without a poll). After stopping a workflow on purpose, `node scripts/codex-node.mjs
 cancel --orphaned` cancels every unfinished run on this machine whose caller stopped polling.
+
+## Sessions: steer a running Codex job
+
+A one-shot run cannot be talked to. A **session** can: add `"session": true` to the request of a direct run
+(`codex-implement`, `codex-ask`; never a Workflow node — a relayed request with `session` is refused) and
+the supervisor drives a private `codex app-server --listen stdio://` (JSON-RPC over stdio) instead of
+`codex exec`. One session is one Codex thread; Claude can
+
+- **steer** the running turn (`send`: Codex reads it at its next step boundary) or **queue** a message;
+- send **follow-ups** after a turn — same thread, same context, no new run;
+- **interrupt** a turn, read the **event feed** (`events RUN --follow`, built for Claude Code's Monitor tool),
+  **answer questions** Codex asks through its client-side tool `ask_orchestrator`, and **close** the session.
+
+```bash
+node scripts/codex-node.mjs start --request req.json        # {"session": true, "task": "…", …}
+node scripts/codex-node.mjs events RUN --follow             # a line per event; ends on idle / question / dormant / ended
+node scripts/codex-node.mjs send RUN --message "also handle the empty case"   # steer, follow up or queue (--mode)
+node scripts/codex-node.mjs answer RUN QUESTION_ID --text "use Postgres"
+node scripts/codex-node.mjs interrupt RUN
+node scripts/codex-node.mjs close RUN [--force] [--archive]
+```
+
+**State.** `queued` → `running` (a turn) → `idle` (the app-server stays up for `idleTtlSec`, default 20 min)
+→ `dormant` (no process at all; the thread is on disk) → the next `send` **revives** it transparently — a new
+supervisor resumes the thread with the requested sandbox, also after a reboot — until `close`
+(`closed`; `--archive` also archives the Codex thread). `result.json` exists only for a session that
+ended for good (closed, cancelled, failed, a hermetic violation); each turn's signed envelope is
+`turns/<n>.json`, and `wait` returns the latest one as soon as the session is idle (or a question is waiting).
+`timeoutSec` is the deadline of **each turn**; the usage-limit wait, account handoff, spacing and budget of
+the one-shot runs apply inside a session (the app-server is restarted on a new account, then the thread is
+resumed and continued); orphan handling, slots (held only while a turn runs) and Job Object teardown are the
+same.
+
+**Questions.** With `askOrchestrator` (default on) the thread gets a client-side tool `ask_orchestrator`. A call
+is a `question` event; `wait` and `events --follow` return at once and Codex is blocked until `answer` — or
+until `askTimeoutSec` (default 1800) passes and it is told to proceed on its best judgement. The deadline keeps
+running meanwhile.
+
+**Safety.** Hermetic sessions (the default) disable every MCP server of `~/.codex/config.toml`, plugins and apps
+(`app-server` has no `--ignore-user-config`) and then check with `mcpServerStatus/list` that none reports a tool
+— before any turn, failing closed (`hermetic_violation`). A writable request whose `cwd` or `addDirs` contains or
+lies inside the runner's home (`~/.ultracodex`) is refused: a Codex job must never write its own inbox. One
+supervisor per session (an exclusive `supervisor.lock`); the relay guard still allows relays and readers only
+their own commands, so none of `send`, `answer`, `interrupt`, `events`, `close` is available to them.
+
+**Event feed** (`events.jsonl`, one compact object per line, `seq` strictly increasing for the session's life):
+`session_started`, `turn_started`, `message`, `command_started`, `command`, `file_change` (relative paths, no diffs),
+`plan`, `tool`, `question`, `answer`, `steer`, `followup`, `interrupt`, `error`, `turn_completed`, `limit_wait`, `resumed`,
+`idle`, `dormant`, `closed`, `cancelled`, `hermetic_violation`. Reasoning, auth data and account ids are never
+written. Past 8 MB the file keeps only the structural events (no command / file / plan / tool / commentary events).
+The skill `codex-steer` is the command reference; `codex-node.mjs help` lists the syntax.
 
 ## Install
 

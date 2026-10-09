@@ -24,7 +24,8 @@ shell. Every command prints one JSON line tagged `{"ultracodex":1,...}`; exit co
 | `cancel --orphaned` | the same for every unfinished attached run whose caller stopped polling for its `orphanAfterSec` (the cleanup after stopping a workflow on purpose — it reaches every unpolled run on this machine, other sessions' too, so only when the owner asks); prints one line listing the run ids and labels |
 | `preflight [--live]` | CLI, auth, catalog, policy models, home dir; `--live` = one tiny luna call |
 | `dry-run --request FILE` | show the exact codex argv, model, effort, deadline — no model call |
-| `policy` · `models` · `schema PRESET` · `schema-check --schema FILE` · `gc` | helpers |
+| `policy` · `models` · `schema PRESET` · `schema-check --schema FILE` · `gc` | helpers (`gc` also removes dormant sessions older than `--older-than-days`) |
+| `send` · `interrupt` · `answer` · `events` · `close` · `result RUN --turn N` | steerable sessions — see "Sessions" below; never for relays or readers |
 
 Request fields (unknown fields are rejected): `task` or `taskFile`; `schema` / `schemaFile` /
 `schemaPreset` (`verdict`, `score`, `review`, `implement`); `cwd`; `sandbox` (`read-only` default,
@@ -39,7 +40,9 @@ twice); `attached` (default true — a run nobody polls for
 `stop`: it is torn down as `abandoned`); `limitWaitSec` (0–691200, default 86400: how long a usage-limited run waits for the limit to
 reset before failing with `usage_limit`; 0 = only the 15-minute account wait); `ephemeral` (default false to retain resumable thread history);
 `label`; `meta` (echoed back); `serviceTier` (`priority` = Fast); `addDirs`; `images`;
-`profile`; `review: {base|commit|uncommitted, title}`; `resume: {sessionId}`.
+`profile`; `review: {base|commit|uncommitted, title}`; `resume: {sessionId}`; for a session (direct runs only):
+`session` (default false), `idleTtlSec` (0–86400, default 1200), `askOrchestrator` (default true), `askTimeoutSec` (60–86400,
+default 1800) — see "Sessions".
 
 Envelope: `ok: true` + `result` (schema) or `text` — never both —, `resultHash` (FNV-1a of the
 body, so a relay's transcription can be verified), `mac` (see "Signed requests and results"),
@@ -254,6 +257,76 @@ eight of them, including production business APIs and a computer-use REPL. `-s r
 restricts shell commands, not MCP tools. Hermetic runs (`--ignore-user-config`) drop all of
 them; measured: same result, clean stderr, ~1.8K fewer input tokens. Pass `hermetic: false`
 only when a job genuinely needs the user's config.
+
+## Sessions (steerable runs)
+
+`"session": true` (direct requests only: a framed request that carries `session`, `idleTtlSec`, `askOrchestrator` or
+`askTimeoutSec` is refused; `review` and `profile` are refused with it; `exec` and `resume` modes work; the three
+other fields need `session: true`) makes the supervisor drive a private
+`codex app-server --listen stdio://` (JSON-RPC 2.0, one object per line; codex-cli 0.163.0-alpha.2) instead of
+`codex exec`. `scripts/session.mjs` holds the driver (the runner imports it back; the runner stays the one CLI entry).
+
+**Wire.** Spawn `<launcher> app-server --listen stdio://` (+ flags below) in the Job Object like `exec`; `initialize`
+`{clientInfo, capabilities: {experimentalApi: true}}` (required for `dynamicTools`) then `initialized`;
+`thread/start` `{model, cwd, sandbox, approvalPolicy: "never", ephemeral, dynamicTools?, serviceTier?}` or
+`thread/resume` `{threadId, sandbox, approvalPolicy: "never", model, excludeTurns: true}` (every revive, every account-change
+restart, and the first start of `resume` mode — the resumed sandbox is honoured, dynamic tools registered at `thread/start`
+are restored; a resumed external thread cannot gain `ask_orchestrator`); `turn/start` `{threadId, input, effort,
+outputSchema?}` (`localImage` items for `images`); `turn/steer` `{threadId, expectedTurnId, input}`; `turn/interrupt`;
+`mcpServerStatus/list` (hermetic check); `thread/archive` (`close --archive`); `account/rateLimits/read` stays the probe's.
+`turn/start` on an active turn steers (it does not queue), so the supervisor queues follow-ups itself and starts them after
+`turn/completed`. Closing the app-server's stdin ends it in under a second; one that lingers past `killGraceMs` is stopped
+with the Job Object like any run's tree, and whatever it left behind goes too. Hermetic spawn (no `--ignore-user-config` on
+`app-server`): `--disable plugins --disable apps -c notify=[]`, `-c mcp_servers.<name>.enabled=false` for every
+`[mcp_servers.<name>]` table (bare or quoted; also `name = {…}` under `[mcp_servers]` and dotted top-level keys) in
+`$CODEX_HOME/config.toml`, the Windows sandbox `-c`; workspace-write adds `sandbox_workspace_write.network_access` and
+`writable_roots` (= `addDirs`); `serviceTier` → `-c service_tier`. After every `thread/start|resume` a hermetic run calls
+`mcpServerStatus/list` (following `nextCursor`): any server with tools — or a list that cannot be read — stops the app-server
+and ends the run as `hermetic_violation` before a turn starts.
+
+**State machine.** `queued` (starting, waiting for a slot) → `running` (turn active; `steerable` false after
+`activeTurnNotSteerable`) → `idle` (`idleUntil`; events `idle`) → `dormant` (stdin closed, process gone, lock released, the
+supervisor exits; event `dormant`) → a message revives it (`resumed {reason: "revive"}`) → … → `closed` | `cancelled` | `failed`
+(`result.json`, the last turn's envelope with the final state). `backoff` while a turn's usage-limit/account wait runs. An
+app-server that exits outside a close fails the active turn (`execution`) and leaves the session dormant (no restart loop); an
+ephemeral session ends (`closed`) instead of sleeping. A turn's deadline (`timeoutSec`; moved by suspended time) interrupts it
+(kind `timeout`); an app-server that does not end the turn within `killGraceMs` is killed and the session goes dormant.
+`onOrphan` applies while a turn runs; an idle session is never abandoned (`cancel --orphaned` skips idle ones).
+
+**Run directory** (beside `request.json`, `state.json`, `supervisor.log`): `events.jsonl`; `inbox/` (`<id>.json`
+`{id, kind: send|interrupt|answer|close, text?, mode?, questionId?, force?, archive?, createdAt}`, moved to `inbox/done/` once
+handled, in order, polled every `ULTRACODEX_POLL_MS`); `outbox/<id>.json` `{id, outcome, reason?, turn?, at}`; `turns/<n>.json`;
+`queue/` (accepted follow-ups not yet started); `supervisor.lock` (`{pid, startedAt}`, created with `wx`; stale when its pid is
+gone, or — pid reuse after a reboot — when `alive` and the lock are both older than `lostAfterMs`; a supervisor whose lock
+was taken over stops without writing); `app-server.log` (the app-server's stderr). `state.json` adds `session`, `threadId`,
+`turn`, `turnActive`, `steerable`, `idleUntil`, `question` `{id, question, since}`, `queued`, `usageTotal`. Order of effects: an
+event is appended before the state that announces it; an inbox message is applied, then moved, then acknowledged — which is
+what lets `wait` / `events --follow` read "state, then events" and miss nothing. A `send` to a dormant session (or one whose
+supervisor is gone) writes its message, starts a detached supervisor the way `start` does and waits for the acknowledgement
+(`ULTRACODEX_ACK_WAIT_MS`, 15 s, then `pending`, exit 3); a supervisor that wound down just after a message arrived hands it on.
+
+**Turn envelope** = the one-shot envelope (same `mac`, `resultHash`, failure kinds) plus `session: {turn}`; provenance has
+`usage` (this turn), `usageTotal` (the session), `threadId`, `previousThreadIds` (after a checkpoint thread), and the chain's
+`accountHandoffs` / `limitResumes` / `limitWaitedSec` / `contextRestarts`. `codexErrorInfo` maps to `usage_limit`
+(`usageLimitExceeded`), `rate_limit`, `auth` (`unauthorized`), `context` (`contextWindowExceeded`), `server`, `network`
+(stream / connection failures), `invalid_request` (`badRequest`), `encrypted_history` (told by its text), else the text classifier;
+an interrupt is `interrupted` (`ok: false`, not retryable). Limits inside a session: a failed `usage_limit` / `auth` /
+`rate_limit` turn goes through the same preconditions, `waitForLimitReset` / `waitForAccountChange` (the deadline moves by the
+time waited, the eight-continuation budget and the spacing apply); a reset continues on the same app-server, an account
+change restarts it (`thread/resume`, hermetic check) and continues, and a rejected encrypted reasoning continues from
+`visibleAccountCheckpoint` in a fresh thread that becomes the session's. `close`, `interrupt`, `cancel` and new messages are
+handled while it waits.
+
+**Security.** Inbox writes come from unsandboxed callers only — a read-only Codex sandbox cannot write the runner's home
+(measured), and a writable request whose `cwd` or any `addDirs` entry contains, or lies inside, the home (links resolved) is
+refused (every writable request, session or not). The relay guard is unchanged and allows relays and readers none of the
+session commands. Nothing from `auth.json`, no account or credit id and no reasoning content is logged, returned or put in the
+feed.
+
+Timing and test knobs: `ULTRACODEX_ACK_WAIT_MS`, `ULTRACODEX_ACK_GRACE_MS` (how long a command keeps looking for its ack once `result.json`
+exists: the supervisor writes `result.json` first and acknowledges after it, so a `close` whose ack is late still reports `closed`),
+`ULTRACODEX_CLOSE_WAIT_MS`, `ULTRACODEX_LOCK_WAIT_MS`, `ULTRACODEX_MIN_ASK_TIMEOUT_SEC`, `ULTRACODEX_EVENT_CAP_BYTES`,
+`ULTRACODEX_TEST_FINAL_ACK_DELAY_MS` (tests only: delays the acks a session ends with).
 
 ## Model catalog (codex debug models)
 

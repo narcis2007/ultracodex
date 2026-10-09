@@ -12,8 +12,13 @@
 // ten), so no Bash call ever blocks for long; a run nobody polls any more is marked orphaned
 // and, unless the request says `onOrphan: "stop"`, still runs to its result.
 //
-// Every command prints exactly one JSON line tagged {"ultracodex":1,...}.
-// Exit codes: 0 done/ok, 1 failed or rejected, 2 usage error, 3 still running.
+// A request with `"session": true` (direct runs only) is driven through a private
+// `codex app-server` instead (scripts/session.mjs): the same supervisor, but Claude can steer the
+// running turn, send follow-ups, answer Codex's questions, follow an event feed and close the
+// session (`send`, `interrupt`, `answer`, `events`, `close`).
+//
+// Every command prints exactly one JSON line tagged {"ultracodex":1,...} (`events` prints the
+// feed's own lines). Exit codes: 0 done/ok, 1 failed or rejected, 2 usage error, 3 still running.
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
@@ -24,7 +29,26 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const RUNNER_VERSION = "0.3.9";
+import {
+  buildAppServerArgs,
+  claimSupervisorLock,
+  cmdAnswer,
+  cmdClose,
+  cmdEvents,
+  cmdInterrupt,
+  cmdSend,
+  configuredMcpServers,
+  endDormantSession,
+  runSession,
+  sessionHasWork,
+  sessionIsRevive,
+  sessionPendingMessages,
+  sessionResult,
+  sessionSupervisorAlive,
+  sessionWaitPrint,
+} from "./session.mjs";
+
+export const RUNNER_VERSION = "0.4.0";
 export const RUNNER_FILE = fileURLToPath(import.meta.url);
 
 export const EFFORTS = Object.freeze(["low", "medium", "high", "xhigh", "max", "ultra"]);
@@ -85,12 +109,17 @@ export const TIMING = Object.freeze({
   limitProbeMs: envInt("ULTRACODEX_LIMIT_PROBE_MS", 5 * 60_000), // rate-limit probe cadence while waiting for a limit reset
   limitProbeAfterResetMs: envInt("ULTRACODEX_LIMIT_PROBE_AFTER_RESET_MS", 30_000), // an extra probe this long after the reset time
   limitResetMarginMs: envInt("ULTRACODEX_LIMIT_RESET_MARGIN_MS", 60_000), // resume on the reset time alone only this long after it
+  ackWaitMs: envInt("ULTRACODEX_ACK_WAIT_MS", 15_000), // how long send/interrupt/answer wait for the supervisor's acknowledgement
+  ackGraceMs: envInt("ULTRACODEX_ACK_GRACE_MS", 3000), // how long a command keeps looking for its acknowledgement once the session's result.json exists
+  closeWaitMs: envInt("ULTRACODEX_CLOSE_WAIT_MS", 60_000), // how long close waits for a live supervisor to wind the session down
+  lockWaitMs: envInt("ULTRACODEX_LOCK_WAIT_MS", 8000), // how long a new supervisor waits for the lock of one that is winding down
   limitProbeTimeoutMs: envInt("ULTRACODEX_LIMIT_PROBE_TIMEOUT_MS", 20_000),
   slotPollMs: envInt("ULTRACODEX_SLOT_POLL_MS", 2000),
   slotStaleMs: envInt("ULTRACODEX_SLOT_STALE_MS", 60_000),
   killGraceMs: envInt("ULTRACODEX_KILL_GRACE_MS", 5000),
   minOrphanSec: envInt("ULTRACODEX_MIN_ORPHAN_SEC", 60),
   minTimeoutSec: envInt("ULTRACODEX_MIN_TIMEOUT_SEC", 60),
+  minAskTimeoutSec: envInt("ULTRACODEX_MIN_ASK_TIMEOUT_SEC", 60), // the lowest askTimeoutSec a request may name
   treeSnapshotMs: envInt("ULTRACODEX_TREE_SNAPSHOT_MS", 20_000), // fallback mode only (no Job Object)
   nonceWaitMs: envInt("ULTRACODEX_NONCE_WAIT_MS", 1000), // how long a duplicate upload looks for the winner's run
   slotClaimDelayMs: envInt("ULTRACODEX_SLOT_CLAIM_DELAY_MS", 0), // tests: widens the window between judging a slot free and landing the claim
@@ -140,6 +169,33 @@ function isDirSync(candidate) {
   } catch {
     return false;
   }
+}
+
+// True when one path is the other or lies inside it. Links are resolved through the deepest
+// existing ancestor (a junction cannot hide the runner's home), and Windows compares case-blind.
+export function pathsOverlap(a, b) {
+  const real = (target) => {
+    let current = path.resolve(target);
+    const tail = [];
+    for (;;) {
+      try {
+        return path.join(fs.realpathSync.native(current), ...tail.reverse());
+      } catch {
+        const parent = path.dirname(current);
+        if (parent === current) return path.resolve(target);
+        tail.push(path.basename(current));
+        current = parent;
+      }
+    }
+  };
+  const fold = (value) => (process.platform === "win32" ? value.toLowerCase() : value);
+  const inside = (child, parent) => {
+    const rel = path.relative(parent, child);
+    return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+  };
+  const x = fold(real(a));
+  const y = fold(real(b));
+  return inside(x, y) || inside(y, x);
 }
 
 function readTextSafe(file) {
@@ -593,6 +649,10 @@ const REQUEST_FIELDS = new Set([
   "profile",
   "review",
   "resume",
+  "session",
+  "idleTtlSec",
+  "askOrchestrator",
+  "askTimeoutSec",
   "taskHash",
   "schemaHash",
   "meta",
@@ -603,7 +663,7 @@ const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const PROFILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,199}$/;
 const COMMIT_RE = /^[0-9a-fA-F]{7,40}$/;
-const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{5,127}$/;
+export const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{5,127}$/;
 export const RUN_ID_RE = /^\d{8}T\d{6}Z-[0-9a-f]{6}$/;
 
 function expectBoolean(raw, name, fallback) {
@@ -732,6 +792,17 @@ export function validateRequest(raw, { catalog = null, requestDigest: signedDige
   if (mode === "review" && sandbox !== "read-only") {
     throw new RequestError("invalid_request", "review mode is read-only");
   }
+  // A session drives a private `codex app-server` (see session.mjs): no `exec review`, and no `-p`
+  // (the app-server has no profile flag).
+  const session = expectBoolean(raw, "session", false);
+  if (session && mode === "review") throw new RequestError("invalid_request", "a session cannot run a review");
+  if (session && raw.profile !== undefined && raw.profile !== null) {
+    throw new RequestError("invalid_request", "a session cannot use a profile (the app-server has no -p)");
+  }
+  if (!session) {
+    const stray = ["idleTtlSec", "askOrchestrator", "askTimeoutSec"].filter((name) => raw[name] !== undefined && raw[name] !== null);
+    if (stray.length) throw new RequestError("invalid_request", `${stray.join(", ")} need session: true`);
+  }
   const tier = expectEnum(raw, "tier", TIERS, "daily");
   const defaultKind = mode === "review" ? "review" : sandbox === "workspace-write" ? "implement" : "ask";
   const kind = expectEnum(raw, "kind", KINDS, defaultKind);
@@ -843,6 +914,18 @@ export function validateRequest(raw, { catalog = null, requestDigest: signedDige
     );
   }
 
+  // A Codex job must never be able to write the runner's home: its inbox answers questions and
+  // starts turns, and another run's state is not its own. A read-only sandbox cannot write there;
+  // a writable one can, if its cwd or an added directory is (inside) the home or contains it.
+  const addDirs = listOf("addDirs", isDirSync, "a directory");
+  if (sandbox === "workspace-write") {
+    for (const entry of [cwd, ...addDirs]) {
+      if (pathsOverlap(entry, ucxHome())) {
+        throw new RequestError("invalid_request", `a writable sandbox may not reach the runner's home (${ucxHome()}): ${entry} contains it or lies inside it`);
+      }
+    }
+  }
+
   const orphanFloor = Math.max(1, TIMING.minOrphanSec);
   return {
     mode,
@@ -879,11 +962,20 @@ export function validateRequest(raw, { catalog = null, requestDigest: signedDige
     ephemeral: expectBoolean(raw, "ephemeral", false),
     label,
     serviceTier: expectEnum(raw, "serviceTier", ["default", "priority"], null),
-    addDirs: listOf("addDirs", isDirSync, "a directory"),
+    addDirs,
     images: listOf("images", isFileSync, "a file"),
     profile: raw.profile ?? null,
     review,
     resume,
+    // Steerable session: the supervisor drives a private `codex app-server` instead of `codex exec`
+    // (direct runs only; see session.mjs). idleTtlSec: how long the app-server stays up after a
+    // turn when nothing is pending, then the session goes dormant (process gone, thread on disk,
+    // revived by the next message). askTimeoutSec: an unanswered ask_orchestrator question gets an
+    // automatic reply after this long.
+    session,
+    idleTtlSec: session ? expectInteger(raw, "idleTtlSec", 0, 86_400, 1200) : null,
+    askOrchestrator: session ? expectBoolean(raw, "askOrchestrator", true) : false,
+    askTimeoutSec: session ? expectInteger(raw, "askTimeoutSec", Math.max(1, TIMING.minAskTimeoutSec), 86_400, 1800) : null,
     meta,
     nonce: raw.nonce ?? null,
     requestDigest: signedDigest ?? directDigest(task),
@@ -1048,7 +1140,7 @@ export function framedToRaw({ header, schema, task }, { key = null } = {}) {
   // Framed requests come from a relaying model. Whatever it was told, it may only
   // start read-only, hermetic jobs with the task it was given inline — never a
   // write sandbox, a resumed (possibly writable) session, local files or config.
-  const forbidden = ["taskFile", "schemaFile", "resume", "addDirs", "images", "profile", "network"].filter(
+  const forbidden = ["taskFile", "schemaFile", "resume", "addDirs", "images", "profile", "network", "session", "idleTtlSec", "askOrchestrator", "askTimeoutSec"].filter(
     (key) => header[key] !== undefined && header[key] !== null && header[key] !== false
   );
   if (header.sandbox !== undefined && header.sandbox !== "read-only") forbidden.push("sandbox");
@@ -1427,6 +1519,15 @@ export function runPaths(runId, env = process.env) {
     alive: path.join(dir, "alive"),
     cancel: path.join(dir, "cancel"),
     log: path.join(dir, "supervisor.log"),
+    // sessions (see session.mjs)
+    events: path.join(dir, "events.jsonl"),
+    inbox: path.join(dir, "inbox"),
+    inboxDone: path.join(dir, "inbox", "done"),
+    outbox: path.join(dir, "outbox"),
+    turns: path.join(dir, "turns"),
+    queue: path.join(dir, "queue"),
+    lock: path.join(dir, "supervisor.lock"),
+    appServerLog: path.join(dir, "app-server.log"),
   };
 }
 
@@ -2742,7 +2843,7 @@ async function waitForAccountChange(paths, request, context, previous, mayWait) 
   try {
     for (;;) {
       until += context.clock.tick(); // a suspended machine did not wait either
-      const stop = stopReason(paths, request, context.clock);
+      const stop = context.waitStop?.() ?? stopReason(paths, request, context.clock);
       if (stop) return { stop };
       const next = managedAccountIdentity();
       if (next && next !== previous) return { changed: true };
@@ -2940,12 +3041,12 @@ async function waitForLimitReset(paths, request, context, previous, log, limitRe
   try {
     for (;;) {
       context.clock.tick();
-      const stop = stopReason(paths, request, context.clock);
+      const stop = context.waitStop?.() ?? stopReason(paths, request, context.clock);
       if (stop) return { stop };
       const next = managedAccountIdentity();
       if (next && next !== previous) return { changed: true };
       if (Date.now() >= nextProbeAt) {
-        const probe = await probeRateLimits({ launcher: context.launcher, shouldStop: () => stopReason(paths, request, context.clock) });
+        const probe = await probeRateLimits({ launcher: context.launcher, shouldStop: () => context.waitStop?.() ?? stopReason(paths, request, context.clock) });
         if (probe.reason === "stopped") continue; // the stop is reported at the top of the loop
         allowed = probe.ok ? probe.allowed : undefined;
         if (probe.ok) resumeAt = estimateResumeAt(probe.windows) ?? resumeAt;
@@ -2983,20 +3084,57 @@ export async function superviseRun(runId) {
   const paths = runPaths(runId);
   const stored = readJsonSafe(paths.request);
   if (!stored) return;
+  if (!stored.session) return superviseBody(runId, paths, stored, null);
+  // A session has exactly one supervisor at a time: it takes the lock before it spawns anything
+  // (the Job Object helper, the app-server) and gives it up when it exits. A supervisor that
+  // loses the race for it just leaves — the winner runs the session.
+  const log = (line) => appendLine(paths.log, `${nowIso()} ${line}`);
+  const lock = await claimSupervisorLock(paths, { waitMs: TIMING.lockWaitMs });
+  if (!lock) {
+    log("another supervisor owns this session; this one leaves");
+    return;
+  }
+  try {
+    if (readJsonSafe(paths.result)) {
+      log("this session has ended; nothing to supervise");
+      return;
+    }
+    return await superviseBody(runId, paths, stored, lock);
+  } finally {
+    lock.release();
+    // A message that arrived while this supervisor wound down has nobody to read it: hand it on.
+    if (readJsonSafe(paths.result) === null && sessionPendingMessages(paths).length) launchSupervisor(runId);
+  }
+}
+
+async function superviseBody(runId, paths, stored, lock) {
   const request = { ...stored, task: readTextSafe(paths.task) ?? "", schema: stored.hasSchema ? readJsonSafe(paths.schema) : null };
   const legacy = readJsonSafe(paths.accountRecovery);
   const log = (line) => appendLine(paths.log, `${nowIso()} ${line}`);
+  // A revived session that finds nothing to do (a spurious revive, a message already handled)
+  // goes back to sleep without a Job Object helper, a catalog refresh or an app-server.
+  if (request.session && sessionIsRevive(paths) && !sessionHasWork(paths)) {
+    log("revived with nothing to do; dormant again");
+    updateState(paths, { state: "dormant", dormantAt: nowIso(), turnActive: false, supervisorPid: null });
+    return;
+  }
   writeText(paths.alive, String(Date.now()));
   updateState(paths, { state: "queued", supervisorPid: process.pid });
   let slot = null;
   let slotLost = false;
   let lostBeats = 0;
+  const control = { fenced: false };
   const beat = setInterval(() => {
     writeText(paths.alive, String(Date.now()));
     try {
       slot?.touch();
     } catch {
       // a vanished slot is reclaimed by the next taker
+    }
+    // a session supervisor whose lock was taken over (it stalled past the stale window) stops driving
+    if (lock && !control.fenced && !lock.stillHeld()) {
+      control.fenced = true;
+      log("the session lock now belongs to another supervisor; stopping");
     }
     lostBeats = slot?.lost?.().length ? lostBeats + 1 : 0;
     if (!slotLost && lostBeats >= 2) {
@@ -3013,6 +3151,7 @@ export async function superviseRun(runId) {
     }
   }, TIMING.aliveMs);
   let envelope;
+  let sessionOutcome = null;
   // Windows: joining a Job Object before anything is spawned lets the kernel, not PID
   // bookkeeping, say which processes belong to this run (see "process-tree teardown").
   let job = process.platform === "win32" && process.env.ULTRACODEX_NO_JOB !== "1" ? startWindowsJob() : null;
@@ -3067,6 +3206,12 @@ export async function superviseRun(runId) {
         message: `effort ${request.effort} is not supported by ${request.model}`,
         status: null,
       });
+    } else if (request.session) {
+      // The session driver (session.mjs) runs the turns on a private app-server; it holds a slot
+      // only while a turn runs, and decides whether the session ends for good (an envelope, which
+      // becomes result.json), goes dormant (no result: it can be revived) or was fenced off.
+      sessionOutcome = await runSession({ runId, request, paths, context, log, check, control, setSlot: (next) => { slot = next; } });
+      envelope = sessionOutcome.envelope ?? null; // already written (result.json, state) by the driver
     } else {
       slot = await acquireSlots(request.weight, runId, check);
       if (slot.stopped) {
@@ -3174,6 +3319,14 @@ export async function superviseRun(runId) {
     } catch {
       // slot directories are reclaimed when stale
     }
+  }
+  if (sessionOutcome) {
+    // The driver wrote the end of a session itself (result.json comes before the close
+    // acknowledgement); a dormant (revivable) or fenced-off session has no result at all.
+    log(sessionOutcome.fenced ? "fenced off; leaving the session to its new supervisor"
+      : envelope ? `finished: ${envelope.state}${envelope.ok ? "" : ` (${envelope.error?.kind})`}`
+      : "dormant: no processes left; the next message revives it");
+    return;
   }
   if (slotLost) envelope.provenance = { ...(envelope.provenance ?? {}), slotLost: true };
   writeJsonAtomic(paths.result, envelope);
@@ -3290,6 +3443,9 @@ function persistRun(request) {
   delete stored.schema;
   writeJsonAtomic(paths.request, stored);
   writeText(paths.heartbeat, String(Date.now()));
+  if (request.session) {
+    for (const dir of [paths.inboxDone, paths.outbox, paths.turns, paths.queue]) fs.mkdirSync(dir, { recursive: true });
+  }
   writeJsonAtomic(paths.state, {
     state: "starting",
     runId,
@@ -3302,6 +3458,7 @@ function persistRun(request) {
     timeoutSec: request.timeoutSec,
     attached: request.attached,
     cwd: request.cwd,
+    ...(request.session ? { session: true, turn: 0, turnActive: false, queued: 0, question: null } : {}),
   });
   return { runId, paths };
 }
@@ -3507,6 +3664,7 @@ function startedLine(runId, request, state) {
     tier: request.tier,
     kind: request.kind,
     timeoutSec: request.timeoutSec,
+    ...(request.session ? { session: true, idleTtlSec: request.idleTtlSec, events: `events ${runId} --follow` } : {}),
     next: `wait ${runId}`,
   };
 }
@@ -3575,6 +3733,26 @@ async function recoverLegacyAccountRun(runId, paths, result) {
   return true;
 }
 
+// Starts a detached supervisor for run `runId` (`start` for a new run, `send` to revive a
+// dormant session). `failure` is set if the process could not be spawned.
+export function launchSupervisor(runId) {
+  const supervisor = spawn(process.execPath, [RUNNER_FILE, "supervise", runId], {
+    // Never the (possibly untrusted) repository, and not the home either: a process's working
+    // directory cannot be deleted on Windows, and nothing is resolved relative to it anyway.
+    cwd: path.dirname(process.execPath),
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+    env: process.env,
+  });
+  const launched = { failure: null };
+  supervisor.on("error", (error) => {
+    launched.failure = error;
+  });
+  supervisor.unref();
+  return launched;
+}
+
 async function startFromRaw(raw, options, { requestDigest = null } = {}) {
   let request;
   try {
@@ -3630,33 +3808,20 @@ async function startFromRaw(raw, options, { requestDigest = null } = {}) {
     }
     fs.rmSync(registration, { force: true }); // consumed: the announcement starts one run, once
   }
-  const supervisor = spawn(process.execPath, [RUNNER_FILE, "supervise", runId], {
-    // Never the (possibly untrusted) repository, and not the home either: a process's working
-    // directory cannot be deleted on Windows, and nothing is resolved relative to it anyway.
-    cwd: path.dirname(process.execPath),
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-    env: process.env,
-  });
-  let spawnFailure = null;
-  supervisor.on("error", (error) => {
-    spawnFailure = error;
-  });
-  supervisor.unref();
+  const launched = launchSupervisor(runId);
   for (let index = 0; index < 50; index += 1) {
-    if (spawnFailure || readJsonSafe(paths.state)?.supervisorPid) break;
+    if (launched.failure || readJsonSafe(paths.state)?.supervisorPid) break;
     await sleep(100);
   }
-  if (spawnFailure) {
-    print(rejection("spawn", `could not start the supervisor: ${spawnFailure.message}`, { runId }), options.pretty);
+  if (launched.failure) {
+    print(rejection("spawn", `could not start the supervisor: ${launched.failure.message}`, { runId }), options.pretty);
     return 1;
   }
   print(startedLine(runId, request, readJsonSafe(paths.state) ?? {}), options.pretty);
   return 3;
 }
 
-export async function cmdWait(runId, { maxWaitSec = DEFAULT_MAX_WAIT_SEC, pretty = false } = {}) {
+export async function cmdWait(runId, { maxWaitSec = DEFAULT_MAX_WAIT_SEC, pretty = false, finalOnly = false } = {}) {
   if (!RUN_ID_RE.test(String(runId ?? ""))) throw new UsageError("wait needs a run id");
   const paths = runPaths(runId);
   if (!isDirSync(paths.dir)) {
@@ -3676,6 +3841,10 @@ export async function cmdWait(runId, { maxWaitSec = DEFAULT_MAX_WAIT_SEC, pretty
     }
     writeText(paths.heartbeat, String(Date.now()));
     const state = readJsonSafe(paths.state) ?? {};
+    if (state.session && !finalOnly) {
+      const early = sessionWaitPrint(runId, paths, state, pretty);
+      if (early !== null) return early;
+    }
     const lastSign = Math.max(readNumber(paths.alive), Date.parse(state.createdAt ?? 0) || 0);
     // Declared lost only if the supervisor stays silent while we watch — right after a
     // suspend every timestamp is old, and the supervisor needs a moment to tick again.
@@ -3693,9 +3862,10 @@ export async function cmdWait(runId, { maxWaitSec = DEFAULT_MAX_WAIT_SEC, pretty
           error: {
             kind: "supervisor_lost",
             retryable: false,
-            message:
-              `the supervisor stopped reporting; codex pid ${state.codexPid ?? "?"} may still be running. ` +
-              "It is NOT stopped automatically — check `status` and ask the owner before stopping anything.",
+            message: state.session
+              ? "the session's supervisor stopped reporting (its app-server ends with it). `send` revives the session — the turn it was running is then recorded as failed — and `close` ends it; nothing is stopped automatically."
+              : `the supervisor stopped reporting; codex pid ${state.codexPid ?? "?"} may still be running. ` +
+                "It is NOT stopped automatically — check `status` and ask the owner before stopping anything.",
             status: null,
           },
         },
@@ -3718,6 +3888,7 @@ export async function cmdWait(runId, { maxWaitSec = DEFAULT_MAX_WAIT_SEC, pretty
           attempt: state.attempt ?? null,
           elapsedSec: Math.round((Date.now() - startedAt) / 1000),
           timeoutSec: state.timeoutSec ?? null,
+          ...(state.session ? { session: true, turn: state.turn ?? 0, turnActive: Boolean(state.turnActive), queued: state.queued ?? 0 } : {}),
           next: `wait ${runId}`,
         },
         pretty
@@ -3761,9 +3932,19 @@ function describeRun(runId) {
     createdAt: state.createdAt ?? null,
     finishedAt: state.finishedAt ?? null,
     codexPid: result ? null : state.codexPid ?? null,
-    supervisorAlive: result ? false : Date.now() - alive < TIMING.lostAfterMs,
+    supervisorAlive: result ? false : state.session ? sessionSupervisorAlive(paths) : Date.now() - alive < TIMING.lostAfterMs,
     errorKind: result?.error?.kind ?? null,
     cwd: state.cwd ?? null,
+    ...(state.session
+      ? {
+          session: true,
+          turn: state.turn ?? 0,
+          turnActive: result ? false : Boolean(state.turnActive),
+          idleUntil: result ? null : state.idleUntil ?? null,
+          waitingForAnswer: result ? false : Boolean(state.question),
+          queued: result ? 0 : state.queued ?? 0,
+        }
+      : {}),
   };
 }
 
@@ -3790,8 +3971,13 @@ export async function cmdCancel(runId, { pretty = false } = {}) {
     print(rejection("unknown_run", `no such run: ${runId}`, { runId, state: "unknown" }), pretty);
     return 1;
   }
-  if (!readJsonSafe(paths.result)) writeText(paths.cancel, nowIso());
-  return cmdWait(runId, { maxWaitSec: 30, pretty });
+  if (!readJsonSafe(paths.result)) {
+    // A session with no live supervisor (dormant, or one that died) has nobody to read the cancel
+    // file: it is ended here, which also stops anything a dead supervisor left behind recorded.
+    if (readJsonSafe(paths.state)?.session && !sessionSupervisorAlive(paths)) await endDormantSession(runId, "cancelled");
+    else writeText(paths.cancel, nowIso());
+  }
+  return cmdWait(runId, { maxWaitSec: 30, pretty, finalOnly: true }); // not a question, not a turn: the end
 }
 
 // The cleanup after a workflow was stopped on purpose: its relays are gone, and an unpolled
@@ -3806,6 +3992,8 @@ export async function cmdCancelOrphaned({ pretty = false } = {}) {
     if (readJsonSafe(paths.result)) continue;
     if (!orphanedSince(paths, readJsonSafe(paths.request))) continue;
     if (Date.now() - readNumber(paths.alive) >= TIMING.lostAfterMs) continue;
+    // an idle session is revivable, not abandoned work: it goes dormant by itself
+    if (["idle", "dormant"].includes(readJsonSafe(paths.state)?.state)) continue;
     targets.push({ runId, paths, label: readJsonSafe(paths.state)?.label ?? null });
   }
   for (const target of targets) writeText(target.paths.cancel, nowIso());
@@ -3823,9 +4011,14 @@ export async function cmdCancelOrphaned({ pretty = false } = {}) {
   return 0;
 }
 
-export function cmdResult(runId, { pretty = false } = {}) {
+export function cmdResult(runId, { pretty = false, turn = null } = {}) {
   if (!RUN_ID_RE.test(String(runId ?? ""))) throw new UsageError("result needs a run id");
-  const result = readJsonSafe(runPaths(runId).result);
+  const paths = runPaths(runId);
+  if (turn !== null || readJsonSafe(paths.state)?.session) {
+    const shown = sessionResult(runId, paths, turn, pretty);
+    if (shown !== null) return shown;
+  }
+  const result = readJsonSafe(paths.result);
   if (result) return printFinal(result, pretty);
   print({ ultracodex: 1, runnerVersion: RUNNER_VERSION, ok: null, ...describeRun(runId) }, pretty);
   return 3;
@@ -3838,9 +4031,13 @@ export function cmdGc({ olderThanDays = 7, pretty = false } = {}) {
     const paths = runPaths(runId);
     const result = readJsonSafe(paths.result);
     const state = readJsonSafe(paths.state) ?? {};
-    const finished = Date.parse(state.finishedAt ?? state.createdAt ?? 0) || 0;
+    // A session lives on after its first turn: its age is its last sign of life, and one that is
+    // dormant (no processes, thread in Codex's own history) goes the way of a finished run — never
+    // one whose supervisor is alive.
+    const finished = Date.parse(state.finishedAt ?? (state.session ? state.dormantAt ?? state.updatedAt : state.createdAt) ?? 0) || 0;
     const abandonedDir = !result && Date.now() - readNumber(paths.alive) > 2 * 24 * 3600 * 1000;
-    if ((result && finished < cutoff) || (abandonedDir && finished < cutoff)) {
+    if (!result && state.session && sessionSupervisorAlive(paths)) continue;
+    if ((result && finished < cutoff) || (abandonedDir && finished < cutoff) || (!result && state.session && state.state === "dormant" && finished < cutoff)) {
       fs.rmSync(paths.dir, { recursive: true, force: true });
       removed.push(runId);
     }
@@ -3991,7 +4188,11 @@ export async function cmdDryRun(options) {
       ok: true,
       modelCallMade: false,
       codex: { path: launcher.displayPath, source: launcher.source },
-      args: buildCodexArgs(request, files, { windowsSandbox: request.hermetic ? readUserWindowsSandbox() : null }),
+      // a session starts an app-server (its flags below), not `codex exec`
+      args: request.session
+        ? buildAppServerArgs(request, { windowsSandbox: request.hermetic ? readUserWindowsSandbox() : null, mcpServers: request.hermetic ? configuredMcpServers() : [] })
+        : buildCodexArgs(request, files, { windowsSandbox: request.hermetic ? readUserWindowsSandbox() : null }),
+      ...(request.session ? { session: true, idleTtlSec: request.idleTtlSec, askOrchestrator: request.askOrchestrator } : {}),
       model: request.model,
       effort: request.effort,
       tier: request.tier,
@@ -4025,7 +4226,16 @@ function helpText() {
     "  node codex-node.mjs policy | models | schema PRESET              routing policy, catalog, schema presets",
     "  node codex-node.mjs schema-check --schema FILE|-                 OpenAI strict-mode check for a schema",
     "  node codex-node.mjs dry-run (--request FILE|- | --framed FILE|-) show the codex invocation, no model call",
-    "  node codex-node.mjs gc [--older-than-days N]                     remove finished run directories",
+    "  node codex-node.mjs gc [--older-than-days N]                     remove finished run directories (and dormant sessions)",
+    "",
+    "  Sessions (request \"session\": true; direct runs only — see the codex-steer skill):",
+    "  node codex-node.mjs send RUN_ID (--message TEXT | --message-file FILE) [--mode auto|steer|queue]",
+    "                                                                   steer the running turn, start a follow-up turn, or queue one",
+    "  node codex-node.mjs interrupt RUN_ID                             interrupt the running turn",
+    "  node codex-node.mjs answer RUN_ID QUESTION_ID (--text TEXT | --file FILE)   answer Codex's ask_orchestrator question",
+    "  node codex-node.mjs events RUN_ID [--since SEQ] [--follow] [--max-wait SEC]  the compact event feed (JSON lines; for Monitor)",
+    "  node codex-node.mjs close RUN_ID [--force] [--archive]           end the session for good",
+    "  node codex-node.mjs result RUN_ID [--turn N]                     the latest (or turn N's) envelope of a session",
     "",
     "Exit codes: 0 done, 1 failed/rejected, 2 usage error, 3 still running.",
   ].join("\n");
@@ -4045,6 +4255,16 @@ function parseCli(argv) {
     maxWait: null,
     schema: null,
     olderThanDays: null,
+    follow: false,
+    force: false,
+    archive: false,
+    message: null,
+    messageFile: null,
+    mode: null,
+    text: null,
+    file: null,
+    since: null,
+    turn: null,
   };
   const valued = {
     "--request": "request",
@@ -4052,6 +4272,13 @@ function parseCli(argv) {
     "--max-wait": "maxWait",
     "--schema": "schema",
     "--older-than-days": "olderThanDays",
+    "--message": "message",
+    "--message-file": "messageFile",
+    "--mode": "mode",
+    "--text": "text",
+    "--file": "file",
+    "--since": "since",
+    "--turn": "turn",
   };
   for (let index = 0; index < rest.length; index += 1) {
     const token = rest[index];
@@ -4059,6 +4286,9 @@ function parseCli(argv) {
     else if (token === "--all") options.all = true;
     else if (token === "--live") options.live = true;
     else if (token === "--orphaned") options.orphaned = true;
+    else if (token === "--follow") options.follow = true;
+    else if (token === "--force") options.force = true;
+    else if (token === "--archive") options.archive = true;
     else if (valued[token]) {
       const value = rest[index + 1];
       if (value === undefined) throw new UsageError(`${token} requires a value`);
@@ -4071,6 +4301,13 @@ function parseCli(argv) {
     if (options[name] !== null) {
       const value = Number(options[name]);
       if (!Number.isFinite(value) || value < 0) throw new UsageError(`--${name} must be a non-negative number`);
+      options[name] = value;
+    }
+  }
+  for (const [name, flag, lowest] of [["since", "--since", 0], ["turn", "--turn", 1]]) {
+    if (options[name] !== null) {
+      const value = Number(options[name]);
+      if (!Number.isInteger(value) || value < lowest) throw new UsageError(`${flag} must be an integer of at least ${lowest}`);
       options[name] = value;
     }
   }
@@ -4118,6 +4355,16 @@ export async function main(argv = process.argv.slice(2)) {
         return cmdStatus(id, options);
       case "result":
         return cmdResult(id, options);
+      case "send":
+        return await cmdSend(id, options);
+      case "interrupt":
+        return await cmdInterrupt(id, options);
+      case "answer":
+        return await cmdAnswer(id, options.positionals[1], options);
+      case "events":
+        return await cmdEvents(id, options);
+      case "close":
+        return await cmdClose(id, options);
       case "cancel":
         if (options.orphaned) {
           if (id) throw new UsageError("cancel takes a run id or --orphaned, not both");
@@ -4200,6 +4447,46 @@ async function captureStart(options) {
   }
   return { runId: parsed.runId, exitCode };
 }
+
+// Shared with session.mjs (which imports this module back; only ever called, never read at load).
+export {
+  ACCOUNT_CONTINUATION,
+  MAX_ACCOUNT_HANDOFFS,
+  addUsage,
+  appendLine,
+  baseEnvelope,
+  buildProvenance,
+  checkpointContinuation,
+  clamp,
+  compact,
+  describeRun,
+  extractJsonObject,
+  failureEnvelope,
+  isDirSync,
+  isFileSync,
+  isPlainObject,
+  nowIso,
+  print,
+  publicRunState,
+  readBoundedFile,
+  readJsonSafe,
+  readNumber,
+  readTextSafe,
+  reapLeftovers,
+  rejection,
+  renameRetry,
+  sleep,
+  sleepSync,
+  startedLine,
+  tryUpdateState,
+  updateState,
+  waitForAccountChange,
+  waitForLimitReset,
+  withTimeout,
+  writeJsonAtomic,
+  writeText,
+  UsageError,
+};
 
 const invokedPath = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : null;
 if (invokedPath === import.meta.url) {

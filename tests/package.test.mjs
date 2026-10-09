@@ -49,7 +49,7 @@ test("marketplace lists exactly this plugin from ./plugins/ultracodex", () => {
 test("every skill has name + description frontmatter and uses the substituted runner path", () => {
   const skillsDir = path.join(PLUGIN, "skills");
   const names = fs.readdirSync(skillsDir);
-  assert.deepEqual(names.sort(), ["codex-ask", "codex-implement", "codex-review", "codex-workflow"]);
+  assert.deepEqual(names.sort(), ["codex-ask", "codex-implement", "codex-review", "codex-steer", "codex-workflow"]);
   for (const name of names) {
     const { fields, body } = frontmatter(path.join(skillsDir, name, "SKILL.md"));
     assert.equal(fields.name, name);
