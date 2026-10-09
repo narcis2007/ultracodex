@@ -94,12 +94,16 @@ on this machine, and do not run heavy builds in parallel with them.
 3. Run the verification commands yourself. "Tests passed" in the report is a claim, not evidence.
 4. Check every task marked `done` against the diff; list anything missing or partial.
 5. If the run ended in `timeout`, `abandoned`, `cancelled` or `usage_limit`, the tree may hold a
-   half-written change: inspect it before building on it.
+   half-written change: inspect it before building on it. (A usage-limited run first waits up to
+   `limitWaitSec`, 24 h by default, for the limit to reset and then resumes by itself; `status`
+   shows `waitingForLimit` and `resumesAt`.)
 
 ## 6. Iterate or review (combinations)
 
-- **Follow-up in the same Codex session** (keeps its context; the sandbox stays the original):
-  `{ "resume": { "sessionId": "<provenance.threadId>" }, "taskFile": "<fix brief>", "cwd": "<worktree>", "kind": "implement", "tier": "daily", "schemaPreset": "implement", "attached": false }`
+- **Follow-up in the same Codex session** (keeps its context; the runner restates the sandbox on
+  every resume — `codex exec resume` alone runs read-only — so a follow-up that must write says
+  `"sandbox": "workspace-write"`):
+  `{ "resume": { "sessionId": "<provenance.threadId>" }, "sandbox": "workspace-write", "taskFile": "<fix brief>", "cwd": "<worktree>", "kind": "implement", "tier": "daily", "schemaPreset": "implement", "attached": false }`
 - **Adversarial review of the result**: the `codex-review` skill (or the
   `ultracodex:codex-review` workflow) on the worktree branch — typically on a *different* tier
   than the implementer (sol implements → astra reviews at the end), or

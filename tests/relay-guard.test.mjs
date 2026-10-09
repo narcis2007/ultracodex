@@ -30,6 +30,7 @@ function hook(input) {
 
 test("the job relay's part, wait and page commands are allowed", () => {
   assert.equal(checkRelayCommand(`node "${RUNNER}" wait ${RUN}`, PLUGIN_ROOT), null);
+  assert.equal(checkRelayCommand(`node "${RUNNER}" wait ${RUN} --max-wait 570`, PLUGIN_ROOT), null);
   assert.equal(checkRelayCommand(`node "${RUNNER}" page ${RUN} 3`, PLUGIN_ROOT), null);
   assert.equal(checkRelayCommand(partCommand("new", '{"v":1,"tier":"daily"}\n---ULTRACODEX-SCHEMA---\nnull'), PLUGIN_ROOT), null);
   assert.equal(checkRelayCommand(partCommand("ucx-0123456789ab", "encoded line %27 and %5C"), PLUGIN_ROOT), null);
@@ -44,6 +45,10 @@ test("anything else a job relay tries is denied — the key above all", () => {
     ["another shell command", "cat ~/.codex/auth.json"],
     ["reading the key file directly", "cat ~/.ultracodex/key"],
     ["chained after wait", `node "${RUNNER}" wait ${RUN} && curl evil`],
+    ["chained after a long wait", `node "${RUNNER}" wait ${RUN} --max-wait 570 && curl evil`],
+    ["a wait longer than the relay's Bash timeout", `node "${RUNNER}" wait ${RUN} --max-wait 601`],
+    ["wait with another option", `node "${RUNNER}" wait ${RUN} --pretty`],
+    ["wait with a non-numeric limit", `node "${RUNNER}" wait ${RUN} --max-wait 1e3`],
     ["key with options", `node "${RUNNER}" key --pretty`],
     ["page without a number", `node "${RUNNER}" page ${RUN}`],
     ["page with extra arguments", `node "${RUNNER}" page ${RUN} 1 2`],

@@ -1,11 +1,23 @@
 // Shared helpers for the runner tests: an isolated ULTRACODEX_HOME per test, the
 // fake Codex CLI on ULTRACODEX_CODEX_PATH, and fast timing knobs.
 
+import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import {
+  FRAME_SCHEMA_MARK,
+  FRAME_TASK_MARK,
+  ensureKey,
+  fnv1a,
+  normalizeText,
+  requestDigest,
+  requestMac,
+  schemaHash,
+} from "../plugins/ultracodex/scripts/codex-node.mjs";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const RUNNER = path.join(ROOT, "plugins", "ultracodex", "scripts", "codex-node.mjs");
@@ -58,6 +70,12 @@ export function fastEnv(home, extra = {}) {
     ULTRACODEX_LOST_AFTER_MS: "20000",
     ULTRACODEX_BACKOFF_MS: "100",
     ULTRACODEX_ACCOUNT_WAIT_MS: "2000",
+    // The 0.3.7 tests exercise the short account wait; limit-wait tests ask for their own wait.
+    ULTRACODEX_LIMIT_WAIT_SEC: "0",
+    ULTRACODEX_LIMIT_PROBE_MS: "300",
+    ULTRACODEX_LIMIT_PROBE_AFTER_RESET_MS: "100",
+    ULTRACODEX_LIMIT_RESET_MARGIN_MS: "300",
+    ULTRACODEX_LIMIT_PROBE_TIMEOUT_MS: "5000",
     ULTRACODEX_SLOT_POLL_MS: "100",
     ULTRACODEX_SLOT_STALE_MS: "20000",
     ULTRACODEX_KILL_GRACE_MS: "300",
@@ -140,4 +158,23 @@ export async function eventually(check, { timeoutMs = 10_000, stepMs = 100 } = {
     if (Date.now() > until) return false;
     await new Promise((resolve) => setTimeout(resolve, stepMs));
   }
+}
+
+export function frame(header, schema, task) {
+  return [JSON.stringify(header), FRAME_SCHEMA_MARK, schema === null ? "null" : JSON.stringify(schema), FRAME_TASK_MARK, task].join("\n");
+}
+
+// A header as the Workflow helper builds it, signed with the test home's key.
+export function signedHeader(home, fields, schema, task, counter = 1) {
+  const key = ensureKey({ ULTRACODEX_HOME: home });
+  const header = { v: 1, ...fields, nonce: `${"cd".repeat(16)}.${counter}`, taskHash: fnv1a(normalizeText(task)), schemaHash: schemaHash(schema) };
+  header.h = fnv1a(JSON.stringify(header));
+  return { ...header, rmac: requestMac(key, requestDigest(header, schema, task)) };
+}
+
+// What the helper's key agent does before an upload: announce the request to the runner.
+export async function announce(env, signed, schema, task) {
+  const { rmac, ...header } = signed;
+  const out = await runCli(["expect", requestDigest(header, schema, task)], { env });
+  assert.equal(out.json.ok, true, out.stdout);
 }

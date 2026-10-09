@@ -28,10 +28,12 @@ Requires the Codex CLI (logged in) and Node.js 18+. Check with
 `node scripts/codex-node.mjs preflight --pretty`.
 
 Jobs retain thread history by default. After a ChatGPT quota failure, the runner
-waits for PrimerSwitch to select another account and resumes the saved thread
-under the same job id and permissions. Existing Claude relays keep polling.
-The wait is limited to 15 minutes and the original deadline; cancellation works.
-Active tool commands finish normally. Native `codex exec` cannot reload accounts
+waits — up to `limitWaitSec`, 24 hours by default — for the usage limit to reset
+(read from a cost-free rate-limit probe) or for PrimerSwitch to select another
+account, and resumes the saved thread under the same job id and permissions.
+Waiting does not use up the job's deadline; cancellation works; existing Claude
+relays keep polling. A run nobody polls any more keeps going (`onOrphan: "finish"`;
+`cancel --orphaned` cleans up). Active tool commands finish normally. Native `codex exec` cannot reload accounts
 mid-request. Explicit `ephemeral: true` opts out of history and continuation;
 external API-key authentication and missing thread history cannot be recovered.
 If cross-account resumption rejects encrypted reasoning, the runner continues

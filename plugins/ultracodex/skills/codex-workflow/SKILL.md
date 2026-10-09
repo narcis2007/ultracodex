@@ -131,9 +131,12 @@ What the helper guarantees (keep it intact):
    a rejected relay call is a failed node, never a vanished one.
 3. **Nothing blocks.** Codex runs detached under the runner's supervisor, which owns the
    deadline (model × effort × kind, scaled for batches) and tears down only the process tree
-   it started (on Windows: exactly the members of the run's Job Object). Every `wait` returns
-   within two minutes. A workflow node nobody polls for 15 min gets its run torn down
-   (`abandoned`).
+   it started (on Windows: exactly the members of the run's Job Object). A `wait` returns
+   within two minutes by default (the relay asks for up to ten). A workflow node nobody polls for 15 min is
+   marked `orphaned` but its run keeps going (`onOrphan: "finish"`): a resumed workflow
+   joins it and gets the result. After stopping a workflow on purpose, the owner can end its
+   leftover runs with `cancel --orphaned` — it cancels every unpolled run on this machine, other
+   sessions' included, so only when the owner asks.
 4. **Capped.** 4 Codex jobs per workflow (astra counts 2) and 4 machine-wide by default.
 5. **Fail closed.** Partition with `ucxPartition`; a dead node is `unverified`; return
    `status: 'incomplete'` when a required node failed.
@@ -147,7 +150,7 @@ What the helper guarantees (keep it intact):
 
 ## Runner commands you may need
 
-`status [RUN_ID]` · `result RUN_ID` · `wait RUN_ID` · `cancel RUN_ID` (only runs this plugin
+`status [RUN_ID]` · `result RUN_ID` · `wait RUN_ID` · `cancel RUN_ID` / `cancel --orphaned` (only runs this plugin
 started, and only when the owner asks) · `gc` · `policy` · `models` · `schema PRESET` ·
 `schema-check --schema FILE` · `dry-run --request FILE`. Full reference, error kinds and
 troubleshooting: `references/codex-headless.md`.

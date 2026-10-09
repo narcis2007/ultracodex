@@ -8,8 +8,9 @@
 // tree it started (taskkill /T on Windows, the process group elsewhere), retries
 // transient API failures with backoff, and writes one fail-closed JSON envelope
 // with provenance (thread id, model, effort, token usage). Callers poll with
-// `wait`, which returns within two minutes, so no Bash call ever blocks for long
-// and a relay that stops polling is detected and cleaned up.
+// `wait`, which by default returns within two minutes (the Workflow relay asks for up to
+// ten), so no Bash call ever blocks for long; a run nobody polls any more is marked orphaned
+// and, unless the request says `onOrphan: "stop"`, still runs to its result.
 //
 // Every command prints exactly one JSON line tagged {"ultracodex":1,...}.
 // Exit codes: 0 done/ok, 1 failed or rejected, 2 usage error, 3 still running.
@@ -23,7 +24,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const RUNNER_VERSION = "0.3.8";
+export const RUNNER_VERSION = "0.3.9";
 export const RUNNER_FILE = fileURLToPath(import.meta.url);
 
 export const EFFORTS = Object.freeze(["low", "medium", "high", "xhigh", "max", "ultra"]);
@@ -58,12 +59,20 @@ export const MAX_TASK_BYTES = 4 * 1024 * 1024;
 export const MAX_SCHEMA_BYTES = 64 * 1024;
 export const MAX_META_BYTES = 8 * 1024;
 export const DEFAULT_MAX_WAIT_SEC = 110; // stays under the Bash tool's 2-minute default timeout
+export const MAX_LIMIT_WAIT_SEC = 8 * 24 * 3600;
+export const DEFAULT_LIMIT_WAIT_SEC = 24 * 3600;
 export const FRAME_SCHEMA_MARK = "---ULTRACODEX-SCHEMA---";
 export const FRAME_TASK_MARK = "---ULTRACODEX-TASK---";
 
 function envInt(name, fallback, env = process.env) {
   const value = Number(env[name]);
   return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+// How long a usage-limited job waits for the limit to reset when the request does not say.
+// Read at request time (not import time) so a test can set it per process.
+export function defaultLimitWaitSec(env = process.env) {
+  return Math.min(MAX_LIMIT_WAIT_SEC, Math.floor(envInt("ULTRACODEX_LIMIT_WAIT_SEC", DEFAULT_LIMIT_WAIT_SEC, env)));
 }
 
 // Timing knobs; the env overrides exist so the offline tests run in seconds.
@@ -73,6 +82,10 @@ export const TIMING = Object.freeze({
   lostAfterMs: envInt("ULTRACODEX_LOST_AFTER_MS", 120_000),
   backoffMs: envInt("ULTRACODEX_BACKOFF_MS", 20_000),
   accountWaitMs: envInt("ULTRACODEX_ACCOUNT_WAIT_MS", 15 * 60_000),
+  limitProbeMs: envInt("ULTRACODEX_LIMIT_PROBE_MS", 5 * 60_000), // rate-limit probe cadence while waiting for a limit reset
+  limitProbeAfterResetMs: envInt("ULTRACODEX_LIMIT_PROBE_AFTER_RESET_MS", 30_000), // an extra probe this long after the reset time
+  limitResetMarginMs: envInt("ULTRACODEX_LIMIT_RESET_MARGIN_MS", 60_000), // resume on the reset time alone only this long after it
+  limitProbeTimeoutMs: envInt("ULTRACODEX_LIMIT_PROBE_TIMEOUT_MS", 20_000),
   slotPollMs: envInt("ULTRACODEX_SLOT_POLL_MS", 2000),
   slotStaleMs: envInt("ULTRACODEX_SLOT_STALE_MS", 60_000),
   killGraceMs: envInt("ULTRACODEX_KILL_GRACE_MS", 5000),
@@ -570,6 +583,8 @@ const REQUEST_FIELDS = new Set([
   "workItems",
   "attached",
   "orphanAfterSec",
+  "onOrphan",
+  "limitWaitSec",
   "ephemeral",
   "label",
   "serviceTier",
@@ -852,6 +867,13 @@ export function validateRequest(raw, { catalog = null, requestDigest: signedDige
     // `wait` that Claude Code may stop (memory pressure, a closed session); restarting the wait
     // within this window keeps the run. Workflow relays send their own value (900).
     orphanAfterSec: expectInteger(raw, "orphanAfterSec", orphanFloor, 3600, Math.max(orphanFloor, 1800)),
+    // An unpolled run keeps going by default: a Claude session that hit its own usage limit
+    // stops polling, and tearing the job down then loses work Codex already paid for.
+    // "stop" restores the old rule (abandoned after orphanAfterSec without a poll).
+    onOrphan: expectEnum(raw, "onOrphan", ["finish", "stop"], "finish"),
+    // How long a usage-limited job may wait for the limit to reset (0 = only the short
+    // account-change wait). The waiting time is not counted against the deadline.
+    limitWaitSec: expectInteger(raw, "limitWaitSec", 0, MAX_LIMIT_WAIT_SEC, defaultLimitWaitSec()),
     // Durable threads let an exhausted job continue on a newly selected account.
     // An explicit ephemeral request still opts out of saving/recovery.
     ephemeral: expectBoolean(raw, "ephemeral", false),
@@ -1246,9 +1268,12 @@ export function buildCodexArgs(request, files, { platform = process.platform, wi
   // `exec review` / `exec resume` accept neither -p nor --add-dir (codex-cli 0.156).
   if (request.mode === "exec" && request.profile) args.push("-p", request.profile);
   if (request.mode === "exec") for (const directory of request.addDirs) args.push("--add-dir", directory);
-  if (request.accountContinuation) {
-    // Resume must retain the original job's permission boundary, including when its
-    // saved thread is writable. These are internal overrides, not prompt input.
+  if (request.mode === "resume" || request.accountContinuation) {
+    // `exec resume` ignores the saved thread's sandbox and runs read-only unless told
+    // otherwise (measured on codex-cli 0.163), and the override does not stick to the next
+    // resume: every resume restates the request's sandbox — a user's follow-up as well as an
+    // account or usage-limit continuation (and the fresh-thread checkpoint fallback, which also
+    // restates it). These are internal overrides, not prompt input.
     args.push("-c", `sandbox_mode=${JSON.stringify(request.sandbox)}`);
     if (request.sandbox === "workspace-write") {
       args.push("-c", `sandbox_workspace_write.network_access=${request.network}`);
@@ -2235,6 +2260,7 @@ export function makeClock(request) {
   let last = Date.now();
   let graceUntil = 0;
   return {
+    orphanedSince: null, // ISO, set while the supervisor sees no poller (see stopReason)
     tick() {
       const now = Date.now();
       const gap = now - last;
@@ -2249,11 +2275,37 @@ export function makeClock(request) {
   };
 }
 
-function stopReason(paths, request, clock = null) {
+// When the run became orphaned — an attached run whose last poll is older than its
+// orphanAfterSec — as epoch ms, else null.
+function orphanedSince(paths, request) {
+  if (!request?.attached) return null;
+  const beat = readNumber(paths.heartbeat);
+  if (!beat) return null;
+  const since = beat + request.orphanAfterSec * 1000;
+  return Date.now() > since ? since : null;
+}
+
+// State writes that only inform (orphan marks, wait estimates) never end a run.
+function tryUpdateState(paths, patch) {
+  try {
+    updateState(paths, patch);
+  } catch {
+    // informational
+  }
+}
+
+export function stopReason(paths, request, clock = null) {
   if (fs.existsSync(paths.cancel)) return "cancelled";
   if (request.attached && !clock?.inGrace()) {
-    const beat = readNumber(paths.heartbeat);
-    if (beat && Date.now() - beat > request.orphanAfterSec * 1000) return "abandoned";
+    const since = orphanedSince(paths, request);
+    // A request stored by a runner that predates onOrphan keeps the rule it was made under.
+    if (since && (request.onOrphan ?? "stop") === "stop") return "abandoned";
+    // Otherwise the run goes on; only the record changes, once per change.
+    if (clock && Boolean(since) !== Boolean(clock.orphanedSince)) {
+      clock.orphanedSince = since ? new Date(since).toISOString() : null;
+      tryUpdateState(paths, { orphanedSince: clock.orphanedSince });
+      appendLine(paths.log, `${nowIso()} ${since ? `nobody has polled since ${clock.orphanedSince}; the run keeps going (onOrphan: finish)` : "a poller is back"}`);
+    }
   }
   return null;
 }
@@ -2589,7 +2641,7 @@ async function runAttempt(request, paths, attempt, context) {
 }
 
 const MAX_ACCOUNT_HANDOFFS = 8;
-const ACCOUNT_CONTINUATION = "Continue the unfinished task in this saved thread after an account change. "
+const ACCOUNT_CONTINUATION = "Continue the unfinished task in this saved thread after an account change or a usage-limit reset. "
   + "Keep the original instructions and constraints, inspect the current work before continuing, "
   + "and do not repeat completed edits or external actions. Return the original requested final answer.";
 
@@ -2681,19 +2733,249 @@ function checkpointContinuation(request, checkpoint) {
     + JSON.stringify({ originalTask: request.task, originalReview: request.review ?? null, visibleCheckpoint: checkpoint });
 }
 
+// Waiting is not working: both waits below move the job's deadline by the time they took,
+// so a continuation gets the work time the interrupted attempt had left.
 async function waitForAccountChange(paths, request, context, previous, mayWait) {
-  let until = Math.min(context.recoveryDeadlineAt, Date.now() + (mayWait ? TIMING.accountWaitMs : 0));
+  const startedAt = Date.now();
+  let until = startedAt + (mayWait ? TIMING.accountWaitMs : 0);
   updateState(paths, { state: "account_wait", codexPid: null });
-  for (;;) {
-    const suspended = context.clock.tick();
-    until += suspended;
-    context.recoveryDeadlineAt += suspended;
-    const stop = stopReason(paths, request, context.clock);
-    if (stop) return { stop };
-    const next = managedAccountIdentity();
-    if (next && next !== previous) return { changed: true };
-    if (Date.now() >= until) return { changed: false };
-    await sleep(Math.min(TIMING.pollMs, Math.max(1, until - Date.now())));
+  try {
+    for (;;) {
+      until += context.clock.tick(); // a suspended machine did not wait either
+      const stop = stopReason(paths, request, context.clock);
+      if (stop) return { stop };
+      const next = managedAccountIdentity();
+      if (next && next !== previous) return { changed: true };
+      if (Date.now() >= until) return { changed: false };
+      await sleep(Math.min(TIMING.pollMs, Math.max(1, until - Date.now())));
+    }
+  } finally {
+    context.recoveryDeadlineAt += Date.now() - startedAt;
+  }
+}
+
+// ── usage-limit waiting ──
+
+const LIMIT_ID_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+
+// Reduces an `account/rateLimits/read` result to what the supervisor may keep: whether
+// ordinary usage is allowed (Codex's own verdict; null = unavailable) and each window's used
+// percentage and reset time (unix seconds). Account and credit identifiers are dropped here,
+// so nothing downstream — log, state, envelope — can carry them.
+export function summarizeRateLimits(result) {
+  const number = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
+  const windows = [];
+  const seen = new Set();
+  const collect = (snapshot, key) => {
+    if (!isPlainObject(snapshot)) return;
+    const named = typeof key === "string" ? key : typeof snapshot.limitId === "string" ? snapshot.limitId : "codex";
+    const limitId = LIMIT_ID_RE.test(named) ? named : "other";
+    seen.add(limitId);
+    for (const window of ["primary", "secondary"]) {
+      const entry = snapshot[window];
+      if (isPlainObject(entry)) windows.push({ limitId, window, usedPercent: number(entry.usedPercent), resetsAt: number(entry.resetsAt) });
+    }
+  };
+  if (isPlainObject(result?.rateLimitsByLimitId)) {
+    for (const [key, snapshot] of Object.entries(result.rateLimitsByLimitId)) collect(snapshot, key);
+  }
+  // `rateLimits` is the default bucket, usually also listed by id above
+  const defaultId = typeof result?.rateLimits?.limitId === "string" ? result.rateLimits.limitId : "codex";
+  if (!seen.has(LIMIT_ID_RE.test(defaultId) ? defaultId : "other")) collect(result?.rateLimits, null);
+  return { ok: true, allowed: typeof result?.ordinaryUsageAllowed === "boolean" ? result.ordinaryUsageAllowed : null, windows };
+}
+
+// When usage should be back, as epoch ms: the latest reset among the used-up windows of the
+// `codex` limit, else the earliest reset known; null when no window reports one. An estimate
+// for display and for the fallback when Codex gives no verdict — never a reason to resume
+// while Codex says usage is not allowed.
+export function estimateResumeAt(windows) {
+  const known = windows.filter((window) => window.resetsAt !== null);
+  const codex = known.filter((window) => window.limitId === "codex");
+  const pool = codex.length ? codex : known;
+  const used = pool.filter((window) => window.usedPercent !== null && window.usedPercent >= 100);
+  const at = used.length ? Math.max(...used.map((window) => window.resetsAt)) : pool.length ? Math.min(...pool.map((window) => window.resetsAt)) : null;
+  return at === null ? null : at * 1000;
+}
+
+// One short-lived `codex app-server` asked for the account's rate limits: initialize,
+// initialized, account/rateLimits/read — no model turn, no MCP servers, no usage. Closing its
+// stdin ends it; one that has not exited within a few seconds is killed. Resolves (never
+// rejects) to {ok: true, allowed, windows} or {ok: false, reason}. Read-only by construction:
+// no other method is ever sent (in particular nothing that consumes credits).
+export function probeRateLimits({ launcher = null, timeoutMs = TIMING.limitProbeTimeoutMs, shouldStop = null } = {}) {
+  return new Promise((resolve) => {
+    const fail = (reason) => ({ ok: false, reason });
+    let resolved;
+    try {
+      resolved = launcher ?? resolveCodexLauncher();
+    } catch {
+      return resolve(fail("no_cli"));
+    }
+    let child;
+    try {
+      child = spawn(resolved.command, [...resolved.argsPrefix, "app-server", "--listen", "stdio://"], {
+        env: { ...process.env, ...resolved.env },
+        stdio: ["pipe", "pipe", "ignore"],
+        windowsHide: true,
+      });
+    } catch {
+      return resolve(fail("spawn"));
+    }
+    let done = false;
+    let exited = false;
+    const grace = Math.max(1, Math.min(TIMING.killGraceMs, 3000));
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      clearInterval(watcher);
+      if (exited) return resolve(value);
+      try {
+        child.stdin.end();
+      } catch {
+        // already closed
+      }
+      const kill = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // already gone
+        }
+      }, grace);
+      const abandon = setTimeout(() => resolve(value), grace + 1500); // never wait on a process that will not die
+      child.once("exit", () => {
+        clearTimeout(kill);
+        clearTimeout(abandon);
+        resolve(value);
+      });
+    };
+    const timer = setTimeout(() => finish(fail("timeout")), timeoutMs);
+    const watcher = shouldStop ? setInterval(() => shouldStop() && finish(fail("stopped")), Math.max(50, TIMING.pollMs)) : null;
+    child.once("error", () => {
+      exited = true;
+      finish(fail("spawn"));
+    });
+    child.once("exit", () => {
+      exited = true;
+      finish(fail("exited"));
+    });
+    child.stdin.on("error", () => {});
+    const send = (message) => {
+      try {
+        child.stdin.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\n");
+      } catch {
+        // the exit handler reports it
+      }
+    };
+    let buffered = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("error", () => {});
+    child.stdout.on("data", (chunk) => {
+      buffered += chunk;
+      if (buffered.length > 4 * 1024 * 1024) return finish(fail("oversized"));
+      for (let at = buffered.indexOf("\n"); at >= 0; at = buffered.indexOf("\n")) {
+        const line = buffered.slice(0, at).trim();
+        buffered = buffered.slice(at + 1);
+        let message = null;
+        try {
+          message = line ? JSON.parse(line) : null;
+        } catch {
+          // not a JSON-RPC line
+        }
+        // answers only: the server's own notifications and requests are none of the probe's business
+        if (!isPlainObject(message) || message.method !== undefined) continue;
+        if (message.id === 1) {
+          if (message.error !== undefined) return finish(fail("initialize_error"));
+          send({ method: "initialized" });
+          send({ id: 2, method: "account/rateLimits/read", params: {} });
+        } else if (message.id === 2) {
+          if (message.error !== undefined || !isPlainObject(message.result)) return finish(fail("rpc_error"));
+          return finish(summarizeRateLimits(message.result));
+        }
+      }
+    });
+    send({ id: 1, method: "initialize", params: { clientInfo: { name: "ultracodex", version: RUNNER_VERSION }, capabilities: null } });
+  });
+}
+
+function describeProbe(probe, resumeAt) {
+  if (!probe.ok) return `limit probe: unavailable (${probe.reason})`;
+  const verdict = probe.allowed === true ? "usage allowed" : probe.allowed === false ? "usage blocked" : "no verdict";
+  const hasCodex = probe.windows.some((window) => window.limitId === "codex");
+  const windows = probe.windows
+    .filter((window) => !hasCodex || window.limitId === "codex")
+    .map((window) => `${window.limitId} ${window.window} ${window.usedPercent ?? "?"} %`);
+  return `limit probe: ${verdict}${windows.length ? ` (${windows.join(", ")})` : ""}${resumeAt === null ? "" : `; resumesAt ${new Date(resumeAt).toISOString()}`}`;
+}
+
+// The usage limit ended an attempt. Waits — at most request.limitWaitSec — until usage is
+// allowed again on this account (a rate-limit probe, at most every limitProbeMs and once
+// right after the expected reset) or the managed account changes, whichever comes first.
+// Codex's verdict decides: "allowed" resumes, "not allowed" keeps waiting. Only when there is
+// no verdict (null, or a failed probe) does the latest known reset time, plus a margin, stand
+// in for it.
+//
+// A resume that hits the limit again is not trusted to be a flap-free signal: "Your workspace
+// is out of credits" is a usage_limit while the verdict may still say allowed. So from the
+// second wait of a run on, a decision to resume is honoured only after limitProbeMs * 2^(k-1)
+// (k = the limit resumes done so far; never longer than the cap), counted from the start of
+// the wait. An account change is a real signal and is never deferred.
+async function waitForLimitReset(paths, request, context, previous, log, limitResumes = 0) {
+  const startedAt = Date.now();
+  const capAt = startedAt + request.limitWaitSec * 1000;
+  const spacingMs = limitResumes > 0 ? Math.min(Math.max(0, TIMING.limitProbeMs) * 2 ** Math.min(limitResumes - 1, 10), capAt - startedAt) : 0;
+  const notBefore = startedAt + spacingMs; // the earliest moment a resume decision is honoured
+  let nextProbeAt = startedAt; // learn the reset time at once
+  let resumeAt = null; // epoch ms, the latest estimate; survives a failed probe
+  let allowed; // the latest probe's verdict: true, false, null (none) or undefined (probe failed)
+  let deferralLogged = false;
+  // what the run shows as its return time: the estimate, or the end of the spacing if later
+  const publish = () => {
+    const shown = Math.max(resumeAt ?? 0, spacingMs > 0 && Date.now() < notBefore ? notBefore : 0);
+    tryUpdateState(paths, { resumesAt: shown ? new Date(shown).toISOString() : null });
+  };
+  tryUpdateState(paths, { state: "limit_wait", codexPid: null, limitWaitUntil: new Date(capAt).toISOString(), resumesAt: null });
+  publish();
+  try {
+    for (;;) {
+      context.clock.tick();
+      const stop = stopReason(paths, request, context.clock);
+      if (stop) return { stop };
+      const next = managedAccountIdentity();
+      if (next && next !== previous) return { changed: true };
+      if (Date.now() >= nextProbeAt) {
+        const probe = await probeRateLimits({ launcher: context.launcher, shouldStop: () => stopReason(paths, request, context.clock) });
+        if (probe.reason === "stopped") continue; // the stop is reported at the top of the loop
+        allowed = probe.ok ? probe.allowed : undefined;
+        if (probe.ok) resumeAt = estimateResumeAt(probe.windows) ?? resumeAt;
+        log(describeProbe(probe, resumeAt));
+        publish();
+        const now = Date.now();
+        nextProbeAt = now + Math.max(1, TIMING.limitProbeMs);
+        if (resumeAt !== null && resumeAt + TIMING.limitProbeAfterResetMs > now) {
+          nextProbeAt = Math.min(nextProbeAt, resumeAt + TIMING.limitProbeAfterResetMs);
+        }
+        if (notBefore > now) nextProbeAt = Math.min(nextProbeAt, notBefore); // a fresh verdict when the spacing ends
+      }
+      const now = Date.now();
+      const ready = allowed === true || (allowed !== false && resumeAt !== null && now >= resumeAt + TIMING.limitResetMarginMs);
+      if (ready && now >= notBefore) {
+        if (allowed !== true) log("no usable verdict from the limit probe; the expected reset time has passed");
+        return { reset: true, estimated: allowed !== true };
+      }
+      if (ready && !deferralLogged) {
+        deferralLogged = true;
+        log(`${allowed === true ? "usage reported allowed" : "the expected reset time has passed"}, but the previous limit resume failed again; resuming no earlier than ${new Date(notBefore).toISOString()}`);
+      }
+      if (now >= capAt) return { expired: true };
+      await sleep(Math.max(1, Math.min(TIMING.pollMs, nextProbeAt - now, capAt - now)));
+    }
+  } finally {
+    const waited = Date.now() - startedAt;
+    context.recoveryDeadlineAt += waited;
+    context.limitWaitedMs = (context.limitWaitedMs ?? 0) + waited;
+    tryUpdateState(paths, { limitWaitUntil: null, resumesAt: null });
   }
 }
 
@@ -2794,7 +3076,8 @@ export async function superviseRun(runId) {
         let activeRequest = legacy ? { ...request, mode: "resume", resume: { sessionId: legacy.threadId }, images: [],
           task: ACCOUNT_CONTINUATION, accountContinuation: true,
           timeoutSec: Math.max(1, Math.floor((legacy.deadlineAt - Date.now()) / 1000)) } : request;
-        let handoffs = legacy ? 1 : 0;
+        let handoffs = legacy ? 1 : 0; // continuations of either kind: one budget (MAX_ACCOUNT_HANDOFFS)
+        let limitResumes = 0; // of those, resumes after a usage-limit reset on the same account
         let checkpoints = 0;
         let checkpointHandoff = 0;
         let retries = 1;
@@ -2808,7 +3091,9 @@ export async function superviseRun(runId) {
           envelope = outcome.envelope;
           spent = addUsage(spent, envelope.provenance?.usage);
           if (spent && envelope.provenance) envelope.provenance.usageTotal = spent;
-          if (handoffs && envelope.provenance) envelope.provenance.accountHandoffs = handoffs;
+          if (handoffs > limitResumes && envelope.provenance) envelope.provenance.accountHandoffs = handoffs - limitResumes;
+          if (limitResumes && envelope.provenance) envelope.provenance.limitResumes = limitResumes;
+          if (context.limitWaitedMs && envelope.provenance) envelope.provenance.limitWaitedSec = Math.round(context.limitWaitedMs / 1000);
           if (checkpoints && envelope.provenance) envelope.provenance.contextRestarts = checkpoints;
           if (outcome.done) break;
           const thread = envelope.provenance?.threadId ?? activeRequest.resume?.sessionId;
@@ -2829,26 +3114,38 @@ export async function superviseRun(runId) {
               continue;
             }
           }
+          // A continuation needs work time left: the waits below do not use any up.
           if (!request.ephemeral && context.attemptAccount && handoffs < MAX_ACCOUNT_HANDOFFS
               && typeof thread === "string" && SESSION_RE.test(thread)
               && ["usage_limit", "auth", "rate_limit"].includes(kind)
-              && clean) {
-            log(`attempt ${attempt} ended (${kind}); waiting for an account change before resuming its thread`);
-            const change = await waitForAccountChange(paths, request, context, context.attemptAccount, kind === "usage_limit");
+              && clean && context.recoveryDeadlineAt - Date.now() >= Math.max(1, TIMING.minTimeoutSec) * 1000) {
+            const limitWait = kind === "usage_limit" && request.limitWaitSec > 0;
+            log(limitWait
+              ? `attempt ${attempt} ended (usage_limit); waiting up to ${request.limitWaitSec} s for the limit to reset or the account to change`
+              : `attempt ${attempt} ended (${kind}); waiting for an account change before resuming its thread`);
+            const change = limitWait
+              ? await waitForLimitReset(paths, request, context, context.attemptAccount, log, limitResumes)
+              : await waitForAccountChange(paths, request, context, context.attemptAccount, kind === "usage_limit");
+            // the envelope of the attempt that hit the limit may be the run's last: it says how long the run waited
+            if (context.limitWaitedMs && envelope.provenance) envelope.provenance.limitWaitedSec = Math.round(context.limitWaitedMs / 1000);
             if (change.stop) {
               envelope = failureEnvelope(request, runId, change.stop,
                 classifyFailure({ cancelled: change.stop === "cancelled", abandoned: change.stop === "abandoned" }), envelope.provenance);
               break;
             }
-            if (change.changed && Date.now() < context.recoveryDeadlineAt) {
+            if ((change.changed || change.reset) && Date.now() < context.recoveryDeadlineAt) {
               handoffs += 1;
+              if (change.reset) limitResumes += 1;
               activeRequest = { ...request, mode: "resume", resume: { sessionId: thread }, images: [],
                 task: ACCOUNT_CONTINUATION, accountContinuation: true,
                 timeoutSec: Math.max(1, Math.floor((context.recoveryDeadlineAt - Date.now()) / 1000)) };
               retries = 1;
-              log(`resuming the saved thread on the newly selected account (handoff ${handoffs})`);
+              log(change.reset
+                ? `usage is available again; resuming the saved thread (limit resume ${limitResumes}, ${Math.round((context.recoveryDeadlineAt - Date.now()) / 1000)} s of work time left)`
+                : `resuming the saved thread on the newly selected account (handoff ${handoffs - limitResumes})`);
               continue;
             }
+            if (change.expired) log(`the usage limit did not reset within ${request.limitWaitSec} s; giving up`);
           }
           if (!outcome.classification.retryable || retries >= request.maxAttempts) break;
           retries += 1;
@@ -3201,8 +3498,8 @@ function startedLine(runId, request, state) {
     ultracodex: 1,
     runnerVersion: RUNNER_VERSION,
     ok: null,
-    state: publicRunState(state),
-    ...(state === "account_wait" ? { waitingForAccount: true } : {}),
+    state: publicRunState(state?.state),
+    ...waitFlags(state),
     runId,
     label: request.label,
     model: request.model,
@@ -3217,7 +3514,18 @@ function startedLine(runId, request, state) {
 // Existing Claude relays know backoff, so an in-flight workflow keeps polling
 // after the runner is updated without needing its agent prompt to be reloaded.
 function publicRunState(state) {
-  return state === "account_wait" ? "backoff" : state === "starting" ? "queued" : state ?? "queued";
+  return state === "account_wait" || state === "limit_wait" ? "backoff" : state === "starting" ? "queued" : state ?? "queued";
+}
+
+// What a waiting run adds to its public state: that it waits for another account (a
+// usage-limit wait ends on that too), and for a limit wait when usage should be back
+// (best estimate, null until a probe learned it) and when the wait gives up.
+function waitFlags(state) {
+  if (state?.state === "account_wait") return { waitingForAccount: true };
+  if (state?.state === "limit_wait") {
+    return { waitingForAccount: true, waitingForLimit: true, resumesAt: state.resumesAt ?? null, limitWaitUntil: state.limitWaitUntil ?? null };
+  }
+  return {};
 }
 
 // Adopt a still-polled durable job from the installed 0.3.6 runner only after
@@ -3230,14 +3538,16 @@ async function recoverLegacyAccountRun(runId, paths, result) {
   const teardown = result.provenance?.teardown;
   const threadId = result.provenance?.threadId;
   const deadlineAt = Date.parse(state.deadlineAt ?? "");
+  // Adopted only while its caller still polls, whatever onOrphan says: this job predates it.
+  const unwanted = () => fs.existsSync(paths.cancel) || Boolean(orphanedSince(paths, request));
   if (!request || request.ephemeral !== false || !SESSION_RE.test(String(threadId ?? ""))
       || !Number.isFinite(deadlineAt) || deadlineAt <= Date.now() + 1000
       || !teardown || teardown.unverified || teardown.survivors?.length || teardown.possibleLeftovers?.length
-      || stopReason(paths, request) || !managedAccountIdentity()) return false;
+      || unwanted() || !managedAccountIdentity()) return false;
   // A finished result is written after teardown, immediately before the old
   // supervisor's final state/log writes. Let that process exit on its own.
   for (let poll = 0; pidAlive(state.supervisorPid) && poll < 20; poll += 1) await sleep(100);
-  if (pidAlive(state.supervisorPid) || stopReason(paths, request)) return false;
+  if (pidAlive(state.supervisorPid) || unwanted()) return false;
   const plan = { threadId, deadlineAt, attempts: result.provenance?.attempts ?? 1,
     usage: result.provenance?.usageTotal ?? result.provenance?.usage ?? null, queuedAt: nowIso() };
   try {
@@ -3282,7 +3592,7 @@ async function startFromRaw(raw, options, { requestDigest = null } = {}) {
     // A second upload of a request that already started (a retrying relay) joins that run.
     const joined = existingRunForNonce(request.nonce);
     if (joined) {
-      print(startedLine(joined, request, readJsonSafe(runPaths(joined).state)?.state), options.pretty);
+      print(startedLine(joined, request, readJsonSafe(runPaths(joined).state)), options.pretty);
       return 3;
     }
     // Otherwise the request must have been announced through the helper's key agent: a frame
@@ -3293,7 +3603,7 @@ async function startFromRaw(raw, options, { requestDigest = null } = {}) {
       // announcement since the look above: join that run rather than refuse.
       const late = existingRunForNonce(request.nonce, { waitMs: TIMING.nonceWaitMs });
       if (late) {
-        print(startedLine(late, request, readJsonSafe(runPaths(late).state)?.state), options.pretty);
+        print(startedLine(late, request, readJsonSafe(runPaths(late).state)), options.pretty);
         return 3;
       }
       print(rejection("unregistered_request", "the Workflow helper did not announce this request to the runner"), options.pretty);
@@ -3315,7 +3625,7 @@ async function startFromRaw(raw, options, { requestDigest = null } = {}) {
         print(rejection("nonce_reused", "this signed request was already uploaded"), options.pretty);
         return 1;
       }
-      print(startedLine(existing, request, readJsonSafe(runPaths(existing).state)?.state), options.pretty);
+      print(startedLine(existing, request, readJsonSafe(runPaths(existing).state)), options.pretty);
       return 3;
     }
     fs.rmSync(registration, { force: true }); // consumed: the announcement starts one run, once
@@ -3342,7 +3652,7 @@ async function startFromRaw(raw, options, { requestDigest = null } = {}) {
     print(rejection("spawn", `could not start the supervisor: ${spawnFailure.message}`, { runId }), options.pretty);
     return 1;
   }
-  print(startedLine(runId, request, (readJsonSafe(paths.state) ?? {}).state), options.pretty);
+  print(startedLine(runId, request, readJsonSafe(paths.state) ?? {}), options.pretty);
   return 3;
 }
 
@@ -3355,6 +3665,9 @@ export async function cmdWait(runId, { maxWaitSec = DEFAULT_MAX_WAIT_SEC, pretty
   }
   const until = Date.now() + maxWaitSec * 1000;
   let staleSince = null;
+  // Seen before this poll refreshes the heartbeat: the poll that finds a run unpolled is the
+  // one that re-attaches it.
+  const unpolledSince = orphanedSince(paths, readJsonSafe(paths.request));
   for (;;) {
     const result = readJsonSafe(paths.result);
     if (result) {
@@ -3398,7 +3711,8 @@ export async function cmdWait(runId, { maxWaitSec = DEFAULT_MAX_WAIT_SEC, pretty
           runnerVersion: RUNNER_VERSION,
           ok: null,
           state: publicRunState(state.state),
-          ...(state.state === "account_wait" ? { waitingForAccount: true } : {}),
+          ...waitFlags(state),
+          ...(unpolledSince ? { orphaned: true, orphanedSince: new Date(unpolledSince).toISOString() } : {}),
           runId,
           label: state.label ?? null,
           attempt: state.attempt ?? null,
@@ -3432,9 +3746,12 @@ function describeRun(runId) {
   const state = readJsonSafe(paths.state) ?? {};
   const result = readJsonSafe(paths.result);
   const alive = readNumber(paths.alive);
+  const unpolledSince = result ? null : orphanedSince(paths, readJsonSafe(paths.request));
   return {
     runId,
-    state: result?.state ?? state.state ?? "unknown",
+    state: result?.state ?? (waitFlags(state).waitingForAccount ? "backoff" : state.state ?? "unknown"),
+    ...(result ? {} : waitFlags(state)),
+    ...(unpolledSince ? { orphaned: true, orphanedSince: new Date(unpolledSince).toISOString() } : {}),
     ok: result ? result.ok : null,
     label: state.label ?? null,
     kind: state.kind ?? null,
@@ -3475,6 +3792,35 @@ export async function cmdCancel(runId, { pretty = false } = {}) {
   }
   if (!readJsonSafe(paths.result)) writeText(paths.cancel, nowIso());
   return cmdWait(runId, { maxWaitSec: 30, pretty });
+}
+
+// The cleanup after a workflow was stopped on purpose: its relays are gone, and an unpolled
+// run goes on by default (onOrphan: finish). Cancels every unfinished run whose caller has
+// not polled for its orphanAfterSec, through the same cancel file as `cancel RUN_ID`, so each
+// supervisor stops only its own tree. A run whose supervisor is gone has nobody to ask
+// (`wait` reports it as lost) and is left alone.
+export async function cmdCancelOrphaned({ pretty = false } = {}) {
+  const targets = [];
+  for (const runId of listRunIds()) {
+    const paths = runPaths(runId);
+    if (readJsonSafe(paths.result)) continue;
+    if (!orphanedSince(paths, readJsonSafe(paths.request))) continue;
+    if (Date.now() - readNumber(paths.alive) >= TIMING.lostAfterMs) continue;
+    targets.push({ runId, paths, label: readJsonSafe(paths.state)?.label ?? null });
+  }
+  for (const target of targets) writeText(target.paths.cancel, nowIso());
+  const until = Date.now() + 30_000;
+  const cancelled = [];
+  for (const target of targets) {
+    let result = readJsonSafe(target.paths.result);
+    while (!result && Date.now() < until) {
+      await sleep(Math.min(TIMING.pollMs, 250));
+      result = readJsonSafe(target.paths.result);
+    }
+    cancelled.push({ runId: target.runId, label: target.label, state: result?.state ?? "cancelling" });
+  }
+  print({ ultracodex: 1, runnerVersion: RUNNER_VERSION, ok: true, cancelled }, pretty);
+  return 0;
 }
 
 export function cmdResult(runId, { pretty = false } = {}) {
@@ -3674,7 +4020,7 @@ function helpText() {
     "  node codex-node.mjs page RUN_ID K                                 slice K of a large (paged) result",
     "  node codex-node.mjs key                                          the per-machine key and a fresh nonce (for the helper's key agent)",
     "  node codex-node.mjs expect DIGEST                                announce a request the helper built (for the helper's key agent)",
-    "  node codex-node.mjs cancel RUN_ID                                stop that run's own process tree",
+    "  node codex-node.mjs cancel RUN_ID | --orphaned                   stop that run's own process tree / every unpolled (orphaned) run's",
     "  node codex-node.mjs preflight [--live]                           check CLI, auth, catalog (no model call unless --live)",
     "  node codex-node.mjs policy | models | schema PRESET              routing policy, catalog, schema presets",
     "  node codex-node.mjs schema-check --schema FILE|-                 OpenAI strict-mode check for a schema",
@@ -3693,6 +4039,7 @@ function parseCli(argv) {
     pretty: false,
     all: false,
     live: false,
+    orphaned: false,
     request: null,
     framed: null,
     maxWait: null,
@@ -3711,6 +4058,7 @@ function parseCli(argv) {
     if (token === "--pretty") options.pretty = true;
     else if (token === "--all") options.all = true;
     else if (token === "--live") options.live = true;
+    else if (token === "--orphaned") options.orphaned = true;
     else if (valued[token]) {
       const value = rest[index + 1];
       if (value === undefined) throw new UsageError(`${token} requires a value`);
@@ -3771,6 +4119,10 @@ export async function main(argv = process.argv.slice(2)) {
       case "result":
         return cmdResult(id, options);
       case "cancel":
+        if (options.orphaned) {
+          if (id) throw new UsageError("cancel takes a run id or --orphaned, not both");
+          return await cmdCancelOrphaned(options);
+        }
         return await cmdCancel(id, options);
       case "gc":
         return cmdGc({ olderThanDays: options.olderThanDays ?? 7, pretty: options.pretty });

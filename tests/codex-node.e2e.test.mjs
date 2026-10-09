@@ -8,18 +8,12 @@ import test from "node:test";
 
 import {
   FRAME_MAGIC,
-  FRAME_SCHEMA_MARK,
-  FRAME_TASK_MARK,
   SCHEMA_PRESETS,
   encodeFrameText,
-  ensureKey,
   fnv1a,
   normalizeText,
-  requestDigest,
-  requestMac,
-  schemaHash,
 } from "../plugins/ultracodex/scripts/codex-node.mjs";
-import { eventually, fastEnv, makeHome, pidAlive, runCli, startAndWait, writeRequest } from "./helpers.mjs";
+import { announce, eventually, fastEnv, frame, makeHome, pidAlive, runCli, signedHeader, startAndWait, writeRequest } from "./helpers.mjs";
 
 function saveAccount(home, account) {
   fs.writeFileSync(path.join(home, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: { account_id: account } }));
@@ -357,12 +351,12 @@ test("cancel stops only that run and reports cancelled", async (t) => {
   assert.ok(await eventually(() => !pidAlive(grandchild)));
 });
 
-test("an attached run whose caller stops polling is torn down as abandoned", async (t) => {
+test("an attached run with onOrphan: stop whose caller stops polling is torn down as abandoned", async (t) => {
   const home = makeHome(t);
   const env = fastEnv(home);
   const pidFile = path.join(home, "grandchild.pid");
   const started = await runCli(
-    ["start", "--request", writeRequest(home, { task: `slow\nFAKE_SLEEP_MS=60000\nFAKE_SPAWN_CHILD=${pidFile}`, orphanAfterSec: 4 })],
+    ["start", "--request", writeRequest(home, { task: `slow\nFAKE_SLEEP_MS=60000\nFAKE_SPAWN_CHILD=${pidFile}`, orphanAfterSec: 4, onOrphan: "stop" })],
     { env }
   );
   const runId = started.json.runId;
@@ -407,25 +401,6 @@ test("machine-wide slots queue a second run until the first finishes", async (t)
   const firstResult = JSON.parse(fs.readFileSync(path.join(home, "runs", first.json.runId, "result.json"), "utf8"));
   assert.equal(firstResult.state, "done");
 });
-
-function frame(header, schema, task) {
-  return [JSON.stringify(header), FRAME_SCHEMA_MARK, schema === null ? "null" : JSON.stringify(schema), FRAME_TASK_MARK, task].join("\n");
-}
-
-// A header as the Workflow helper builds it, signed with the test home's key.
-function signedHeader(home, fields, schema, task, counter = 1) {
-  const key = ensureKey({ ULTRACODEX_HOME: home });
-  const header = { v: 1, ...fields, nonce: `${"cd".repeat(16)}.${counter}`, taskHash: fnv1a(normalizeText(task)), schemaHash: schemaHash(schema) };
-  header.h = fnv1a(JSON.stringify(header));
-  return { ...header, rmac: requestMac(key, requestDigest(header, schema, task)) };
-}
-
-// What the helper's key agent does before an upload: announce the request to the runner.
-async function announce(env, signed, schema, task) {
-  const { rmac, ...header } = signed;
-  const out = await runCli(["expect", requestDigest(header, schema, task)], { env });
-  assert.equal(out.json.ok, true, out.stdout);
-}
 
 test("a framed request from the relay runs; a corrupted copy is rejected before any run", async (t) => {
   const home = makeHome(t);

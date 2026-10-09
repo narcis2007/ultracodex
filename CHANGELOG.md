@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.3.9 — 2026-10-09 (limits)
+
+Stop losing Codex work at usage limits.
+
+- **A resume keeps the sandbox it was asked for.** `codex exec resume` without
+  `-c sandbox_mode=…` runs read-only even when the original session was writable ("the current
+  filesystem sandbox is read-only"; measured on codex-cli 0.163.0-alpha.2), and a previous
+  writable resume does not stick. Every resume now restates the request's sandbox — for
+  workspace-write also `network_access` and `writable_roots` (= `addDirs`) — whether it is a
+  follow-up (`"resume": {...}`) or a continuation after an account change or a limit reset. A
+  follow-up that must write now says `"sandbox": "workspace-write"` (documented in the
+  `codex-implement` skill).
+- **A usage-limited job waits for the limit to reset, not only for an account switch.** After a
+  `usage_limit` (same preconditions as before: durable thread, managed ChatGPT account, clean
+  teardown, under the eight-continuation budget) the supervisor enters a limit wait of up to
+  `limitWaitSec` (integer 0–691200, default 86400; env `ULTRACODEX_LIMIT_WAIT_SEC`; 0 = the old
+  15-minute account wait only) that ends when the managed account changes (the existing
+  handoff, encrypted-reasoning fallback included) or when usage is allowed again on the same
+  account, then resumes the same thread. "Allowed again" is read from a rate-limit probe: a
+  short-lived `codex app-server --listen stdio://` (exported `probeRateLimits`) that gets
+  `initialize`, `initialized` and `account/rateLimits/read` and nothing else — no model turn,
+  no MCP servers, no usage — is closed through its stdin and killed only if it lingers.
+  `ordinaryUsageAllowed: true` resumes, `false` keeps waiting, and with no verdict (`null`, or
+  a failed probe) the latest known reset time plus 60 s stands in. The probe runs on entering
+  the wait, then at most every 5 minutes (`ULTRACODEX_LIMIT_PROBE_MS`) and once 30 s after the
+  expected reset. Only the verdict, percentages and reset times are kept or logged — never
+  account or credit ids. A resume that hits the limit again is spaced out ("out of credits" is a
+  `usage_limit` the verdict may still call allowed): from a run's second limit wait on, a
+  resume waits at least 5, 10, 20, 40… minutes (`ULTRACODEX_LIMIT_PROBE_MS` × 2^(k−1), never
+  beyond the cap) after the wait began; account changes are never deferred.
+- Waiting does not use up the job's deadline (account wait included): the deadline moves by the
+  time waited, so the continuation gets the work time the interrupted attempt had left.
+  Reset-resumes and account handoffs share the eight-continuation budget and are reported
+  separately in provenance (`accountHandoffs`, `limitResumes`, plus `limitWaitedSec`).
+- While waiting, `status` and `wait` report `backoff` (relays keep polling) with
+  `waitingForAccount: true`, `waitingForLimit: true`, `resumesAt` (the latest reset among the
+  used-up windows of the `codex` limit, else the earliest known; null until a probe learned it)
+  and `limitWaitUntil` (when the wait gives up). `codexNode` takes a `limitWaitSec` option.
+- **An orphaned run is no longer torn down by default.** New `onOrphan: "finish" | "stop"`,
+  default `finish`: a run nobody polls keeps going — a queued run still starts, a running attempt
+  runs to its result or deadline, a limit wait continues — and `status` / `wait` show
+  `orphaned: true` (state records `orphanedSince`) until a poll returns. A Claude session that
+  hit its own usage limit stops polling; the old rule then killed Codex work that was already
+  paid for, and a resumed workflow joined the dead run and got `abandoned`. A resumed workflow's
+  re-upload of the same signed request now joins the live run and gets its result. `"stop"`
+  restores the old behaviour. New `node codex-node.mjs cancel --orphaned` cancels every
+  unfinished run whose caller stopped polling for its `orphanAfterSec` (the cleanup after
+  stopping a workflow on purpose).
+- The relay now polls with `wait <runId> --max-wait 570` under a 600 s Bash timeout (was ~110 s):
+  about a fifth of the polling turns during long waits. `wait` already refreshed the heartbeat every
+  poll while blocking. The relay guard accepts `--max-wait` up to 600.
+
 ## 0.3.8 — 2026-10-08 (Haiku 5.5)
 
 - `codex-review` triage runs on Claude Haiku 5.5 at `high` effort by default; `triageModel`

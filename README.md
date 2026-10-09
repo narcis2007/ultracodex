@@ -59,18 +59,33 @@ workflow returns `codexUsage` — runs and tokens per model.
 - Codex CLI, logged in (`codex login`; tested on 0.156.1)
 - Node.js 18+
 
-## Account switching with PrimerSwitch
+## Usage limits and account switching
 
 Jobs retain their Codex thread history by default. If a ChatGPT job reaches a
-usage limit, the supervisor waits for PrimerSwitch to select another account,
-then runs `codex exec resume` for that exact thread. Claude keeps polling the
-same job and receives its original authenticated result. The continuation keeps
-the original model, schema, directory, sandbox and network permissions.
+usage limit, the supervisor waits — by default up to 24 hours (`limitWaitSec`,
+0 to 8 days; 0 keeps only the 15-minute account wait) — for either of two things,
+whichever comes first, then runs `codex exec resume` for that exact thread:
+
+- the selected account changes (PrimerSwitch), or
+- usage is allowed again on the same account. This is read from a short-lived
+  `codex app-server` that only asks for the account's rate limits (no model call,
+  no usage; at most every 5 minutes and once just after the expected reset). Codex's
+  own verdict decides; only when it gives none does the reset time, plus a minute,
+  stand in for it. A resume that hits the limit again is spaced out (5, 10, 20… minutes
+  between resumes), so a limit the verdict does not reflect cannot burn the 8 continuations.
+
+Claude keeps polling the same job and receives its original authenticated result.
+The continuation keeps the original model, schema, directory, sandbox and network
+permissions (a resume restates them on every call: `codex exec resume` alone
+would run read-only). Time spent waiting does not count against the job's deadline.
+While waiting, `status` and `wait` show `backoff` with `waitingForLimit: true`,
+`resumesAt` (best estimate) and `limitWaitUntil`; the result's provenance counts
+`accountHandoffs` and `limitResumes` (together at most 8 per job).
 
 The supervisor lets active commands finish. Native `codex exec` does not support
 live account reload, so an already-running request may use the old account until
-it finishes or fails; continuation handles the terminal quota error. Waiting is
-bounded to 15 minutes and the original deadline, and cancellation still works.
+it finishes or fails; continuation handles the terminal quota error. Cancellation
+still works while waiting.
 Explicit `ephemeral: true`, external API-key authentication, a missing saved
 thread or an unverified process teardown prevent continuation. An already-polled
 durable job from the installed 0.3.6 runner can be adopted once after a quota
@@ -82,6 +97,16 @@ job. The original rollout stays intact. This fallback excludes hidden reasoning
 and configuration, keeps the same permissions, and runs once per account
 handoff. Bounded transcripts can omit older context; Codex must inspect current
 work and request missing essential information instead of guessing.
+
+## Orphaned runs
+
+A run nobody polls any more (Claude hit its own usage limit, the session closed) is
+**not** torn down by default: `onOrphan: "finish"` lets it run to its result or deadline
+(a queued run still starts, a limit wait goes on), and a resumed workflow joins it
+and gets the result. `status` and `wait` show `orphaned: true` while no poller is
+seen. `onOrphan: "stop"` restores the old rule (`abandoned` after `orphanAfterSec`
+without a poll). After stopping a workflow on purpose, `node scripts/codex-node.mjs
+cancel --orphaned` cancels every unfinished run on this machine whose caller stopped polling.
 
 ## Install
 
@@ -114,7 +139,7 @@ Workflow script ──agent({agentType:'ultracodex:codex-key'})────▶ k
                                                      codex-node.mjs start → detached supervisor
                                                                    │  spawns codex.exe directly,
                                                                    │  deadline · retries · slots
-                                                     wait (≤110 s per call, repeated) ◀── relay polls
+                                                     wait (≤570 s per call, repeated) ◀── relay polls
                                                                    ▼
                               { ok, result, provenance: { threadId, model, effort, usage } }
 ```

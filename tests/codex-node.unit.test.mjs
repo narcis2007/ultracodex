@@ -13,6 +13,7 @@ import {
   FRAME_SCHEMA_MARK,
   FRAME_TASK_MARK,
   KINDS,
+  MAX_LIMIT_WAIT_SEC,
   MAX_TIMEOUT_SEC,
   PAGED_THRESHOLD,
   PAGE_CHARS,
@@ -25,8 +26,10 @@ import {
   compactEnvelope,
   computeDeadlineSec,
   decodeFrameText,
+  defaultLimitWaitSec,
   encodeFrameText,
   encodePageText,
+  estimateResumeAt,
   ensureKey,
   evictGeneration,
   fnv1a,
@@ -46,6 +49,7 @@ import {
   parseFramed,
   parseProcessTable,
   policyTable,
+  probeRateLimits,
   readUserWindowsSandbox,
   requestDigest,
   requestMac,
@@ -54,7 +58,9 @@ import {
   resultBody,
   resultMac,
   schemaHash,
+  stopReason,
   summarizeEvents,
+  summarizeRateLimits,
   validateRequest,
   validateValue,
   visibleAccountCheckpoint,
@@ -957,4 +963,225 @@ test("resolveCodexLauncher prefers the native binary behind an npm install", (t)
   assert.match(launcher.source, /npm-native$/);
   const explicit = resolveCodexLauncher({ env: {}, explicitPath: path.join(root, "bin", "codex.js") });
   assert.equal(fs.realpathSync(explicit.command), fs.realpathSync(exe));
+});
+
+// ─── 0.3.9: resume sandbox, usage-limit waiting, orphaned runs ──────────────
+
+const RESUME_BASE = {
+  mode: "resume",
+  resume: { sessionId: "01a0cec5-503d" },
+  task: "follow up",
+  cwd: "/repo",
+  model: "gpt-6.1-sol",
+  effort: "xhigh",
+  ephemeral: false,
+  hermetic: true,
+  network: false,
+  serviceTier: null,
+  profile: null,
+  addDirs: [],
+  images: [],
+};
+
+test("buildCodexArgs: every resume restates the sandbox it was asked for", () => {
+  const files = { lastMessage: "L", schema: null };
+  const opts = { platform: "linux" };
+  // read-only: without the override `codex exec resume` would pick the saved thread's own setting
+  const readOnly = buildCodexArgs({ ...RESUME_BASE, sandbox: "read-only" }, files, opts);
+  assert.deepEqual(readOnly.slice(0, 3), ["exec", "resume", "01a0cec5-503d"]);
+  assert.ok(readOnly.includes('sandbox_mode="read-only"'));
+  assert.ok(!readOnly.some((arg) => arg.startsWith("sandbox_workspace_write")), "no write settings for a read-only resume");
+  // workspace-write: the mode, the network switch and the writable roots (the request's addDirs)
+  const writable = buildCodexArgs({ ...RESUME_BASE, sandbox: "workspace-write", addDirs: ["/cache", "C:/x y"] }, files, opts);
+  assert.ok(writable.includes('sandbox_mode="workspace-write"'));
+  assert.ok(writable.includes("sandbox_workspace_write.network_access=false"));
+  assert.ok(writable.includes('sandbox_workspace_write.writable_roots=["/cache","C:/x y"]'));
+  assert.ok(buildCodexArgs({ ...RESUME_BASE, sandbox: "workspace-write", network: true }, files, opts).includes("sandbox_workspace_write.network_access=true"));
+  // each override is a `-c` value, before the stdin marker
+  assert.equal(writable[writable.indexOf('sandbox_mode="workspace-write"') - 1], "-c");
+  assert.equal(writable.at(-1), "-");
+  // a continuation after an account change or a limit reset is a resume like any other
+  const continuation = buildCodexArgs({ ...RESUME_BASE, sandbox: "workspace-write", accountContinuation: true }, files, opts);
+  assert.ok(continuation.includes('sandbox_mode="workspace-write"'));
+  // the exec path is unchanged: it states its sandbox with -s
+  const exec = buildCodexArgs({ ...RESUME_BASE, mode: "exec", resume: null, sandbox: "workspace-write" }, files, opts);
+  assert.ok(exec.includes("-s") && !exec.some((arg) => arg.startsWith("sandbox_mode=")));
+});
+
+test("a resume request keeps the sandbox it names (read-only unless it says otherwise)", (t) => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-req-"));
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  const resumeOf = (extra) => validateRequest({ task: "x", cwd, resume: { sessionId: "01a0cec5-503d" }, ...extra }, { catalog: CATALOG });
+  assert.equal(resumeOf({}).sandbox, "read-only");
+  const writing = resumeOf({ sandbox: "workspace-write" });
+  assert.deepEqual([writing.mode, writing.sandbox, writing.kind], ["resume", "workspace-write", "implement"]);
+});
+
+test("onOrphan and limitWaitSec: defaults, bounds, and an environment default for tests", (t) => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-req-"));
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  const request = (extra = {}) => validateRequest({ task: "x", cwd, ...extra }, { catalog: CATALOG });
+  withHome(t, { ULTRACODEX_LIMIT_WAIT_SEC: "" }); // restores the variable afterwards
+  delete process.env.ULTRACODEX_LIMIT_WAIT_SEC;
+  assert.equal(request().onOrphan, "finish");
+  assert.equal(request({ onOrphan: "stop" }).onOrphan, "stop");
+  assert.throws(() => request({ onOrphan: "ignore" }), /onOrphan must be one of: finish, stop/);
+  assert.equal(request().limitWaitSec, 86_400, "24 hours by default");
+  assert.equal(request({ limitWaitSec: 0 }).limitWaitSec, 0);
+  assert.equal(request({ limitWaitSec: MAX_LIMIT_WAIT_SEC }).limitWaitSec, 8 * 24 * 3600);
+  for (const bad of [-1, MAX_LIMIT_WAIT_SEC + 1, 1.5, "600"]) {
+    assert.throws(() => request({ limitWaitSec: bad }), /limitWaitSec must be an integer from 0 to 691200/, String(bad));
+  }
+  process.env.ULTRACODEX_LIMIT_WAIT_SEC = "90";
+  assert.equal(request().limitWaitSec, 90);
+  assert.equal(request({ limitWaitSec: 5 }).limitWaitSec, 5, "the request wins over the environment");
+  assert.equal(defaultLimitWaitSec({ ULTRACODEX_LIMIT_WAIT_SEC: "99999999" }), MAX_LIMIT_WAIT_SEC);
+});
+
+test("relayed (framed) requests may carry limitWaitSec and onOrphan", () => {
+  const raw = framedToRaw(parseFramed(signedFrame({ tier: "light", kind: "verify", limitWaitSec: 3600, onOrphan: "stop" }, null, "x")), { key: TEST_KEY }).raw;
+  assert.deepEqual([raw.limitWaitSec, raw.onOrphan], [3600, "stop"]);
+});
+
+const RATE_LIMITS = {
+  ordinaryUsageAllowed: false,
+  accountId: "ACCOUNT-ID-SENTINEL",
+  rateLimitResetCredits: [{ id: "CREDIT-ID-SENTINEL" }],
+  rateLimits: {
+    limitId: "codex",
+    limitName: "Codex",
+    primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+    secondary: { usedPercent: 62.5, windowDurationMins: 10_080, resetsAt: 1_800_200_000 },
+    credits: { balance: "CREDIT-BALANCE-SENTINEL" },
+    planType: "pro",
+    rateLimitReachedType: "rate_limit_reached",
+  },
+  rateLimitsByLimitId: {
+    codex: { limitId: "codex", primary: { usedPercent: 100, resetsAt: 1_800_000_000 }, secondary: { usedPercent: 62.5, resetsAt: 1_800_200_000 } },
+    codex_other: { limitId: "codex_other", primary: { usedPercent: 10, resetsAt: 1_799_000_000 }, secondary: null },
+  },
+};
+
+test("a rate-limit response is reduced to the verdict, percentages and reset times", () => {
+  const summary = summarizeRateLimits(RATE_LIMITS);
+  assert.equal(summary.allowed, false);
+  assert.deepEqual(summary.windows, [
+    { limitId: "codex", window: "primary", usedPercent: 100, resetsAt: 1_800_000_000 },
+    { limitId: "codex", window: "secondary", usedPercent: 62.5, resetsAt: 1_800_200_000 },
+    { limitId: "codex_other", window: "primary", usedPercent: 10, resetsAt: 1_799_000_000 },
+  ]);
+  assert.doesNotMatch(JSON.stringify(summary), /SENTINEL/);
+  // an absent verdict is "unavailable", never "allowed"
+  assert.equal(summarizeRateLimits({ rateLimits: null }).allowed, null);
+  assert.equal(summarizeRateLimits({ ordinaryUsageAllowed: "yes" }).allowed, null);
+  assert.equal(summarizeRateLimits({ ordinaryUsageAllowed: true }).allowed, true);
+  // only `rateLimits` (no per-id map) is still read, as the default `codex` bucket
+  assert.deepEqual(summarizeRateLimits({ rateLimits: RATE_LIMITS.rateLimits }).windows.map((window) => [window.limitId, window.window]), [["codex", "primary"], ["codex", "secondary"]]);
+  // limit ids that are not plain identifiers are not echoed
+  assert.equal(summarizeRateLimits({ rateLimitsByLimitId: { "weird id with ACCOUNT-ID": { primary: { usedPercent: 1, resetsAt: 1 } } } }).windows[0].limitId, "other");
+});
+
+test("the expected return time is the latest reset of the used-up codex windows, else the earliest known", () => {
+  const w = (limitId, window, usedPercent, resetsAt) => ({ limitId, window, usedPercent, resetsAt });
+  // both windows used up: usage is back when the later one resets
+  assert.equal(estimateResumeAt([w("codex", "primary", 100, 1000), w("codex", "secondary", 100, 5000), w("codex_other", "primary", 100, 9000)]), 5_000_000);
+  // only the 5-hour window is used up
+  assert.equal(estimateResumeAt([w("codex", "primary", 100, 1000), w("codex", "secondary", 40, 5000)]), 1_000_000);
+  // nothing used up (a block for another reason): the earliest reset known
+  assert.equal(estimateResumeAt([w("codex", "primary", 70, 3000), w("codex", "secondary", 40, 2000)]), 2_000_000);
+  // no `codex` limit: the others stand in; no reset anywhere: unknown
+  assert.equal(estimateResumeAt([w("other", "primary", 100, 4000)]), 4_000_000);
+  assert.equal(estimateResumeAt([w("codex", "primary", 100, null)]), null);
+  assert.equal(estimateResumeAt([]), null);
+});
+
+const FAKE_CODEX_FILE = path.join(TESTS_DIR, "fixtures", "fake-codex.mjs");
+
+async function waitUntilGone(pid) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+test("the rate-limit probe asks an app-server for the limits, sends nothing else and leaves no process behind", async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-probe-"));
+  const script = path.join(home, "limits.json");
+  const log = path.join(home, "probe.jsonl");
+  fs.writeFileSync(script, JSON.stringify([
+    { result: RATE_LIMITS },
+    { result: { ordinaryUsageAllowed: true, rateLimits: null } },
+    { result: { ordinaryUsageAllowed: null } },
+    { error: { code: -32603, message: "ACCOUNT-ID-SENTINEL" } },
+    { exit: 3 },
+    { hang: true },
+    { hang: "ignore-close" },
+  ]));
+  withHome(t, { FAKE_CODEX_RATE_LIMITS: script, FAKE_CODEX_PROBE_LOG: log });
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const launcher = resolveCodexLauncher({ env: { ...process.env, ULTRACODEX_CODEX_PATH: FAKE_CODEX_FILE } });
+  const first = await probeRateLimits({ launcher });
+  assert.equal(first.ok, true);
+  assert.equal(first.allowed, false);
+  assert.equal(first.windows.length, 3);
+  assert.doesNotMatch(JSON.stringify(first), /SENTINEL/);
+  assert.equal((await probeRateLimits({ launcher })).allowed, true);
+  assert.equal((await probeRateLimits({ launcher })).allowed, null);
+  assert.deepEqual(await probeRateLimits({ launcher }), { ok: false, reason: "rpc_error" });
+  assert.deepEqual(await probeRateLimits({ launcher }), { ok: false, reason: "exited" });
+  assert.deepEqual(await probeRateLimits({ launcher, timeoutMs: 400 }), { ok: false, reason: "timeout" });
+  assert.deepEqual(await probeRateLimits({ launcher, timeoutMs: 400 }), { ok: false, reason: "timeout" }, "a server that ignores the close is killed");
+  const seen = fs.readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);
+  assert.deepEqual([...new Set(seen.map((entry) => entry.method))], ["initialize", "initialized", "account/rateLimits/read"], "read-only: nothing else is ever sent");
+  assert.equal(seen.filter((entry) => entry.method === "account/rateLimits/read").length, 7);
+  for (const pid of new Set(seen.map((entry) => entry.pid))) assert.ok(await waitUntilGone(pid), `probe process ${pid} is gone`);
+  // the server's own notifications and requests (even with the client's ids) are not answers
+  process.env.FAKE_CODEX_APP_SERVER_NOISE = "1";
+  fs.writeFileSync(script, JSON.stringify([{ result: { ordinaryUsageAllowed: true, rateLimits: null } }]));
+  fs.rmSync(`${script}.count`, { force: true });
+  assert.equal((await probeRateLimits({ launcher })).allowed, true);
+  delete process.env.FAKE_CODEX_APP_SERVER_NOISE;
+  // a missing Codex CLI is an unavailable probe, not an error
+  assert.deepEqual(await probeRateLimits({ launcher: { command: path.join(home, "no-such-codex"), argsPrefix: [], env: {} } }), { ok: false, reason: "spawn" });
+});
+
+test("an unpolled run is judged by onOrphan: finish records it, stop abandons it", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-orphan-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const paths = { dir, cancel: path.join(dir, "cancel"), heartbeat: path.join(dir, "heartbeat"), state: path.join(dir, "state.json"), log: path.join(dir, "supervisor.log") };
+  fs.writeFileSync(paths.state, JSON.stringify({ state: "running" }));
+  const beat = (agoMs) => fs.writeFileSync(paths.heartbeat, String(Date.now() - agoMs));
+  const request = (extra) => ({ attached: true, orphanAfterSec: 60, ...extra });
+  const clock = { orphanedSince: null, inGrace: () => false };
+  const recorded = () => JSON.parse(fs.readFileSync(paths.state, "utf8")).orphanedSince;
+
+  beat(5_000);
+  assert.equal(stopReason(paths, request({ onOrphan: "finish" }), clock), null);
+  assert.equal(clock.orphanedSince, null);
+  beat(90_000);
+  assert.equal(stopReason(paths, request({ onOrphan: "finish" }), clock), null, "finish: the run goes on");
+  assert.ok(clock.orphanedSince && Math.abs(Date.parse(clock.orphanedSince) - (Date.now() - 30_000)) < 2000, "since the moment the last poll was orphanAfterSec old");
+  assert.equal(recorded(), clock.orphanedSince, "recorded in the state");
+  assert.match(fs.readFileSync(paths.log, "utf8"), /nobody has polled since .*the run keeps going/);
+  const first = clock.orphanedSince;
+  assert.equal(stopReason(paths, request({ onOrphan: "finish" }), clock), null);
+  assert.equal(clock.orphanedSince, first, "recorded once, not on every look");
+  beat(1_000); // a poll arrives
+  assert.equal(stopReason(paths, request({ onOrphan: "finish" }), clock), null);
+  assert.equal(clock.orphanedSince, null);
+  assert.equal(recorded(), null, "cleared in the state");
+  assert.match(fs.readFileSync(paths.log, "utf8"), /a poller is back/);
+
+  beat(90_000);
+  assert.equal(stopReason(paths, request({ onOrphan: "stop" }), null), "abandoned");
+  assert.equal(stopReason(paths, request({}), null), "abandoned", "a request stored before onOrphan existed keeps the old rule");
+  assert.equal(stopReason(paths, request({ onOrphan: "stop", attached: false }), null), null, "detached runs are never orphaned");
+  assert.equal(stopReason(paths, request({ onOrphan: "stop" }), { orphanedSince: null, inGrace: () => true }), null, "the suspend grace holds for both");
+  fs.writeFileSync(paths.cancel, "1");
+  assert.equal(stopReason(paths, request({ onOrphan: "finish" }), clock), "cancelled", "cancel always wins");
 });

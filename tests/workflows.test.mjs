@@ -652,6 +652,28 @@ test("batch nodes declare their size, workflow nodes get a 15-minute orphan wind
   assert.deepEqual(usage["gpt-6-luna"], { runs: 1, failed: 1, input_tokens: 50, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0 });
 });
 
+test("codexNode sends limitWaitSec only when given, validated, and the relay accepts it", async () => {
+  const headers = [];
+  const agent = async (prompt) => {
+    const { request, framed } = receive(prompt); // the runner's own validation, signature included
+    headers.push({ header: parseFramed(framed, { encoded: true }).header, request });
+    return okEnvelope(request, { refuted: false, confidence: 1, reasoning: "r" });
+  };
+  await runHelper([
+    "await codexNode('default', { schemaPreset: 'verdict' })",
+    "await codexNode('none', { schemaPreset: 'verdict', limitWaitSec: 0 })",
+    "await codexNode('two hours', { schemaPreset: 'verdict', limitWaitSec: 7200 })",
+  ], agent);
+  assert.equal("limitWaitSec" in headers[0].header, false, "the runner's default (24 h) applies");
+  assert.equal(headers[0].header.onOrphan, undefined, "workflow nodes leave onOrphan to the runner: finish");
+  assert.equal(headers[0].request.onOrphan, "finish");
+  assert.equal(headers[1].request.limitWaitSec, 0);
+  assert.equal(headers[2].request.limitWaitSec, 7200);
+  for (const bad of ["-1", "691201", "1.5", "'3600'"]) {
+    await assert.rejects(runHelper([`await codexNode('x', { schemaPreset: 'verdict', limitWaitSec: ${bad} })`], agent), /limitWaitSec must be an integer 0\.\.691200/, bad);
+  }
+});
+
 test("the helper gate keeps at most 4 Codex jobs in flight, astra counting double", async () => {
   let active = 0;
   let peak = 0;

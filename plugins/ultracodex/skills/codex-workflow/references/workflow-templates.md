@@ -22,7 +22,8 @@ Two ways to use Codex nodes in a Workflow:
 `codexNode(task, opts)` — `opts`: `schema` (strict JSON Schema) or `schemaPreset`
 (`verdict` · `score` · `review` · `implement`), `tier` (`light` · `daily` · `final`), `kind`
 (`verify` · `ask` · `review`), optional `model`/`effort` overrides, `cwd` (the tree Codex may
-read), `timeoutSec`, `maxAttempts`, `orphanAfterSec` (default 900), `workItems` (set by
+read), `timeoutSec`, `maxAttempts`, `orphanAfterSec` (default 900), `limitWaitSec` (how long a usage-limited
+run waits for the limit to reset; runner default 24 h, 0 = no limit wait), `workItems` (set by
 `codexBatchNode`), `serviceTier` (`'priority'` = Fast: more usage, less waiting), `label`,
 `phase`, `meta`. It resolves to the parsed object
 (provenance in the non-enumerable `_codex`), the final text (no schema), or
@@ -54,7 +55,7 @@ stage works in the session's directory, not in the workflow's `cwd`.
 // for every kind · 'final' → gpt-6-astra@max for exceptional critical work. Pin
 // model/effort only to override with a reason. Concurrency is capped intrinsically: 4 Codex jobs
 // per workflow, an astra job counting as 2 — do not wrap calls in another gate.
-const UCX_VERSION = '0.3.8'
+const UCX_VERSION = '0.3.9'
 const UCX_RELAY = 'ultracodex:codex-relay'
 const UCX_TIER_MODEL = { light: 'gpt-6-luna', daily: 'gpt-6.1-sol', final: 'gpt-6-astra' }
 const UCX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
@@ -408,7 +409,7 @@ function ucxUnwrap(env, raw, expected = {}) {
       return ucxError('unauthenticated_result', 'the result is not signed by this machine\'s runner for this request — not trusted', env.runId)
     }
     const prov = { runId: env.runId, threadId: p.threadId, model: p.model, effort: p.effort, tier: p.tier,
-      usage: p.usageTotal || p.usage, durationMs: p.durationMs, attempts: p.attempts, accountHandoffs: p.accountHandoffs || 0, contextRestarts: p.contextRestarts || 0, codexVersion: p.codexVersion, slotLost: p.slotLost || false }
+      usage: p.usageTotal || p.usage, durationMs: p.durationMs, attempts: p.attempts, accountHandoffs: p.accountHandoffs || 0, limitResumes: p.limitResumes || 0, contextRestarts: p.contextRestarts || 0, codexVersion: p.codexVersion, slotLost: p.slotLost || false }
     ucxRecordUsage(prov)
     if (wantsResult) {
       Object.defineProperty(env.result, '_codex', { value: prov, enumerable: false })
@@ -431,8 +432,9 @@ function ucxUnwrap(env, raw, expected = {}) {
 
 function codexNode(task, opts = {}) {
   // orphanAfterSec 900: a collector may queue behind other agents before it resumes polling.
+  // An unpolled run is not torn down (onOrphan: finish is the runner's default): a resumed workflow joins it.
   const { schema = null, schemaPreset = null, tier = 'daily', kind = 'verify', model, effort, cwd, timeoutSec,
-    maxAttempts = 2, orphanAfterSec = 900, workItems = 1, serviceTier, label, phase, meta } = opts
+    maxAttempts = 2, orphanAfterSec = 900, workItems = 1, serviceTier, limitWaitSec, label, phase, meta } = opts
   if (typeof task !== 'string' || !task.trim()) throw new Error('codexNode: task must be a non-empty string')
   if (!UCX_TIER_MODEL[tier]) throw new Error('codexNode: tier must be light, daily or final')
   if (!UCX_KINDS.includes(kind)) throw new Error('codexNode: kind must be verify, ask or review (implementation is not a workflow node)')
@@ -445,6 +447,7 @@ function codexNode(task, opts = {}) {
   if (!(Number.isInteger(orphanAfterSec) && orphanAfterSec >= 60 && orphanAfterSec <= 3600)) throw new Error('codexNode: orphanAfterSec must be an integer 60..3600')
   if (!(Number.isInteger(workItems) && workItems >= 1 && workItems <= 256)) throw new Error('codexNode: workItems must be an integer 1..256')
   if (serviceTier !== undefined && !['default', 'priority'].includes(serviceTier)) throw new Error('codexNode: serviceTier must be default or priority')
+  if (limitWaitSec !== undefined && !(Number.isInteger(limitWaitSec) && limitWaitSec >= 0 && limitWaitSec <= 691200)) throw new Error('codexNode: limitWaitSec must be an integer 0..691200')
 
   const text = ucxNormalize(task)
   const wantsResult = Boolean(schema || schemaPreset)
@@ -457,6 +460,7 @@ function codexNode(task, opts = {}) {
   base.orphanAfterSec = orphanAfterSec
   if (workItems > 1) base.workItems = workItems                     // the runner scales the deadline for a batch
   if (serviceTier) base.serviceTier = serviceTier
+  if (limitWaitSec !== undefined) base.limitWaitSec = limitWaitSec    // how long a usage-limited run waits for the limit to reset (runner default: 24 h)
   if (schemaPreset) base.schemaPreset = schemaPreset
   if (label) base.label = String(label).replace(/[^\w .:/@#+=-]/g, '_').slice(0, 120)
   if (meta !== undefined) base.meta = meta
@@ -521,7 +525,7 @@ function codexNode(task, opts = {}) {
         agentType: UCX_RELAY, label: relayLabel + ':' + suffix, phase, ...(strong ? { model: 'opus' } : { effort: 'low' }),
       })
       // The relay stopped while the run is still going: a collector resumes polling
-      // (the supervisor tears the run down if nobody polls for orphanAfterSec).
+      // (an unpolled run keeps going; `cancel --orphaned` ends the ones nobody wants).
       for (let round = 0; env && env.ok === null && ucxRunId(env) && round < 3; round++) {
         raw = await collect(env.runId, 'collect', false)
         env = ucxEnvelope(raw, pageStore)
@@ -627,11 +631,12 @@ Rules the helper already enforces — do not work around them:
 - **Nothing vanishes.** A rejected relay call is a `relay_failed` node; the shipped workflows
   reconcile every requested dimension, lens, finding and candidate, and report what failed.
 - **No slot is held by a blocked call.** Codex runs detached under the runner's supervisor, which
-  owns the deadline and stops only the process tree it started. Each `wait` returns within two
-  minutes, so the relay never hits the Bash timeout; if nobody polls a workflow node for 15
-  minutes (`orphanAfterSec` 900 — a collector may queue behind other agents) the supervisor
-  tears the run down (`abandoned`). Only well-formed run ids from a relay's reply ever reach
-  another relay's prompt.
+  owns the deadline and stops only the process tree it started. Each `wait` returns within ten
+  minutes (the relay asks for 570 s under a 600 s Bash timeout), so the relay never hits it;
+  if nobody polls a workflow node for 15 minutes (`orphanAfterSec` 900 — a collector may queue
+  behind other agents) the run is marked `orphaned` but keeps going (`onOrphan: finish`), and a
+  resumed workflow joins it; `cancel --orphaned` ends the leftovers. Only well-formed run ids from
+  a relay's reply ever reach another relay's prompt.
 - **Intrinsic concurrency cap:** 4 Codex jobs per workflow, an astra job counting as 2, plus the
   runner's machine-wide cap (`ULTRACODEX_MAX_CONCURRENT`, default 4). Don't add another gate.
 - **Fail closed.** A dead node is unverified, never a pass: partition with `ucxPartition`, report

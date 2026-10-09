@@ -42,11 +42,11 @@ It gives `RUN_ID: <id>`. Go straight to the waiting loop with that id.
 
 ## Waiting loop
 
-Run:
+Run, with the Bash tool's `timeout` parameter set to `600000`:
 
-    node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" wait <runId>
+    node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" wait <runId> --max-wait 570
 
-Each call returns within about two minutes and prints one JSON line. While its `"state"` is `"queued"`, `"running"` or `"backoff"`, run the same command again — immediately, with nothing in between. Codex jobs legitimately take 30–90 minutes, so keep waiting until the state is something else. Never stop early, never sleep, never run any other command, never look at files.
+Each call returns within about ten minutes (sooner when the job finishes) and prints one JSON line. While its `"state"` is `"queued"`, `"running"` or `"backoff"`, run the same command again, with the same `timeout` — immediately, with nothing in between. Codex jobs legitimately take 30–90 minutes — and up to a day when a usage limit has to reset — so keep waiting until the state is something else. Never stop early, never sleep, never run any other command, never look at files.
 
 A large result is printed in pages: the final line then has `"paged":{"pages":P,…}` and no result. Fetch every page, k = 1 to P, one call each:
 

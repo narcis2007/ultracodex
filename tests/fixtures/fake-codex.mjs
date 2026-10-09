@@ -53,6 +53,77 @@ if (argv[0] === "debug" && argv[1] === "models") {
   process.stdout.write(JSON.stringify(CATALOG) + "\n");
   process.exit(0);
 }
+// The runner's rate-limit probe: `app-server --listen stdio://`, JSON-RPC one object per line.
+// FAKE_CODEX_RATE_LIMITS names a JSON file with the scripted answers, one per
+// account/rateLimits/read (the last repeats): {"result": {...}} | {"error": {...}} |
+// {"hang": true} (never answers; leaves when its stdin closes) | {"hang": "ignore-close"}
+// (never answers and ignores the close, so only a kill ends it) | {"exit": 3} (dies mid-call).
+// A `resetsAt` below a million is an offset in seconds from the first probe of the script (the
+// supervisor needs seconds to start, so a test cannot name an absolute time that early).
+// FAKE_CODEX_PROBE_LOG gets one line per message received, so a test can see exactly what the
+// runner sent and how often.
+if (argv[0] === "app-server") {
+  if (argv.slice(1).join(" ") !== "--listen stdio://") {
+    process.stderr.write(`fake-codex: unsupported app-server invocation: ${argv.join(" ")}\n`);
+    process.exit(2);
+  }
+  const record = (entry) => {
+    if (process.env.FAKE_CODEX_PROBE_LOG) fs.appendFileSync(process.env.FAKE_CODEX_PROBE_LOG, JSON.stringify({ ...entry, pid: process.pid, at: Date.now() }) + "\n");
+  };
+  const scriptFile = process.env.FAKE_CODEX_RATE_LIMITS;
+  const nextAnswer = () => {
+    const entries = JSON.parse(fs.readFileSync(scriptFile, "utf8"));
+    const counter = `${scriptFile}.count`;
+    const seen = fs.existsSync(counter) ? Number(fs.readFileSync(counter, "utf8")) : 0;
+    fs.writeFileSync(counter, String(seen + 1));
+    return entries[Math.min(seen, entries.length - 1)];
+  };
+  const anchored = (value) => {
+    if (Array.isArray(value)) return value.map(anchored);
+    if (!value || typeof value !== "object") return value;
+    const anchorFile = `${scriptFile}.anchor`;
+    const out = {};
+    for (const [key, child] of Object.entries(value)) {
+      if (key === "resetsAt" && typeof child === "number" && child < 1_000_000) {
+        if (!fs.existsSync(anchorFile)) fs.writeFileSync(anchorFile, String(Date.now()));
+        out[key] = Number(fs.readFileSync(anchorFile, "utf8")) / 1000 + child;
+      } else out[key] = anchored(child);
+    }
+    return out;
+  };
+  const reply = (id, body) => process.stdout.write(JSON.stringify({ id, ...body }) + "\n");
+  let stubborn = false;
+  const { createInterface } = await import("node:readline");
+  const lines = createInterface({ input: process.stdin });
+  lines.on("line", (line) => {
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      return;
+    }
+    record({ method: message.method ?? null, id: message.id ?? null });
+    // FAKE_CODEX_APP_SERVER_NOISE: the server's own notifications and requests (ids that collide
+    // with the client's) arrive around the answers; a client must take only the answers
+    if (process.env.FAKE_CODEX_APP_SERVER_NOISE && message.id !== undefined) {
+      process.stdout.write(JSON.stringify({ method: "remoteControl/status/changed", params: {} }) + "\n");
+      process.stdout.write(JSON.stringify({ id: message.id, method: "fake/serverRequest", params: {} }) + "\n");
+    }
+    if (message.method === "initialize") reply(message.id, { result: { userAgent: "fake-codex/0.0.0" } });
+    else if (message.method === "account/rateLimits/read") {
+      const answer = scriptFile ? nextAnswer() : { result: { ordinaryUsageAllowed: null, rateLimits: null } };
+      if (answer.hang) {
+        stubborn = answer.hang === "ignore-close";
+        if (stubborn) setTimeout(() => {}, 120_000); // a failing test never leaks for long
+      } else if (answer.exit !== undefined) process.exit(answer.exit);
+      else reply(message.id, answer.error ? { error: answer.error } : { result: anchored(answer.result) });
+    } else if (message.id !== undefined) reply(message.id, { error: { code: -32601, message: "method not found" } });
+  });
+  lines.on("close", () => {
+    if (!stubborn) process.exit(0);
+  });
+  await new Promise(() => {}); // lives until stdin closes (or a kill)
+}
 if (argv[0] !== "exec") {
   process.stderr.write(`fake-codex: unsupported invocation: ${argv.join(" ")}\n`);
   process.exit(2);
@@ -106,6 +177,17 @@ emit({ type: "turn.started" });
 const quotaWork = directive("QUOTA_WORK");
 if (resumeId && process.env.FAKE_CODEX_ENCRYPTED_RESUME === "1") {
   apiFailure(400, { code: "invalid_encrypted_content", message: "The encrypted content could not be verified" });
+}
+// FAKE_CODEX_QUOTA_RESUMES=n: the first n resumes hit the usage limit again (counted in
+// ${FAKE_CODEX_STATE}.quota), the way an out-of-credits workspace does however often it is retried.
+const quotaResumes = Number(process.env.FAKE_CODEX_QUOTA_RESUMES ?? 0);
+if (resumeId && quotaResumes > 0 && process.env.FAKE_CODEX_STATE) {
+  const counter = `${process.env.FAKE_CODEX_STATE}.quota`;
+  const seen = fs.existsSync(counter) ? Number(fs.readFileSync(counter, "utf8")) : 0;
+  if (seen < quotaResumes) {
+    fs.writeFileSync(counter, String(seen + 1));
+    apiFailure(429, { code: "usage_limit_reached", message: "You have hit your usage limit" });
+  }
 }
 if (quotaWork && !resumeId) {
   fs.appendFileSync(quotaWork, "applied once\n");

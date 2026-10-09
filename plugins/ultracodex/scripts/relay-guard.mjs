@@ -6,7 +6,7 @@
 //     node "<plugin>/scripts/codex-node.mjs" part (new|ucx-<12 hex>) K N HASH <<'UCX_P…'
 //     <encoded lines: no quote, no control characters>
 //     UCX_P…
-//     node "<plugin>/scripts/codex-node.mjs" wait <runId>
+//     node "<plugin>/scripts/codex-node.mjs" wait <runId> [--max-wait <1..600>]
 //     node "<plugin>/scripts/codex-node.mjs" page <runId> <k>
 //
 //   key agent (ultracodex:codex-key) — its prompt holds no task text; it may run exactly
@@ -32,6 +32,7 @@ const KEY_TYPES = new Set(["ultracodex:codex-key", "codex-key"]);
 const READER_TYPES = new Set(["ultracodex:codex-reader", "codex-reader"]);
 const RUN_ID = String.raw`\d{8}T\d{6}Z-[0-9a-f]{6}`;
 const UPLOAD = String.raw`(?:new|ucx-[0-9a-f]{12})`;
+const MAX_RELAY_WAIT_SEC = 600;
 
 function normalizePath(value) {
   return String(value).replace(/\\/g, "/").replace(/\/+$/, "");
@@ -56,7 +57,9 @@ export function classifyRelayCommand(command, pluginRoot) {
   const args = prefix[2].trim();
   if (args === "key") return rest.length ? deny("key takes no input") : { command: "key", problem: null };
   if (/^expect [0-9a-f]{64}$/.test(args)) return rest.length ? deny("expect takes no input") : { command: "expect", problem: null };
-  if (new RegExp(`^wait ${RUN_ID}$`).test(args)) return rest.length ? deny("wait takes no input") : { command: "wait", problem: null };
+  const wait = new RegExp(`^wait ${RUN_ID}(?: --max-wait (\\d{1,3}))?$`).exec(args);
+  // a long poll: the relay runs `wait <runId> --max-wait 570` under a 600 s Bash timeout
+  if (wait && Number(wait[1] ?? 0) <= MAX_RELAY_WAIT_SEC) return rest.length ? deny("wait takes no input") : { command: "wait", problem: null };
   if (new RegExp(`^page ${RUN_ID} \\d{1,3}$`).test(args)) return rest.length ? deny("page takes no input") : { command: "page", problem: null };
   const part = new RegExp(`^part ${UPLOAD} \\d{1,3} \\d{1,3} [0-9a-f]{8} <<'(UCX_PX*)'$`).exec(args);
   if (!part) return deny("not an allowed part/wait/page command");

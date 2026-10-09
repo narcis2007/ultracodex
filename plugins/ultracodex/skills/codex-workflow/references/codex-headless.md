@@ -14,13 +14,14 @@ shell. Every command prints one JSON line tagged `{"ultracodex":1,...}`; exit co
 | `start --request FILE\|-` | validate a JSON request, persist it, hand it to a detached supervisor; prints `runId` |
 | `start --framed FILE\|-` | same, from a framed request (header line / schema / task) |
 | `part new 1 N HASH` · `part UPLOAD K N HASH` | relay upload: part 1 opens an upload (the runner allocates its id), parts 2..N go to it; a part whose hash differs is refused (`part_rejected`), but a copy that runs on into the next part's lines keeps the prefix that matches (`trimmedLines`); the last part starts the run |
-| `wait RUN_ID [--max-wait SEC]` | poll up to 110 s (default); prints the final envelope or the running state; refreshes the heartbeat |
+| `wait RUN_ID [--max-wait SEC]` | poll up to 110 s (default; the workflow relay asks for `--max-wait 570`); prints the final envelope or the running state; refreshes the heartbeat on every poll while it blocks |
 | `run --request FILE` | start + one wait |
 | `status [RUN_ID] [--all]` · `result RUN_ID` | inspect runs (never refresh the heartbeat) |
 | `page RUN_ID K` | slice K of a large result (see "Paged results") |
 | `key` | the per-machine key, a fresh nonce and their `keyCheck` — for the Workflow helper's key agent only |
 | `expect DIGEST` | announce one relayed request by its 64-hex digest before it is uploaded — for the key agent only (see "Signed requests and results") |
 | `cancel RUN_ID` | ask that run's supervisor to stop its own process tree |
+| `cancel --orphaned` | the same for every unfinished attached run whose caller stopped polling for its `orphanAfterSec` (the cleanup after stopping a workflow on purpose — it reaches every unpolled run on this machine, other sessions' too, so only when the owner asks); prints one line listing the run ids and labels |
 | `preflight [--live]` | CLI, auth, catalog, policy models, home dir; `--live` = one tiny luna call |
 | `dry-run --request FILE` | show the exact codex argv, model, effort, deadline — no model call |
 | `policy` · `models` · `schema PRESET` · `schema-check --schema FILE` · `gc` | helpers |
@@ -32,8 +33,11 @@ Request fields (unknown fields are rejected): `task` or `taskFile`; `schema` / `
 `timeoutSec` (default from the policy; scaled ×(1 + 0.25·(N−1)), at most ×4, by `workItems: N`
 for a batch); `maxAttempts` (default 2 for read-only work, **1 for writing tasks** — workspace-write
 or resume — which may only retry with `replaySafe: true`, since a replay could apply effects
-twice); `attached` (default true — torn down when nobody polls
-for `orphanAfterSec`, default 1800 so a stopped background `wait` can be restarted; the Workflow helper sends 900); `ephemeral` (default false to retain resumable thread history);
+twice); `attached` (default true — a run nobody polls for
+`orphanAfterSec`, default 1800 so a stopped background `wait` can be restarted, is `orphaned`; the Workflow helper sends 900); `onOrphan`
+(`finish` default: an orphaned run keeps going to its result or deadline and a later upload of the same signed request joins it;
+`stop`: it is torn down as `abandoned`); `limitWaitSec` (0–691200, default 86400: how long a usage-limited run waits for the limit to
+reset before failing with `usage_limit`; 0 = only the 15-minute account wait); `ephemeral` (default false to retain resumable thread history);
 `label`; `meta` (echoed back); `serviceTier` (`priority` = Fast); `addDirs`; `images`;
 `profile`; `review: {base|commit|uncommitted, title}`; `resume: {sessionId}`.
 
@@ -41,7 +45,7 @@ Envelope: `ok: true` + `result` (schema) or `text` — never both —, `resultHa
 body, so a relay's transcription can be verified), `mac` (see "Signed requests and results"),
 and `provenance` {threadId, model, effort, tier, mode, sandbox, hermetic, usage (last attempt),
 usageTotal (all attempts), durationMs, attempts, codexVersion, launcher, taskHash, teardown,
-slotLost}. Failures: `ok: false`, `state` (`failed`, `timeout`, `cancelled`, `abandoned`,
+slotLost, accountHandoffs, limitResumes, limitWaitedSec}. Failures: `ok: false`, `state` (`failed`, `timeout`, `cancelled`, `abandoned`,
 `rejected`, `lost`) and `error` {kind, retryable, message}.
 
 ### Signed requests and results
@@ -97,12 +101,13 @@ Runs live in `~/.ultracodex/runs/<runId>/` (request, task, schema, state, per-at
 `events.jsonl` / `stderr.log` / `last.txt`, `supervisor.log`, `result.json`). `gc` removes
 finished runs after 7 days. `ULTRACODEX_HOME` moves the directory; `ULTRACODEX_CODEX_PATH`
 points at a specific Codex binary; `ULTRACODEX_MAX_CONCURRENT` sets the machine-wide cap (0 =
-unlimited).
+unlimited); `ULTRACODEX_LIMIT_WAIT_SEC` is the default `limitWaitSec` for requests that do not set it;
+`ULTRACODEX_LIMIT_PROBE_MS` the rate-limit probe cadence during a limit wait (default 5 min).
 
 Relayed requests (`part`, `start --framed`) are read-only and hermetic by construction: the
 runner refuses `workspace-write`, `hermetic: false`, `network`, `resume`, `taskFile`, `schemaFile`,
 `addDirs`, `images` and `profile` from a relay, even with valid hashes. Suspend-aware: after a
-sleep the supervisor extends the deadline by the time asleep and pauses abandonment for one
+sleep the supervisor extends the deadline by the time asleep and pauses the orphan check for one
 `orphanAfterSec`; `wait` declares `lost` only after watching the supervisor stay silent.
 
 ### The guard (plugin hook)
@@ -200,19 +205,40 @@ Other 0.156 additions: `--worktree` (Codex-managed worktree), `-p <profile>` (la
 
 ### Account continuation
 
-When a persistent ChatGPT job fails with a usage limit, the runner waits up to
-15 minutes, within its original deadline, for the selected account to change.
-It resumes the exact saved thread using a fixed continuation instruction, not
-the original task prompt. The same run id, request digest, final schema, sandbox,
-network permissions and working directory are preserved. `wait` reports
-`backoff` with `waitingForAccount: true`, so already-loaded Claude relays keep
-polling. Cancellation and orphan detection remain active while waiting.
+When a persistent ChatGPT job fails with a usage limit, the runner enters a *limit wait* of
+at most `limitWaitSec` (default 24 h; internal state `limit_wait`) that ends when the
+selected account changes **or** usage is allowed again on the same account, then resumes
+the exact saved thread using a fixed continuation instruction, not the original task
+prompt. The same run id, request digest, final schema, sandbox, network permissions and
+working directory are preserved (every `exec resume` restates `sandbox_mode` — without it
+the resumed turn is read-only, even for a thread that was writable — and, for
+workspace-write, `network_access` and `writable_roots`). `wait` and `status` report
+`backoff` with `waitingForAccount: true`, `waitingForLimit: true`, `resumesAt` (ISO; the
+latest reset among the used-up windows of the `codex` limit, else the earliest known; null
+until a probe learned it) and `limitWaitUntil` (ISO; when the wait gives up), so
+already-loaded Claude relays keep polling. Cancellation stays active while waiting; an
+orphaned run keeps waiting unless `onOrphan` is `stop`.
+
+"Usage is allowed again" comes from a rate-limit probe: a short-lived `codex app-server
+--listen stdio://` (same launcher; inside the supervisor's Job Object) that gets
+`initialize`, `initialized` and `account/rateLimits/read` — no model turn, no MCP servers,
+no usage, nothing mutating — and is closed through its stdin. It runs once on entering the
+wait, then at most every 5 minutes (`ULTRACODEX_LIMIT_PROBE_MS`) and once 30 s after the
+expected reset. `ordinaryUsageAllowed: true` resumes, `false` keeps waiting; with no
+verdict (`null`, or a failed probe) the latest known reset time plus 60 s resumes. Only
+allowed/percent/reset times are kept or logged — never account or credit ids. From a run's second limit wait on, a resume (verdict or reset time) is honoured only `ULTRACODEX_LIMIT_PROBE_MS` × 2^(k−1) after the wait began, k = the limit resumes so far (never beyond the cap; `resumesAt` shows it; account changes are not deferred). Hitting the
+cap ends the run as `usage_limit`; `limitWaitSec: 0` keeps only the 15-minute account
+wait of 0.3.7 (what `auth` and `rate_limit` errors always get — a single check for an
+account that already changed). Time spent waiting does not count against the job's
+deadline: the continuation gets the work time the interrupted attempt had left.
 
 Native `codex exec` cannot reload accounts during an active request; an account
-change alone never interrupts a tool command. Continuation is bounded to eight
-handoffs and requires a thread id, managed ChatGPT authentication and verified
-cleanup. Auth/rate-limit errors continue only if the account already changed.
-Explicit ephemeral jobs and external authentication are never continued.
+change alone never interrupts a tool command. Continuation — after a reset or an account
+change, sharing one budget — is bounded to eight handoffs and requires a thread id,
+managed ChatGPT authentication and verified cleanup. Auth/rate-limit errors continue only
+if the account already changed. Explicit ephemeral jobs and external authentication are
+never continued. The result's provenance reports `accountHandoffs`, `limitResumes` and
+`limitWaitedSec` separately. A waiting run keeps its machine-wide slot.
 
 If the resumed thread fails with `invalid_encrypted_content`, continue once per
 handoff in a fresh thread using the exact thread's visible rollout messages and
@@ -258,9 +284,9 @@ MCP OAuth refresh noise filtered out.
 | `rate_limit` · `server` · `network` | yes, 20 s × attempt backoff | transient |
 | `empty_output` | yes, once | clean exit, no final message |
 | `timeout` | no | deadline hit; raise `timeoutSec` or shrink the task |
-| `abandoned` · `cancelled` | no | nobody polled / cancel requested; tree stopped |
+| `abandoned` · `cancelled` | no | nobody polled (only with `onOrphan: "stop"`) / cancel requested; tree stopped |
 | `auth` | no | run `codex login` interactively |
-| `usage_limit` | no | plan limit reached |
+| `usage_limit` | no | plan limit reached, and it did not reset within `limitWaitSec` (or the job cannot be continued) |
 | `model` · `effort` | no | not in catalog / not supported — fix the request |
 | `schema` | no | strict-mode violation (usually caught before the run) |
 | `schema_mismatch` · `parse` | no | output did not match / was not JSON |
@@ -281,10 +307,11 @@ MCP OAuth refresh noise filtered out.
 
 `claude -p` waits for background tasks — a running Workflow included — for at most 600 s,
 then terminates them ("Background tasks still running after 600s; terminating"). The relays
-die with it, the heartbeat stops, and attached Codex runs are torn down as `abandoned`. For
-headless automation that runs Codex workflows, set `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`.
-A run whose relay died can be rescued within `orphanAfterSec` by polling it
-(`wait <runId>`), which is exactly what the helper's COLLECT relay does.
+die with it and the heartbeat stops: the runs are `orphaned` but, by default (`onOrphan: "finish"`), keep
+going to their result — `wait <runId>` collects it (what the helper's COLLECT relay does), and
+`cancel --orphaned` ends the ones nobody wants. With `onOrphan: "stop"` they are torn down as
+`abandoned` after `orphanAfterSec`. For headless automation that runs Codex workflows, set
+`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`.
 
 ## Windows/Git Bash traps (why the transport looks the way it does)
 
