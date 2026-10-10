@@ -112,6 +112,7 @@ export const TIMING = Object.freeze({
   limitProbeMs: envInt("ULTRACODEX_LIMIT_PROBE_MS", 5 * 60_000), // rate-limit probe cadence while waiting for a limit reset
   limitProbeAfterResetMs: envInt("ULTRACODEX_LIMIT_PROBE_AFTER_RESET_MS", 30_000), // an extra probe this long after the reset time
   limitResetMarginMs: envInt("ULTRACODEX_LIMIT_RESET_MARGIN_MS", 60_000), // resume on the reset time alone only this long after it
+  accountCheckMs: envInt("ULTRACODEX_ACCOUNT_CHECK_MS", 2000), // how often an idle session looks at the managed account
   ackWaitMs: envInt("ULTRACODEX_ACK_WAIT_MS", 15_000), // how long send/interrupt/answer wait for the supervisor's acknowledgement
   ackGraceMs: envInt("ULTRACODEX_ACK_GRACE_MS", 3000), // how long a command keeps looking for its acknowledgement once the session's result.json exists
   closeWaitMs: envInt("ULTRACODEX_CLOSE_WAIT_MS", 60_000), // how long close waits for a live supervisor to wind the session down

@@ -735,6 +735,7 @@ class SessionDriver {
     this.ending = false;
     this.slot = null;
     this.nextSnapshotAt = 0;
+    this.nextAccountCheckAt = 0;
     // read by the Phase 1 limit/account waits through the run's context: how a session's inbox
     // reaches them (close and interrupt must not wait out a 24-hour limit wait)
     context.waitStop = () => this.waitStopHook();
@@ -823,6 +824,7 @@ class SessionDriver {
         if (!this.server) return this.goDormant(); // revived with nothing left to run
         this.goIdle();
       }
+      if (this.accountSwitchedWhileIdle()) return this.dormantForAccount();
       if (Date.now() >= this.idleUntil) return this.goDormant();
       this.snapshotTree();
       await sleep(TIMING.pollMs);
@@ -863,11 +865,29 @@ class SessionDriver {
     this.publish({ state: "idle" });
   }
 
-  async goDormant() {
+  // Has the managed account changed under an app-server that has nothing to do? A Codex process that
+  // refreshes its tokens after a switch merges the old account's tokens into the new auth.json, so an
+  // idle one must not hold the old login for its whole idle time. Never while a turn runs or one is
+  // queued (a running turn is not stopped for a switch: the next turn follows it, see ensureServer),
+  // and a missing or unreadable login (null) is not a switch. Checked at most every accountCheckMs.
+  accountSwitchedWhileIdle({ now = false } = {}) {
+    if (!this.server || this.server.exited || this.active || this.chain || this.queue.length) return false;
+    if (!now && Date.now() < this.nextAccountCheckAt) return false;
+    this.nextAccountCheckAt = Date.now() + TIMING.accountCheckMs;
+    const current = managedAccountIdentity();
+    return Boolean(current && this.server.login && current !== this.server.login);
+  }
+
+  dormantForAccount() {
+    this.log("the managed account changed while the session was idle; going dormant so that no app-server keeps the old login (the next message resumes the thread on the new one)");
+    return this.goDormant("account_change");
+  }
+
+  async goDormant(reason = null) {
     // An ephemeral thread is not saved by Codex: with the process gone nothing could revive it.
     if (this.request.ephemeral) return this.endForGood("closed");
     await this.stopServer();
-    this.events.append("dormant", {});
+    this.events.append("dormant", reason ? { reason } : {});
     this.phase = "dormant";
     this.idleUntil = null;
     this.publish({ state: "dormant", dormantAt: nowIso(), supervisorPid: null });
@@ -1140,7 +1160,9 @@ class SessionDriver {
     } finally {
       fs.closeSync(errorFd);
     }
-    const server = { child, client: null, exited: false, exitCode: null, closing: false, spawnError: null, lastTotal: null, account: this.request.ephemeral ? null : managedAccountIdentity() };
+    // `login`: the managed account this app-server started with, also for an ephemeral session (whose `account` is not tracked)
+    const login = managedAccountIdentity();
+    const server = { child, client: null, exited: false, exitCode: null, closing: false, spawnError: null, lastTotal: null, account: this.request.ephemeral ? null : login, login };
     const gone = deferred();
     server.gone = gone.promise;
     const markGone = (code) => {
@@ -1690,6 +1712,8 @@ class SessionDriver {
     if (this.closeRequest) return this.finishClose();
     if (this.queue.length) return null;
     if (!this.server || this.server.exited) return this.goDormant();
+    // a switch that happened during the turn: no idle time on the old login
+    if (this.accountSwitchedWhileIdle({ now: true })) return this.dormantForAccount();
     this.goIdle();
     return null;
   }

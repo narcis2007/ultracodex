@@ -141,6 +141,9 @@ supervisor resumes the thread with the requested sandbox, also after a reboot â€
 (`closed`; `--archive` also archives the Codex thread). `result.json` exists only for a session that
 ended for good (closed, cancelled, failed, a hermetic violation); each turn's signed envelope is
 `turns/<n>.json`, and `wait` returns the latest one as soon as the session is idle (or a question is waiting).
+An idle session also sleeps as soon as the managed ChatGPT account changes (checked every ~2 s, and right after a turn;
+`dormant {reason: "account_change"}`, nothing left running): an app-server that kept the old login could merge its old
+tokens into the new `auth.json` when it refreshes them. The next `send` resumes the thread on the new account.
 `timeoutSec` is the deadline of **each turn**; the usage-limit wait, account handoff, spacing and budget of
 the one-shot runs apply inside a session (the app-server is restarted on a new account, then the thread is
 resumed and continued); orphan handling, slots (held only while a turn runs) and Job Object teardown are the

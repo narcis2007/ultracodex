@@ -8,7 +8,7 @@ import test from "node:test";
 
 import { ACCOUNT_CONTINUATION } from "../plugins/ultracodex/scripts/codex-node.mjs";
 import { eventually, pidAlive, runCli } from "./helpers.mjs";
-import { jsonLines, readJson, readState, requests, runDir, serverSpawns, sessionEvents, sessionHome, startSession, untilEvent, untilState, wait } from "./helpers-session.mjs";
+import { hasResult, jsonLines, readJson, readState, requests, runDir, send, serverSpawns, sessionEvents, sessionHome, startSession, untilEvent, untilState, wait } from "./helpers-session.mjs";
 
 const SECRET_ACCOUNT = "ACCOUNT-ID-MUST-NOT-LEAK";
 
@@ -205,4 +205,98 @@ test("close, interrupt and cancel during a limit wait act at once; a message sen
   const cancelled = await runCli(["cancel", three], { env });
   assert.equal(cancelled.json.state, "cancelled", cancelled.stdout);
   assert.equal(requests(calls(), "turn/start").filter((entry) => /cancel me|close me/.test(entry.params.input[0].text)).length, 2, "no turn was started after the waits ended");
+});
+
+// ── an idle session and the managed account ──
+//
+// A Codex process that refreshes its tokens after the owner switched accounts merges the old
+// account's tokens into the new auth.json, so an idle app-server must not sit on the old login for
+// its whole idle time: the session sleeps as soon as the account changes.
+
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const eventTypes = (home, runId) => sessionEvents(home, runId).map((event) => event.type);
+
+test("an idle session sleeps as soon as the managed account changes; the next send resumes the thread on the new one", async (t) => {
+  const { home, env, calls } = sessionHome(t, { ULTRACODEX_ACCOUNT_CHECK_MS: "100" });
+  saveAccount(home, "account-a");
+  const runId = await startSession(env, home, { task: "first\nFAKE_ANSWER=one", tier: "light" });
+  assert.equal((await wait(env, runId)).json.text, "one");
+  assert.ok(await untilState(home, runId, "idle"));
+  const supervisorPid = readState(home, runId).supervisorPid;
+  const firstServer = serverSpawns(calls())[0].pid;
+  assert.ok(pidAlive(supervisorPid) && pidAlive(firstServer));
+
+  saveAccount(home, "account-b");
+  assert.ok(await untilState(home, runId, "dormant", 15_000), "asleep within moments, not after the idle time (20 minutes)");
+  assert.ok(await eventually(() => !pidAlive(supervisorPid) && !pidAlive(firstServer)), "no supervisor, no app-server: nothing holds the old login");
+  assert.equal(hasResult(home, runId), false, "dormant is not finished");
+  const events = sessionEvents(home, runId);
+  assert.deepEqual(events.slice(-2).map((event) => [event.type, event.reason]), [["idle", undefined], ["dormant", "account_change"]]);
+
+  const ack = await send(env, runId, "second\nFAKE_ANSWER=two");
+  assert.deepEqual([ack.json.outcome, ack.json.turn], ["started", 2]);
+  const second = await wait(env, runId);
+  assert.equal(second.json.text, "two");
+  assert.equal(serverSpawns(calls()).length, 2, "a new app-server, started after the switch");
+  assert.equal(requests(calls(), "thread/resume").length, 1, "the same thread");
+  assert.deepEqual(sessionEvents(home, runId).filter((event) => event.type === "resumed").map((event) => event.reason), ["revive"]);
+  await pause(800);
+  assert.equal(readState(home, runId).state, "idle", "the new app-server holds the new login: it is not put to sleep for the switch it was started after");
+});
+
+test("a token refresh on the same account, or a login that cannot be read, is not a switch", async (t) => {
+  const { home, env, calls } = sessionHome(t, { ULTRACODEX_ACCOUNT_CHECK_MS: "100" });
+  saveAccount(home, "account-a");
+  const runId = await startSession(env, home, { task: "first\nFAKE_ANSWER=one", tier: "light" });
+  assert.equal((await wait(env, runId)).json.text, "one");
+  assert.ok(await untilState(home, runId, "idle"));
+  const supervisorPid = readState(home, runId).supervisorPid;
+  const server = serverSpawns(calls())[0].pid;
+  const auth = path.join(home, "auth.json");
+
+  fs.writeFileSync(auth, JSON.stringify({ auth_mode: "chatgpt", tokens: { account_id: "account-a", access_token: "rotated", refresh_token: "rotated" } }));
+  await pause(1000);
+  for (const content of ["{", "", JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: "sk-x" }), JSON.stringify({ auth_mode: "chatgpt", tokens: {} })]) {
+    fs.writeFileSync(auth, content);
+    await pause(500);
+  }
+  fs.rmSync(auth);
+  await pause(500);
+  assert.equal(readState(home, runId).state, "idle");
+  assert.ok(pidAlive(supervisorPid) && pidAlive(server), "nothing was stopped");
+  assert.equal(eventTypes(home, runId).includes("dormant"), false);
+
+  // and the check was running all along: a real switch now puts it to sleep
+  saveAccount(home, "account-b");
+  assert.ok(await untilState(home, runId, "dormant", 15_000));
+});
+
+test("a switch during a turn does not stop it; the session sleeps when the turn is done instead of idling", async (t) => {
+  const { home, env, calls } = sessionHome(t, { ULTRACODEX_ACCOUNT_CHECK_MS: "100" });
+  saveAccount(home, "account-a");
+  const runId = await startSession(env, home, { task: "long\nFAKE_TURN_MS=2500\nFAKE_ANSWER=done", tier: "light" });
+  assert.ok(await untilEvent(home, runId, (event) => event.type === "command"));
+  const server = serverSpawns(calls())[0].pid;
+  saveAccount(home, "account-b");
+  await pause(800);
+  assert.deepEqual([readState(home, runId).state, readState(home, runId).turnActive, pidAlive(server)], ["running", true, true], "a running turn is never stopped for a switch");
+  const final = await wait(env, runId, 30);
+  assert.deepEqual([final.code, final.json.ok, final.json.text], [0, true, "done"]);
+  assert.ok(await untilState(home, runId, "dormant", 15_000));
+  assert.ok(await eventually(() => !pidAlive(server)));
+  const types = eventTypes(home, runId);
+  assert.deepEqual(types.slice(-2), ["turn_completed", "dormant"], "no idle time on the old login");
+  assert.equal(sessionEvents(home, runId).at(-1).reason, "account_change");
+});
+
+test("an ephemeral session still ends instead of sleeping when the account changes", async (t) => {
+  const { home, env } = sessionHome(t, { ULTRACODEX_ACCOUNT_CHECK_MS: "100" });
+  saveAccount(home, "account-a");
+  const runId = await startSession(env, home, { task: "e\nFAKE_ANSWER=e", tier: "light", ephemeral: true });
+  assert.equal((await wait(env, runId)).json.text, "e");
+  assert.equal(hasResult(home, runId), false, "idle for now");
+  saveAccount(home, "account-b");
+  assert.ok(await eventually(() => hasResult(home, runId), { timeoutMs: 20_000 }));
+  assert.equal(readJson(path.join(runDir(home, runId), "result.json")).state, "closed");
+  assert.equal(eventTypes(home, runId).includes("dormant"), false);
 });

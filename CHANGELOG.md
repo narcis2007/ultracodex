@@ -36,6 +36,13 @@ the one-shot behaviour and the Workflow path are unchanged.
   own cursor namespace; `ULTRACODEX_CHANNEL=0` turns it off. Registered only when Claude Code is started with
   `--dangerously-load-development-channels plugin:ultracodex@ultracodex`; otherwise the notifications are dropped
   silently and the tools work as before.
+- **Safety: an idle session sleeps as soon as the account changes.** An idle session kept its `codex app-server` for `idleTtlSec` (20 min) and never
+  looked at the managed account again; a Codex process that refreshes its tokens after the owner switched ChatGPT accounts merges the old
+  account's tokens into the new `auth.json` and corrupts the login. Now an idle session (no turn, nothing queued) compares the managed account
+  with the one its app-server started with every ~2 s (`ULTRACODEX_ACCOUNT_CHECK_MS`) — and right after a turn, before it would idle — and on a
+  change goes dormant at once (`dormant {reason:"account_change"}`, nothing left running); the next `send` resumes the thread on the new
+  account as usual. A missing or unreadable login is not a switch, a token refresh on the same account is not one, a running turn is never
+  stopped for one, and an ephemeral session ends as it does when its idle time is up.
 - **Fix: two supervisors for one revived session.** Two senders reviving a dormant session start two supervisors; both judged the dead
   supervisor's `supervisor.lock` stale and the second one's removal took the first one's new lock, so both believed they held it (measured:
   most of the time when they start together). One noticed at its next beat, but its driver — which starts seconds later, after the Windows

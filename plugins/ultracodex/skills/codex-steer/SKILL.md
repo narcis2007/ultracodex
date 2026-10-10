@@ -55,7 +55,7 @@ below — it does the same. The relay, key and reader agents never get them.
 | `running` | a turn is active (`turnActive: true`; `waitingForAnswer: true` when Codex asked you something) |
 | `backoff` | a usage-limit or account wait inside the session (`waitingForLimit`, `resumesAt`) |
 | `idle` | the turn is done, the app-server is still up for `idleTtlSec` (default 1200 s); `idleUntil` says when it sleeps |
-| `dormant` | no process at all, the thread is on disk; **the next `send` revives it** (also after a reboot) |
+| `dormant` | no process at all, the thread is on disk; **the next `send` revives it** (also after a reboot). An idle session goes dormant at once when the managed account changes (`dormant {reason: "account_change"}`): an app-server holding the old login must not outlive a switch; the revive resumes the thread on the new account |
 | `closed` / `cancelled` / `failed` | ended for good — only now does `result.json` exist |
 
 `wait` (`codex_wait`) returns as soon as there is something to act on: a **question** (exit 3,
