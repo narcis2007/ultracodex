@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.5.0 — 2026-10-10 (native tools + notifications)
+
+Codex sessions feel like Claude Code's own agent messaging: native tools instead of Bash commands, and a
+notification when Codex asks or finishes instead of polling. Everything is additive; the runner commands,
+the one-shot behaviour and the Workflow path are unchanged.
+
+- **MCP server `scripts/mcp-server.mjs`** (hand-written JSON-RPC over stdio, no dependency; declared in
+  `plugin.json` as `mcpServers.ultracodex`, one process per Claude session). Nine tools, each running the runner
+  CLI and returning its JSON line: `codex_start` (always a session, never attached), `codex_sessions`,
+  `codex_send`, `codex_interrupt`, `codex_answer`, `codex_events` (at most 200 events per call, `since` / `lastSeq`
+  paging, `waitSec` ≤ 300), `codex_wait` (≤ 600 s), `codex_result`, `codex_close`. Full names are
+  `mcp__plugin_ultracodex_ultracodex__<tool>`. A refusal is an answer; only a bad argument or a dead runner is a
+  tool error. It asks for MCP revision 2025-06-18 whatever the client prefers (a channel server that negotiates
+  2026-07-28 cannot deliver channel messages). The relay, key and reader agents keep their Bash/Read/Grep/Glob
+  `tools:` list and never get these tools (tested).
+- **Ownership.** Each run records the Claude session that started it (`owner`, `ownerSource` in `state.json`; shown
+  by `status`; `status --mine` filters by it): `ULTRACODEX_OWNER` — exported into the session's Bash commands by the
+  new `SessionStart` hook (`scripts/session-start.mjs`, from the `session_id` and `CLAUDE_ENV_FILE` Claude Code gives
+  it; prints nothing, never fails the session) — else `CLAUDE_CODE_SESSION_ID` (present today, not documented), else
+  none. Metadata only: never in a request, a signature or a digest, and a relayed request cannot set it.
+- **`notify`** (`scripts/notify.mjs`): `notify [--owner ID | --all] [--max-wait SEC | --forever] [--from now|cursor]`
+  watches the event feeds of the owner's sessions and prints one compact JSON line per actionable event —
+  `question`, `turn_done` (with a ≤ 400-character summary), `limit_wait` (once per wait: with the reset time when a probe knows it, else `null` after ~10 s), `resumed` (limit reset / account change),
+  `error`, `ended` (cancelled, or a session that failed) — and nothing for messages, commands, file changes, steers,
+  idle and the like. A per-owner cursor (`~/.ultracodex/notify/<hash>.json`) lets a re-armed watcher continue without
+  missing or repeating anything; a question still waiting is printed again at startup. Default `--max-wait` 1740 s
+  (fits the Monitor tool's 30-minute cap); `--forever` takes a per-owner singleton lock; no owner and no `--all` →
+  `{"codex":"notify_unavailable",…}`, exit 1. It writes no heartbeat. `gc` prunes cursor and lock files older than a week.
+- **Plugin monitors** (`experimental.monitors` in `plugin.json`): `notify --forever` starts when `codex-implement`,
+  `codex-steer` or `codex-ask` is used (interactive sessions).
+- **Channel** (Claude Code research preview): the MCP server declares `experimental["claude/channel"]` and, after
+  `notifications/initialized`, pushes the same events as `notifications/claude/channel` ("Codex session … asks: …",
+  "… finished turn 2 (ok): …") with identifier-only `meta` (`run_id`, `event`, `turn`, `question_id`, `label_slug`). Its
+  own cursor namespace; `ULTRACODEX_CHANNEL=0` turns it off. Registered only when Claude Code is started with
+  `--dangerously-load-development-channels plugin:ultracodex@ultracodex`; otherwise the notifications are dropped
+  silently and the tools work as before.
+- **Fix: two supervisors for one revived session.** Two senders reviving a dormant session start two supervisors; both judged the dead
+  supervisor's `supervisor.lock` stale and the second one's removal took the first one's new lock, so both believed they held it (measured:
+  most of the time when they start together). One noticed at its next beat, but its driver — which starts seconds later, after the Windows
+  Job Object helper — still published its stale state when it began, which could land after the winner's last write and leave the session
+  `queued` with `wait` never returning its result. Taking over a stale lock is now exclusive (a `supervisor.lock.takeover` marker, and the
+  lock is re-checked under it), and a supervisor that lost the lock writes nothing to the session.
+- Skills: `codex-steer` leads with the tools (CLI as the fallback) and documents the three notification tiers;
+  `codex-implement` and `codex-ask` mention the tools and `notify`. README: tools table, notification tiers, the
+  channel launch command, the `mcp__plugin_ultracodex_ultracodex__*` permission entry, the cost note.
+
 ## 0.4.0 — 2026-10-09 (sessions)
 
 Claude can talk to a running Codex job. Opt-in, for direct runs only (`codex-implement`, `codex-ask`); Workflow

@@ -81,6 +81,10 @@ export function fastEnv(home, extra = {}) {
     ULTRACODEX_KILL_GRACE_MS: "300",
     ULTRACODEX_MIN_ORPHAN_SEC: "1",
     ULTRACODEX_MIN_TIMEOUT_SEC: "1",
+    ULTRACODEX_NOTIFY_RESCAN_MS: "200",
+    // tests may run inside Claude Code: its session id must not become the owner of their runs
+    ULTRACODEX_OWNER: "",
+    CLAUDE_CODE_SESSION_ID: "",
     ...extra,
   };
 }

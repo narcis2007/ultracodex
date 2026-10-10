@@ -58,6 +58,9 @@ test("anything else a job relay tries is denied — the key above all", () => {
     ["backslash inside a part", partCommand("new", "C:" + String.fromCharCode(92) + "x")],
     ["unterminated heredoc", `node "${RUNNER}" part new 1 1 0123abcd <<'UCX_P'\nx`],
     ["other runner command", `node "${RUNNER}" cancel ${RUN}`],
+    ["a session command", `node "${RUNNER}" send ${RUN} --message x`],
+    ["the session watcher", `node "${RUNNER}" notify --all`],
+    ["the owner listing", `node "${RUNNER}" status --mine`],
     ["start with a request file", `node "${RUNNER}" start --request C:/x.json`],
     ["caller-chosen upload id", partCommand("ucx-test-inbox", "x")],
   ];

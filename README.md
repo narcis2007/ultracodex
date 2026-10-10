@@ -28,7 +28,9 @@ see [CHANGELOG.md](CHANGELOG.md) for what changed.
 | Agent `codex-relay` | Internal: the Bash-only relay that runs one Codex job for a Workflow node. |
 | Agent `codex-key` | Internal: fetches the runner key and a nonce once per workflow, and announces each request to the runner (no task text in its prompt). |
 | Agent `codex-reader` | Internal: the confined type for Claude stages that read reviewed code — Read, Grep, Glob and read-only git. |
-| Runner `scripts/codex-node.mjs` (+ `session.mjs`) | Validates requests, runs `codex exec` — or, for a steerable session, a private `codex app-server` — under a detached supervisor with deadlines, process-tree teardown, retries, machine-wide slots and a provenance envelope. |
+| MCP server `scripts/mcp-server.mjs` | Codex sessions as native Claude Code tools (`codex_start`, `codex_send`, `codex_answer`, …) and an optional channel that pushes "Codex asks …" / "finished turn N" into the conversation. |
+| Plugin monitors + hooks | `notify --forever` started by the codex skills (events without polling); a `SessionStart` hook that tells each run which Claude session started it. |
+| Runner `scripts/codex-node.mjs` (+ `session.mjs`, `notify.mjs`) | Validates requests, runs `codex exec` — or, for a steerable session, a private `codex app-server` — under a detached supervisor with deadlines, process-tree teardown, retries, machine-wide slots and a provenance envelope. |
 
 ## Model policy — astra, sol, luna
 
@@ -121,6 +123,9 @@ the supervisor drives a private `codex app-server --listen stdio://` (JSON-RPC o
 - **interrupt** a turn, read the **event feed** (`events RUN --follow`, built for Claude Code's Monitor tool),
   **answer questions** Codex asks through its client-side tool `ask_orchestrator`, and **close** the session.
 
+In Claude Code the plugin's MCP tools do all of this without Bash (see "Native tools" below); the commands are the
+fallback and what the tools run.
+
 ```bash
 node scripts/codex-node.mjs start --request req.json        # {"session": true, "task": "…", …}
 node scripts/codex-node.mjs events RUN --follow             # a line per event; ends on idle / question / dormant / ended
@@ -159,6 +164,72 @@ their own commands, so none of `send`, `answer`, `interrupt`, `events`, `close` 
 `idle`, `dormant`, `closed`, `cancelled`, `hermetic_violation`. Reasoning, auth data and account ids are never
 written. Past 8 MB the file keeps only the structural events (no command / file / plan / tool / commentary events).
 The skill `codex-steer` is the command reference; `codex-node.mjs help` lists the syntax.
+
+### Native tools
+
+The plugin declares a stdio MCP server (`plugin:ultracodex:ultracodex`, hand-written, no dependencies); Claude
+Code starts one small node process per session, and Claude — and a subagent that inherits the conversation's
+tools — calls Codex directly. Tool names are `mcp__plugin_ultracodex_ultracodex__<tool>`:
+
+| Tool | Does |
+| --- | --- |
+| `codex_start` | Start a session (always `session: true`, never attached): `task` or `taskFile`, absolute `cwd`, `sandbox`, `tier`, `kind`, `model`, `effort`, `schemaPreset`, `label`, `network`, `addDirs`, `idleTtlSec`, `timeoutSec`, `limitWaitSec`, `askOrchestrator`. Only starts it: implementation work still follows the `codex-implement` skill. |
+| `codex_sessions` | The sessions this Claude session started (`all`: everyone's), with the pending question, and which owner id the server uses. |
+| `codex_send` | Steer the running turn, start a follow-up, or queue one (`mode`). |
+| `codex_interrupt` | Stop the running turn now; the session stays open. |
+| `codex_answer` | Answer a question Codex asked (it is blocked until then). |
+| `codex_events` | The event feed after `since`: at most 200 per call, `truncated` + `lastSeq` to page, `waitSec` (≤ 300) to wait for the next one. |
+| `codex_wait` | Return on a question, a finished turn or the end; otherwise after `waitSec` (≤ 600, default 300). |
+| `codex_result` | The envelope of the latest turn, or of turn `turn`. |
+| `codex_close` | End the session (`force` interrupts a running turn first, `archive` archives the thread). |
+
+Every tool runs the runner CLI and returns its JSON line, so the two cannot drift apart; a refusal is an answer,
+only a bad argument or a dead runner is a tool error. To avoid a permission prompt per call, allow the whole
+server once: `mcp__plugin_ultracodex_ultracodex__*` in the `permissions.allow` of your Claude Code settings. The
+relay, key and reader agents are restricted to Bash/Read/Grep/Glob by their frontmatter, so they never get these
+tools.
+
+### Notifications without polling
+
+Claude should not poll a Codex session. Three tiers, from the most to the least widely available; the runner
+records which Claude session started a run (`owner` in `status`; a `SessionStart` hook exports the session id as
+`ULTRACODEX_OWNER`, with `CLAUDE_CODE_SESSION_ID` as the fallback), and every one of them speaks only for that
+session's runs.
+
+1. **`notify`**, for Claude Code's **Monitor** tool — works wherever Monitor does:
+   `node scripts/codex-node.mjs notify [--owner ID | --all] [--max-wait SEC | --forever] [--from now|cursor]`.
+   One compact JSON line per *actionable* event and nothing else: `question`, `turn_done`, `limit_wait` (once per usage-limit wait), `resumed`
+   (after a limit reset or an account change), `error`, `ended`. Messages, commands, file changes, steers and idle
+   are never reported. A cursor per owner (`~/.ultracodex/notify/<hash>.json`) makes a re-armed watcher continue
+   where the last one stopped — nothing missed, nothing repeated — and a question still waiting is printed again.
+   It ends after 29 minutes (`--max-wait`, to fit the Monitor tool's 30-minute cap): re-arm it. It writes no heartbeat.
+2. **The plugin monitor** (`experimental.monitors` in `plugin.json`, an experimental Claude Code feature, interactive sessions only):
+   the first time `codex-implement`, `codex-steer` or `codex-ask` runs, Claude Code starts `notify --forever` and
+   its lines arrive as notifications. A per-owner lock keeps it to one process however many entries start it. If the
+   monitor's environment does not name the session, the watcher says `notify_unavailable` and leaves; the Monitor
+   recipe above is the fallback.
+3. **The channel** (Claude Code *research preview*): the MCP server declares `claude/channel` and pushes
+   "Codex session … asks: … — answer with codex_answer(…)" / "… finished turn 2 (ok): … — read it with codex_result
+   or continue with codex_send" into the conversation as `<channel>` messages, which Claude answers with the tools.
+   A plugin channel that is not on Anthropic's allowlist registers only when you start an interactive session with
+
+   ```bash
+   claude --dangerously-load-development-channels plugin:ultracodex@ultracodex
+   ```
+
+   (a confirmation dialog appears; not available with `-p`). Without the flag Claude Code drops the notifications
+   silently and the tools work as before. `ULTRACODEX_CHANNEL=0` turns the push off. The channel keeps its own cursor,
+   so with a Monitor watcher running as well you get each event twice.
+
+**Whose run is it?** `codex_start` and `codex_sessions` report `owner` and `ownerSource` (`ultracodex_owner`,
+`claude_code_session_id`, or `instance`: the server found no session id in its environment and made up its own, so
+only its channel and tools see those runs; a watcher then needs `notify --owner <that id>`).
+
+**Cost.** One small node process per Claude session for the MCP server, plus one watcher while the codex skills are in
+use (the same watcher logic runs in the server for the channel; it polls a few small files once a second). Nothing runs
+when no session exists. The MCP server needs Claude Code to start plugin MCP servers (it does by default); the server
+asks for MCP protocol revision 2025-06-18 whatever the client prefers, because a channel server that negotiates the
+newer revision cannot deliver channel messages.
 
 ## Install
 
@@ -227,7 +298,7 @@ Workflow script ──agent({agentType:'ultracodex:codex-key'})────▶ k
 ## Development
 
 ```bash
-npm test           # 90+ offline tests (fake Codex CLI, stubbed workflow runtime) — no quota
+npm test           # 240+ offline tests (fake Codex CLI, stubbed workflow runtime) — no quota
 npm run build      # regenerate plugins/ultracodex/workflows/*.js and the helper block in the docs
 npm run check      # build --check + tests
 npm run preflight

@@ -14,9 +14,16 @@ Codex (GPT-6 via `codex exec`) inside Claude Code.
 - **Runner**: `scripts/codex-node.mjs` (the session driver is `scripts/session.mjs`) — run
   `node scripts/codex-node.mjs help`. A direct run with `"session": true` is a steerable session on a
   private `codex app-server`: `send` / `interrupt` / `answer` / `events --follow` / `close` (README: "Sessions").
+- **MCP server**: `scripts/mcp-server.mjs` (declared in `plugin.json`) — Codex sessions as native tools,
+  `mcp__plugin_ultracodex_ultracodex__codex_start|sessions|send|interrupt|answer|events|wait|result|close`, and a
+  channel (research preview; `claude --dangerously-load-development-channels plugin:ultracodex@ultracodex`) that
+  pushes "Codex asks …" / "finished turn N". `notify` (`scripts/notify.mjs`) is the same watcher for the Monitor
+  tool; `experimental.monitors` in `plugin.json` starts it for the codex skills (README: "Sessions").
 - **Hook**: `hooks/hooks.json` → `scripts/relay-guard.mjs` — confines the job relay to the runner's
   `part`/`wait`/`page` commands, the key agent to `key`/`expect` and the reader to read-only
   git; other subagents only lose the runner's `key`/`expect` (the main conversation is untouched).
+  A `SessionStart` hook (`scripts/session-start.mjs`) exports the session id as `ULTRACODEX_OWNER`, so each run
+  records which Claude session started it.
 
 Tier policy: `light` → gpt-6-luna@max · `daily` → gpt-6.1-sol@xhigh (all workloads) ·
 `final` → gpt-6-astra@max. See `skills/codex-workflow/references/model-policy.md`.

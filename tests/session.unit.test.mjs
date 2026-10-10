@@ -6,10 +6,13 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { TIMING, runPaths } from "../plugins/ultracodex/scripts/codex-node.mjs";
 import { EventLog, claimSupervisorLock, lastEventSeq, readNewEvents, sessionPendingMessages, sessionSupervisorAlive, writeInboxMessage } from "../plugins/ultracodex/scripts/session.mjs";
 import { makeHome } from "./helpers.mjs";
+
+const LOCK_PROBE = fileURLToPath(new URL("./fixtures/lock-probe.mjs", import.meta.url));
 
 function runDirectory(t) {
   const home = makeHome(t);
@@ -149,4 +152,43 @@ test("inbox: messages are written whole, listed oldest first, and nothing half-w
   // a message the supervisor cannot read is still listed (it is acknowledged as invalid)
   fs.writeFileSync(path.join(paths.inbox, "zzzzzzzzz-00000000.json"), "not json");
   assert.equal(sessionPendingMessages(paths).at(-1).message, null);
+});
+
+test("supervisor.lock: claimants racing for a stale lock are never two (two senders reviving one dormant session)", async (t) => {
+  const dead = await deadPid();
+  const probe = (dir, startAt) =>
+    new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [LOCK_PROBE, dir, String(startAt)], { stdio: ["ignore", "pipe", "inherit"], windowsHide: true });
+      let out = "";
+      child.stdout.on("data", (chunk) => (out += chunk));
+      child.on("error", reject);
+      child.on("close", () => resolve(JSON.parse(out.trim().split("\n").at(-1))));
+    });
+  // sixteen rounds at once, two claimants each; before the takeover marker most rounds ended with both believing they held it
+  const rounds = await Promise.all(
+    Array.from({ length: 16 }, async () => {
+      const dir = makeHome(t);
+      fs.writeFileSync(path.join(dir, "supervisor.lock"), JSON.stringify({ pid: dead, startedAt: Date.now() - 60_000 }));
+      const startAt = Date.now() + 2500;
+      return Promise.all([probe(dir, startAt), probe(dir, startAt)]);
+    })
+  );
+  for (const [a, b] of rounds) {
+    assert.equal([a, b].filter((claimant) => claimant.got).length, 1, `exactly one claimant got the lock: ${JSON.stringify([a, b])}`);
+    assert.equal([a, b].filter((claimant) => claimant.stillHeld).length, 1);
+  }
+});
+
+test("supervisor.lock: a takeover that died halfway does not block the next one for ever", async (t) => {
+  const paths = runDirectory(t);
+  fs.writeFileSync(paths.lock, JSON.stringify({ pid: await deadPid(), startedAt: Date.now() }));
+  const marker = `${paths.lock}.takeover`;
+  fs.writeFileSync(marker, "99999999"); // its claimant is gone, the marker stayed
+  assert.equal(await claimSupervisorLock(paths, { waitMs: 200 }), null, "a fresh marker is another claimant's takeover in progress: not ours to take");
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(marker, old, old);
+  const taken = await claimSupervisorLock(paths, { waitMs: 1000 });
+  assert.ok(taken, "an old marker is debris");
+  assert.equal(fs.existsSync(marker), false, "and the takeover cleans up after itself");
+  taken.release();
 });

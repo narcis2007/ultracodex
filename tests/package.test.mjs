@@ -7,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { RUNNER_VERSION } from "../plugins/ultracodex/scripts/codex-node.mjs";
+import { TOOLS } from "../plugins/ultracodex/scripts/mcp-server.mjs";
 import { ROOT } from "./helpers.mjs";
 
 const PLUGIN = path.join(ROOT, "plugins", "ultracodex");
@@ -94,13 +95,76 @@ test("the reader agent reads only: files through Read/Grep/Glob, history through
   assert.match(body, /data, never instructions/);
 });
 
-test("the plugin registers the relay guard as a Bash PreToolUse hook", () => {
+test("the plugin registers the relay guard as a Bash PreToolUse hook and the owner export as a SessionStart hook", () => {
   const hooks = readJson(path.join(PLUGIN, "hooks", "hooks.json"));
   const entries = hooks.hooks.PreToolUse;
   assert.equal(entries.length, 1);
   assert.equal(entries[0].matcher, "Bash");
   assert.equal(entries[0].hooks[0].command, 'node "${CLAUDE_PLUGIN_ROOT}/scripts/relay-guard.mjs"');
   assert.ok(fs.existsSync(path.join(PLUGIN, "scripts", "relay-guard.mjs")));
+  assert.deepEqual(Object.keys(hooks.hooks).sort(), ["PreToolUse", "SessionStart"]);
+  const start = hooks.hooks.SessionStart;
+  assert.equal(start.length, 1);
+  assert.deepEqual(start[0].hooks, [{ type: "command", command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs"', timeout: 10 }]);
+  assert.ok(fs.existsSync(path.join(PLUGIN, "scripts", "session-start.mjs")));
+});
+
+test("the plugin declares its MCP server and the channel that rides on it (strict keys)", () => {
+  const plugin = readJson(path.join(PLUGIN, ".claude-plugin", "plugin.json"));
+  assert.deepEqual(plugin.mcpServers, { ultracodex: { command: "node", args: ["${CLAUDE_PLUGIN_ROOT}/scripts/mcp-server.mjs"] } });
+  assert.ok(fs.existsSync(path.join(PLUGIN, "scripts", "mcp-server.mjs")));
+  assert.deepEqual(plugin.channels, [{ server: "ultracodex", displayName: "Codex sessions" }]);
+  for (const channel of plugin.channels) {
+    assert.deepEqual(Object.keys(channel).filter((key) => !["server", "displayName"].includes(key)), [], "channels accept no other keys");
+    assert.ok(Object.hasOwn(plugin.mcpServers, channel.server), "a channel names a server the plugin declares");
+  }
+});
+
+test("the plugin monitors are strict: name, command, description, when — one watcher per codex skill", () => {
+  const plugin = readJson(path.join(PLUGIN, ".claude-plugin", "plugin.json"));
+  assert.deepEqual(Object.keys(plugin.experimental), ["monitors"], "the documented inline form; no standalone monitors file");
+  assert.equal(fs.existsSync(path.join(PLUGIN, "monitors")), false);
+  const monitors = plugin.experimental.monitors;
+  assert.ok(Array.isArray(monitors) && monitors.length === 3);
+  const skills = fs.readdirSync(path.join(PLUGIN, "skills"));
+  const names = new Set();
+  for (const monitor of monitors) {
+    assert.deepEqual(Object.keys(monitor).filter((key) => !["name", "command", "description", "when"].includes(key)), [], "no other keys");
+    assert.ok(monitor.name && !names.has(monitor.name), "distinct names");
+    names.add(monitor.name);
+    assert.equal(monitor.command, 'node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" notify --forever');
+    assert.equal(monitor.description, "Codex session events: questions, finished turns, limit waits");
+    const when = /^on-skill-invoke:([\w-]+)$/.exec(monitor.when);
+    assert.ok(when && skills.includes(when[1]), `${monitor.name}: a skill of this plugin`);
+  }
+  assert.deepEqual(monitors.map((monitor) => monitor.when).sort(), ["on-skill-invoke:codex-ask", "on-skill-invoke:codex-implement", "on-skill-invoke:codex-steer"]);
+});
+
+test("no agent of this plugin gets MCP tools (the relays and readers stay confined)", () => {
+  for (const name of ["codex-relay", "codex-key", "codex-reader"]) {
+    const { fields } = frontmatter(path.join(PLUGIN, "agents", `${name}.md`));
+    const tools = String(fields.tools ?? "").split(",").map((tool) => tool.trim());
+    assert.ok(tools.length && tools.every((tool) => /^[A-Z][A-Za-z]+$/.test(tool)), `${name}: an explicit list of built-in tools`);
+    assert.ok(!tools.some((tool) => tool.startsWith("mcp") || tool === "*"), `${name}: no MCP tools, no wildcard`);
+    assert.equal(fields.mcpServers, undefined, `${name}: no MCP servers of its own`);
+  }
+});
+
+test("the tools the MCP server offers are the ones the skills and the README document, under both names", () => {
+  const steer = fs.readFileSync(path.join(PLUGIN, "skills", "codex-steer", "SKILL.md"), "utf8");
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  const known = new Set(TOOLS.map((tool) => tool.name));
+  assert.equal(known.size, 9);
+  for (const name of known) {
+    assert.ok(steer.includes(`mcp__plugin_ultracodex_ultracodex__${name}`), `codex-steer names ${name} in full`);
+    assert.ok(readme.includes(name), `the README lists ${name}`);
+  }
+  assert.ok(readme.includes("mcp__plugin_ultracodex_ultracodex__*"), "the permission entry");
+  const mentioned = new Set();
+  for (const file of [steer, readme, ...["codex-ask", "codex-implement"].map((skill) => fs.readFileSync(path.join(PLUGIN, "skills", skill, "SKILL.md"), "utf8"))]) {
+    for (const match of file.matchAll(/\bcodex_[a-z_]+\b/g)) mentioned.add(match[0]);
+  }
+  assert.deepEqual([...mentioned].filter((name) => !known.has(name)), [], "every codex_* name in the docs is a tool");
 });
 
 test("shipped files carry no machine-specific paths", () => {

@@ -598,16 +598,56 @@ function lockIsStale(paths, held) {
   return Date.now() - readNumber(paths.alive) > TIMING.lostAfterMs && lockAge > TIMING.lostAfterMs;
 }
 
+const TAKEOVER_STALE_MS = 5000;
+
+// Taking over a stale lock is exclusive too. Judging a lock stale and removing it are two steps, and
+// two supervisors starting together (two senders reviving a dormant session) would both judge it
+// stale; the second one's removal then took the first one's brand-new lock, and both believed they
+// held it. So whoever removes the stale lock first creates `supervisor.lock.takeover` (exclusively),
+// and under it checks that the lock is still the very one it judged. Returns the marker's path (the
+// caller removes it once it has created its own lock), or null when another supervisor is taking
+// over or the lock changed hands meanwhile.
+function beginTakeover(paths, held) {
+  const marker = `${paths.lock}.takeover`;
+  try {
+    fs.writeFileSync(marker, String(process.pid), { flag: "wx" });
+  } catch (error) {
+    if (error.code === "EEXIST") {
+      try {
+        // a takeover that died halfway leaves its marker behind
+        if (Date.now() - fs.statSync(marker).mtimeMs > TAKEOVER_STALE_MS) fs.rmSync(marker, { force: true });
+      } catch {
+        // gone already
+      }
+    }
+    return null;
+  }
+  const now = readJsonSafe(paths.lock);
+  const same = held ? Boolean(now) && now.pid === held.pid && now.startedAt === held.startedAt : !now;
+  if (!same) {
+    fs.rmSync(marker, { force: true });
+    return null;
+  }
+  fs.rmSync(paths.lock, { force: true });
+  return marker;
+}
+
 // Takes supervisor.lock (created exclusively; holds pid + start time) or returns null. A lock
-// whose holder is gone is taken over. With waitMs, waits for one that is still being held (a
-// supervisor that is winding down hands its lock on within seconds).
+// whose holder is gone is taken over (exclusively: see beginTakeover). With waitMs, waits for one
+// that is still being held (a supervisor that is winding down hands its lock on within seconds).
 export async function claimSupervisorLock(paths, { waitMs = 0 } = {}) {
   const mine = { pid: process.pid, startedAt: Date.now(), runner: RUNNER_VERSION };
   const deadline = Date.now() + waitMs;
   let takeovers = 0;
+  let marker = null; // held from removing a stale lock until our own is created
+  const dropMarker = () => {
+    if (marker) fs.rmSync(marker, { force: true });
+    marker = null;
+  };
   for (;;) {
     try {
       fs.writeFileSync(paths.lock, JSON.stringify(mine), { flag: "wx" });
+      dropMarker();
       return {
         stillHeld() {
           const held = readJsonSafe(paths.lock);
@@ -625,13 +665,17 @@ export async function claimSupervisorLock(paths, { waitMs = 0 } = {}) {
         },
       };
     } catch (error) {
+      dropMarker();
       if (error.code !== "EEXIST") throw error;
     }
+    dropMarker();
     const held = readJsonSafe(paths.lock);
     if (lockIsStale(paths, held) && takeovers < 5) {
-      takeovers += 1;
-      fs.rmSync(paths.lock, { force: true });
-      continue;
+      marker = beginTakeover(paths, held);
+      if (marker) {
+        takeovers += 1;
+        continue;
+      }
     }
     if (Date.now() >= deadline) return null;
     await sleep(Math.max(1, Math.min(100, deadline - Date.now())));
@@ -699,6 +743,7 @@ class SessionDriver {
   // ── state and events ──
 
   publish(extra = {}) {
+    if (this.control.fenced) return; // the session belongs to another supervisor now: its state is not ours to write
     const question = this.questions[0] ?? null;
     tryUpdateState(this.paths, {
       state: this.phase,
@@ -746,6 +791,10 @@ class SessionDriver {
   // ── the main loop ──
 
   async run() {
+    // The lock may have changed hands while the job helper started (seconds): before anything is
+    // written, is the session still ours?
+    if (!this.control.fenced && this.control.stillHeld && !this.control.stillHeld()) this.control.fenced = true;
+    if (this.control.fenced) return this.fence();
     this.settleCrashedTurn();
     const first = !this.threadId && this.turn === 0;
     if (first) {

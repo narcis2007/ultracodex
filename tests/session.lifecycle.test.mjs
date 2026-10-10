@@ -90,6 +90,34 @@ test("a supervisor that died (a crash, a reboot) is replaced by the next message
   assert.deepEqual(texts.slice(1).sort(), ["from a\nFAKE_ANSWER=A", "from b\nFAKE_ANSWER=B"]);
 });
 
+// The bug behind a flaky "two senders" run: two supervisors started together both took the dead
+// supervisor's lock, one noticed at its first beat, and its driver — which starts seconds later, after
+// the Job Object helper — still published its (stale) state at start-up. When that landed after the
+// winner's last publish the session said "queued" for ever and `wait` never returned the result.
+test("a supervisor that lost the session lock writes nothing to the session afterwards", async (t) => {
+  const { home, env } = sessionHome(t, { ULTRACODEX_ACK_WAIT_MS: "0" });
+  const runId = await startSession(env, home, { task: "first\nFAKE_ANSWER=one", tier: "light", idleTtlSec: 0 });
+  assert.equal((await wait(env, runId)).json.text, "one");
+  assert.ok(await untilState(home, runId, "dormant"));
+  const lock = path.join(runDir(home, runId), "supervisor.lock");
+  const log = path.join(runDir(home, runId), "supervisor.log");
+  const logged = (text) => fs.existsSync(log) && fs.readFileSync(log, "utf8").includes(text);
+
+  // a revive whose driver starts four seconds after its supervisor took the lock
+  const slow = { ...env, ULTRACODEX_SESSION_START_DELAY_MS: "4000" };
+  assert.equal((await send(slow, runId, "again\nFAKE_ANSWER=two")).json.outcome, "pending", "not acknowledged: nobody has read it yet");
+  assert.ok(await eventually(() => fs.existsSync(lock) && Number.isInteger(readJson(lock).pid) && readJson(lock).pid !== process.pid));
+  // another supervisor takes the lock from it (this process stands in for the winner, which is alive)
+  fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, startedAt: Date.now(), runner: "test" }));
+  assert.ok(await eventually(() => logged("the session lock now belongs to another supervisor"), { timeoutMs: 20_000 }));
+  // what the winner has published meanwhile
+  const statePath = path.join(runDir(home, runId), "state.json");
+  fs.writeFileSync(statePath, JSON.stringify({ ...readJson(statePath), state: "idle", winnersMark: true }));
+  assert.ok(await eventually(() => logged("fenced off; leaving the session"), { timeoutMs: 30_000 }), "the fenced supervisor leaves");
+  assert.deepEqual([readState(home, runId).state, readState(home, runId).winnersMark], ["idle", true], "and leaves the winner's state as it found it");
+  fs.rmSync(lock, { force: true });
+});
+
 test("a second supervisor for a live session leaves at once and touches nothing", async (t) => {
   const { home, env, calls } = sessionHome(t);
   const runId = await startSession(env, home, { task: "x", tier: "light" });

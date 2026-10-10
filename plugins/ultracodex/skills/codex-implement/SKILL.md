@@ -89,11 +89,18 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" events <runId> --follow   # 
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" wait <runId> --max-wait 9000   # run_in_background: true
 ```
 
-- Follow progress with `events <runId> --follow` (the Monitor tool, re-armed with `--since <lastSeq>` when
-  it ends) or with the background `wait`, which also returns when Codex **asks a question**.
-- A `question` event is Codex blocked on you: `answer <runId> <questionId> --text "…"`.
-- Steer with `send <runId> --message "…"` (lands at Codex's next step; one clear instruction at a
-  time), `interrupt <runId>` to stop the turn now.
+- **Tools instead of Bash**: when the plugin's MCP tools are in your tool list, `codex_start` starts the
+  session from the same fields as the request file, and `codex_wait`, `codex_events`, `codex_send`,
+  `codex_answer`, `codex_interrupt`, `codex_result` and `codex_close` replace the commands below
+  (full names `mcp__plugin_ultracodex_ultracodex__codex_*`; the `codex-steer` skill lists them). Everything
+  here still applies: isolated worktree, the brief, verification. The CLI stays as the fallback.
+- **Do not poll**: in an interactive session the plugin starts a `notify` watcher by itself once this skill
+  ran (a notification when Codex asks, finishes a turn, waits for a limit or fails); otherwise arm the Monitor
+  tool with `notify` — or use `events <runId> --follow` for one run (re-armed with `--since <lastSeq>`
+  when it ends), or the background `wait`, which also returns when Codex **asks a question**.
+- A `question` event is Codex blocked on you: `answer <runId> <questionId> --text "…"` (`codex_answer`).
+- Steer with `send <runId> --message "…"` (`codex_send`; lands at Codex's next step; one clear instruction at
+  a time), `interrupt <runId>` to stop the turn now.
 - The turn's end shows as `idle` (`wait` prints that turn's envelope — the `implement` report). The
   session sleeps by itself after `idleTtlSec` (default 20 min) and the next `send` revives it, also
   after a reboot.

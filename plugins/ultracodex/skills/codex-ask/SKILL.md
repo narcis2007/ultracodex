@@ -86,7 +86,10 @@ its Codex thread: `wait` returns the first answer and the session goes idle; `se
 "…"` asks the next question in the same thread (same context, effort and schema, no new run), and the
 next `wait <runId>` returns that answer. `close <runId>` when you are done (an idle session sleeps by
 itself and the next `send` revives it). Sessions stay read-only and hermetic here, and they are for
-direct asks only — never a Workflow node. The command reference is the `codex-steer` skill.
+direct asks only — never a Workflow node. The command reference is the `codex-steer` skill; with the
+plugin's MCP tools in your tool list, `codex_start` / `codex_wait` / `codex_send` / `codex_close` do the same
+without Bash, and `notify` (or the plugin monitor, or the channel) tells you when Codex asks or answers
+instead of polling.
 
 ## 4. Use the answer
 

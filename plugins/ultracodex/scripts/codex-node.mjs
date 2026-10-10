@@ -15,7 +15,9 @@
 // A request with `"session": true` (direct runs only) is driven through a private
 // `codex app-server` instead (scripts/session.mjs): the same supervisor, but Claude can steer the
 // running turn, send follow-ups, answer Codex's questions, follow an event feed and close the
-// session (`send`, `interrupt`, `answer`, `events`, `close`).
+// session (`send`, `interrupt`, `answer`, `events`, `close`). Each run records which Claude session
+// started it (state.json `owner`), and `notify` (scripts/notify.mjs) prints one line per actionable event
+// of that owner's sessions — for Claude Code's Monitor tool, the plugin monitor and the MCP server's channel.
 //
 // Every command prints exactly one JSON line tagged {"ultracodex":1,...} (`events` prints the
 // feed's own lines). Exit codes: 0 done/ok, 1 failed or rejected, 2 usage error, 3 still running.
@@ -29,6 +31,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { cmdNotify } from "./notify.mjs";
 import {
   buildAppServerArgs,
   claimSupervisorLock,
@@ -48,7 +51,7 @@ import {
   sessionWaitPrint,
 } from "./session.mjs";
 
-export const RUNNER_VERSION = "0.4.0";
+export const RUNNER_VERSION = "0.5.0";
 export const RUNNER_FILE = fileURLToPath(import.meta.url);
 
 export const EFFORTS = Object.freeze(["low", "medium", "high", "xhigh", "max", "ultra"]);
@@ -122,7 +125,10 @@ export const TIMING = Object.freeze({
   minAskTimeoutSec: envInt("ULTRACODEX_MIN_ASK_TIMEOUT_SEC", 60), // the lowest askTimeoutSec a request may name
   treeSnapshotMs: envInt("ULTRACODEX_TREE_SNAPSHOT_MS", 20_000), // fallback mode only (no Job Object)
   nonceWaitMs: envInt("ULTRACODEX_NONCE_WAIT_MS", 1000), // how long a duplicate upload looks for the winner's run
+  notifyRescanMs: envInt("ULTRACODEX_NOTIFY_RESCAN_MS", 4000), // how often `notify` looks for new sessions
+  notifyLimitNullMs: envInt("ULTRACODEX_NOTIFY_LIMIT_NULL_MS", 10_000), // how long a limit wait may go unreported while its reset time is unknown
   slotClaimDelayMs: envInt("ULTRACODEX_SLOT_CLAIM_DELAY_MS", 0), // tests: widens the window between judging a slot free and landing the claim
+  sessionStartDelayMs: envInt("ULTRACODEX_SESSION_START_DELAY_MS", 0), // tests: widens the window between a session supervisor taking its lock and its driver starting (seconds on Windows: the Job Object helper)
 });
 
 // ─── small utilities ────────────────────────────────────────────────────────
@@ -1529,6 +1535,25 @@ export function runPaths(runId, env = process.env) {
     lock: path.join(dir, "supervisor.lock"),
     appServerLog: path.join(dir, "app-server.log"),
   };
+}
+
+// ─── ownership ──────────────────────────────────────────────────────────────
+//
+// Which Claude Code session a run belongs to, so that notifications go to that session only (the
+// owner runs several in parallel). It is metadata in state.json: never part of a request, a signature
+// or a digest, and a relayed request cannot set it.
+
+export const OWNER_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+// ULTRACODEX_OWNER is what the plugin's SessionStart hook exports into the session's Bash commands
+// (the documented route: the hook gets the session id and CLAUDE_ENV_FILE). CLAUDE_CODE_SESSION_ID
+// is what Bash commands see today but is not documented, so it only fills in. { id, source } | null.
+export function currentOwner(env = process.env) {
+  for (const [name, source] of [["ULTRACODEX_OWNER", "ultracodex_owner"], ["CLAUDE_CODE_SESSION_ID", "claude_code_session_id"]]) {
+    const value = env[name];
+    if (typeof value === "string" && OWNER_RE.test(value)) return { id: value, source };
+  }
+  return null;
 }
 
 // ─── request and result authentication ─────────────────────────────────────
@@ -3123,7 +3148,7 @@ async function superviseBody(runId, paths, stored, lock) {
   let slot = null;
   let slotLost = false;
   let lostBeats = 0;
-  const control = { fenced: false };
+  const control = { fenced: false, stillHeld: lock ? () => lock.stillHeld() : null };
   const beat = setInterval(() => {
     writeText(paths.alive, String(Date.now()));
     try {
@@ -3210,6 +3235,7 @@ async function superviseBody(runId, paths, stored, lock) {
       // The session driver (session.mjs) runs the turns on a private app-server; it holds a slot
       // only while a turn runs, and decides whether the session ends for good (an envelope, which
       // becomes result.json), goes dormant (no result: it can be revived) or was fenced off.
+      if (TIMING.sessionStartDelayMs) await sleep(TIMING.sessionStartDelayMs);
       sessionOutcome = await runSession({ runId, request, paths, context, log, check, control, setSlot: (next) => { slot = next; } });
       envelope = sessionOutcome.envelope ?? null; // already written (result.json, state) by the driver
     } else {
@@ -3434,6 +3460,7 @@ async function loadRawRequest(options) {
 
 function persistRun(request) {
   const runId = newRunId();
+  const owner = currentOwner();
   const paths = runPaths(runId);
   fs.mkdirSync(paths.dir, { recursive: true });
   fs.writeFileSync(paths.task, request.task);
@@ -3458,6 +3485,8 @@ function persistRun(request) {
     timeoutSec: request.timeoutSec,
     attached: request.attached,
     cwd: request.cwd,
+    owner: owner?.id ?? null,
+    ownerSource: owner?.source ?? null,
     ...(request.session ? { session: true, turn: 0, turnActive: false, queued: 0, question: null } : {}),
   });
   return { runId, paths };
@@ -3935,6 +3964,7 @@ function describeRun(runId) {
     supervisorAlive: result ? false : state.session ? sessionSupervisorAlive(paths) : Date.now() - alive < TIMING.lostAfterMs,
     errorKind: result?.error?.kind ?? null,
     cwd: state.cwd ?? null,
+    ...(state.owner ? { owner: state.owner, ownerSource: state.ownerSource ?? null } : {}),
     ...(state.session
       ? {
           session: true,
@@ -3948,7 +3978,7 @@ function describeRun(runId) {
   };
 }
 
-export function cmdStatus(runId, { all = false, pretty = false } = {}) {
+export function cmdStatus(runId, { all = false, mine = false, pretty = false } = {}) {
   if (runId) {
     if (!RUN_ID_RE.test(runId)) throw new UsageError("status takes an optional run id");
     if (!isDirSync(runPaths(runId).dir)) {
@@ -3958,9 +3988,17 @@ export function cmdStatus(runId, { all = false, pretty = false } = {}) {
     print({ ultracodex: 1, runnerVersion: RUNNER_VERSION, ok: true, runs: [describeRun(runId)] }, pretty);
     return 0;
   }
-  const ids = listRunIds();
+  let ids = listRunIds();
+  if (mine) {
+    const owner = currentOwner();
+    if (!owner) {
+      print(rejection("no_owner", "--mine needs to know which Claude session this is: run it from a Claude Code Bash command (ULTRACODEX_OWNER / CLAUDE_CODE_SESSION_ID); `status --all` lists everything"), pretty);
+      return 1;
+    }
+    ids = ids.filter((id) => readJsonSafe(runPaths(id).state)?.owner === owner.id);
+  }
   const runs = (all ? ids : ids.slice(0, 30)).map(describeRun);
-  print({ ultracodex: 1, runnerVersion: RUNNER_VERSION, ok: true, home: ucxHome(), maxConcurrent: maxConcurrent(), runs }, pretty);
+  print({ ultracodex: 1, runnerVersion: RUNNER_VERSION, ok: true, home: ucxHome(), maxConcurrent: maxConcurrent(), ...(mine ? { mine: true } : {}), runs }, pretty);
   return 0;
 }
 
@@ -4046,7 +4084,7 @@ export function cmdGc({ olderThanDays = 7, pretty = false } = {}) {
   const day = 24 * 3600 * 1000;
   // A consumed nonce is kept as long as its run: a replayed frame then joins that run, and
   // once both are gone the frame's announcement (consumed at the start) is long gone too.
-  for (const [sub, maxAge] of [["inbox", day], ["rejected", day], ["expected", day], ["relay-roles", day], ["nonces", Math.max(day, olderThanDays * day)]]) {
+  for (const [sub, maxAge] of [["inbox", day], ["rejected", day], ["expected", day], ["relay-roles", day], ["notify", Math.max(7 * day, olderThanDays * day)], ["nonces", Math.max(day, olderThanDays * day)]]) {
     try {
       const root = path.join(ucxHome(), sub);
       for (const name of fs.readdirSync(root)) {
@@ -4235,6 +4273,9 @@ function helpText() {
     "  node codex-node.mjs answer RUN_ID QUESTION_ID (--text TEXT | --file FILE)   answer Codex's ask_orchestrator question",
     "  node codex-node.mjs events RUN_ID [--since SEQ] [--follow] [--max-wait SEC]  the compact event feed (JSON lines; for Monitor)",
     "  node codex-node.mjs close RUN_ID [--force] [--archive]           end the session for good",
+    "  node codex-node.mjs notify [--owner ID | --all] [--max-wait SEC | --forever] [--from now|cursor]",
+    "                                                                   one JSON line per actionable event of your sessions (for Monitor)",
+    "  node codex-node.mjs status --mine                                only the runs this Claude session started",
     "  node codex-node.mjs result RUN_ID [--turn N]                     the latest (or turn N's) envelope of a session",
     "",
     "Exit codes: 0 done, 1 failed/rejected, 2 usage error, 3 still running.",
@@ -4265,6 +4306,10 @@ function parseCli(argv) {
     file: null,
     since: null,
     turn: null,
+    mine: false,
+    forever: false,
+    owner: null,
+    from: null,
   };
   const valued = {
     "--request": "request",
@@ -4279,6 +4324,8 @@ function parseCli(argv) {
     "--file": "file",
     "--since": "since",
     "--turn": "turn",
+    "--owner": "owner",
+    "--from": "from",
   };
   for (let index = 0; index < rest.length; index += 1) {
     const token = rest[index];
@@ -4289,6 +4336,8 @@ function parseCli(argv) {
     else if (token === "--follow") options.follow = true;
     else if (token === "--force") options.force = true;
     else if (token === "--archive") options.archive = true;
+    else if (token === "--mine") options.mine = true;
+    else if (token === "--forever") options.forever = true;
     else if (valued[token]) {
       const value = rest[index + 1];
       if (value === undefined) throw new UsageError(`${token} requires a value`);
@@ -4365,6 +4414,8 @@ export async function main(argv = process.argv.slice(2)) {
         return await cmdEvents(id, options);
       case "close":
         return await cmdClose(id, options);
+      case "notify":
+        return await cmdNotify(options);
       case "cancel":
         if (options.orphaned) {
           if (id) throw new UsageError("cancel takes a run id or --orphaned, not both");
