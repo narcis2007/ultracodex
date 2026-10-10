@@ -109,7 +109,9 @@ if (argv[0] === "debug" && argv[1] === "models") {
 //      missing | malformed         a result without usable `origins`
 //      error             a JSON-RPC "method not found" (an older Codex)      hang   never answers
 //      <path>            that JSON file's content, verbatim, as the result
-//    FAKE_CODEX_APP_SERVER_EXIT=n makes the app-server exit with code n before it answers anything.
+//    FAKE_CODEX_APP_SERVER_EXIT=n makes the app-server exit with code n before it answers anything. FAKE_CODEX_CONFIG_READ_MS=n
+//    answers config/read after n ms. FAKE_CANCEL_BEFORE_COMPLETE=1 (a turn directive) writes the cancel file of every
+//    unfinished run under $ULTRACODEX_HOME in the instant before the turn completes.
 //    FAKE_FAIL_FIRST=n (a turn directive; counted per task in ${FAKE_CODEX_STATE}.fail-*) fails the first n turns of that
 //    task with FAKE_FAIL_KIND (default serverOverloaded; any codexErrorInfo name, e.g. badRequest);
 //    FAKE_FAIL_EXIT=1 makes the app-server exit 100 ms after such a failure. FAKE_CODEX_FAIL_TURNS=n (with FAKE_FAIL_KIND)
@@ -365,6 +367,13 @@ if (argv[0] === "app-server") {
     rollout({ type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: body }] } });
     thread.turns += 1;
     saveThread();
+    if (lineDirective(text, "CANCEL_BEFORE_COMPLETE") === "1" && process.env.ULTRACODEX_HOME) {
+      // the owner cancels the run in the instant before its turn completes: the cancel file of every unfinished run
+      const runs = path.join(process.env.ULTRACODEX_HOME, "runs");
+      for (const name of fs.existsSync(runs) ? fs.readdirSync(runs) : []) {
+        if (!fs.existsSync(path.join(runs, name, "result.json"))) fs.writeFileSync(path.join(runs, name, "cancel"), new Date().toISOString());
+      }
+    }
     notify("turn/completed", { threadId: thread.id, turn: turnObject(active, "completed") });
   };
 
@@ -492,6 +501,7 @@ if (argv[0] === "app-server") {
         return reply(id, answer.error ? { error: answer.error } : { result: anchored(answer.result) });
       }
       case "config/read":
+        if (Number(process.env.FAKE_CODEX_CONFIG_READ_MS ?? 0) > 0) await sleepMs(Number(process.env.FAKE_CODEX_CONFIG_READ_MS));
         return configRead(id);
       case "thread/start": {
         if (params.dynamicTools && !experimental) return rpcError(id, -32600, "dynamicTools requires capabilities.experimentalApi");

@@ -78,6 +78,7 @@ import {
   resultMac,
   runPaths,
   sleep,
+  sleepSync,
   sleepUnlessStopped,
   stopOwnedTree,
   stopReason,
@@ -807,6 +808,7 @@ const NO_FALLBACK_KINDS = new Set(["usage_limit", "auth"]);
 class SessionDriver {
   constructor({ runId, request, paths, context, log, check, control, setSlot, single = false }) {
     this.single = Boolean(single);
+    this.workStartedAt = null; // when the job first held a slot: what its deadline counts from
     this.steers = 0; // steering messages accepted by the app-server (a steerable job reports them in its provenance)
     this.runId = runId;
     this.request = request;
@@ -1003,8 +1005,16 @@ class SessionDriver {
 
   // ── slots ──
 
+  // What a wait asks on every poll: has the machine been suspended (the gap moves the deadlines, as in the main loop:
+  // time asleep is not time worked or waited), and is there a reason to stop (the inbox, a cancel, an abandoned caller)?
+  stopCheck() {
+    this.tick();
+    return this.waitStopHook() ?? this.check();
+  }
+
   async takeSlot() {
-    const slot = await acquireSlots(this.request.weight, this.runId, () => this.waitStopHook() ?? this.check());
+    const slot = await acquireSlots(this.request.weight, this.runId, () => this.stopCheck());
+    if (this.workStartedAt === null && !slot.stopped) this.workStartedAt = Date.now(); // the job's budget runs from here
     if (slot.stopped) return { stopped: slot.stopped };
     this.slot = slot;
     this.setSlot(slot);
@@ -1652,6 +1662,12 @@ class SessionDriver {
       }
       if (up.restartedForAccount) chain.handoffs += 1; // the account changed while the session was idle
       this.dequeue(spec.item);
+      // A steerable job cancelled (or closed, or abandoned, or fenced) while its backend was starting — the awaits
+      // above — never starts its turn: nothing in the turn's own loop would look at the cancel before a quick turn ended.
+      if (this.single) {
+        const stop = this.waitStopHook() ?? this.stopNow();
+        if (stop) return { kind: "stop", reason: stop };
+      }
       const n = (this.turn += 1);
       const turn = {
         n,
@@ -2081,6 +2097,9 @@ class SessionDriver {
         if (out.kind === "stop") return this.stopped(out.reason);
         if (out.kind === "start_failed") {
           const failure = out.classification;
+          // a job that was cancelled meanwhile is not handed to exec
+          const cancelled = this.waitStopHook() ?? this.stopNow();
+          if (cancelled) return this.stopped(cancelled);
           // before any turn: the job has not started — it runs on exec instead (a start failure is not the job's)
           if (this.turn === 0 && !NO_FALLBACK_KINDS.has(failure.kind)) return this.fallback(failure);
           // a retry whose thread cannot be resumed starts a fresh thread with the original task, once
@@ -2092,7 +2111,13 @@ class SessionDriver {
           }
           return this.endForGood("failed", { classification: failure });
         }
-        if (out.envelope.ok) return this.endForGood(out.envelope.state, { envelope: out.envelope });
+        if (out.envelope.ok) {
+          // A cancel (or a close, an abandoned caller, a lost lock) requested before the job is finalized wins over
+          // a result that completed in the meantime: the turn's own loop may never have looked at it.
+          const stop = this.waitStopHook() ?? this.stopNow();
+          if (stop) return this.stopped(stop);
+          return this.endForGood(out.envelope.state, { envelope: out.envelope });
+        }
         const kind = out.classification.kind;
         if (kind === "interrupted") return this.endForGood("interrupted", { envelope: out.envelope }); // on request: never retried
         const stop = this.stopNow();
@@ -2128,7 +2153,7 @@ class SessionDriver {
     const reason = clip(failure.message, 300);
     this.events.append("backend_fallback", { reason, kind: failure.kind });
     this.log(`the session backend could not start the job (${failure.kind}): ${reason}`);
-    return { fallback: { reason, kind: failure.kind } };
+    return { fallback: { reason, kind: failure.kind, startedAt: this.workStartedAt } };
   }
 
   // A retryable failure with attempts left: back off (stoppable), then a continuation turn on the same thread
@@ -2149,7 +2174,16 @@ class SessionDriver {
     this.idleUntil = null;
     this.publish({ state: "backoff", attempt: out.turn.n });
     this.waitingInChain = true;
-    const stop = await sleepUnlessStopped(TIMING.backoffMs * out.turn.n, () => this.waitStopHook() ?? this.check());
+    // TEST ONLY: the machine "sleeps" once during the backoff (the event loop is blocked, the wall clock jumps)
+    const suspend = /^suspend-in-backoff:(\d+)$/.exec(process.env.ULTRACODEX_TEST_FAULT ?? "");
+    let suspended = !suspend;
+    const stop = await sleepUnlessStopped(TIMING.backoffMs * out.turn.n, () => {
+      if (!suspended) {
+        suspended = true;
+        sleepSync(Number(suspend[1]));
+      }
+      return this.stopCheck(); // a suspension moves the job's deadline, as it does in every other wait
+    });
     this.waitingInChain = false;
     if (stop) return { stop };
     // the wait may have used up what was left of the job's time
@@ -2213,6 +2247,9 @@ class SessionDriver {
     if (this.turn) provenance.attempts = this.turn;
     if (this.steers) provenance.steers = this.steers;
     if (this.control.slotLost) provenance.slotLost = true;
+    // the wait of a usage limit that ended without another turn is recorded in the persisted turn envelope only after
+    // the envelope the chain ended with was built: the job's own total is the truth
+    if (this.context.limitWaitedMs) provenance.limitWaitedSec = Math.round(this.context.limitWaitedMs / 1000);
     return { ...out, provenance };
   }
 

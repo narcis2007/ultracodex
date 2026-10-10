@@ -144,6 +144,7 @@ export const TIMING = Object.freeze({
   closeWaitMs: envInt("ULTRACODEX_CLOSE_WAIT_MS", 60_000), // how long close waits for a live supervisor to wind the session down
   lockWaitMs: envInt("ULTRACODEX_LOCK_WAIT_MS", 8000), // how long a new supervisor waits for the lock of one that is winding down
   limitProbeTimeoutMs: envInt("ULTRACODEX_LIMIT_PROBE_TIMEOUT_MS", 20_000),
+  suspendGapMs: envInt("ULTRACODEX_SUSPEND_GAP_MS", 30_000), // a gap this long between two ticks of the supervisor's loops means the machine was suspended (tests lower it)
   configReadTimeoutMs: envInt("ULTRACODEX_CONFIG_READ_TIMEOUT_MS", 60_000), // how long a hermetic app-server may take to answer config/read (the isolation check)
   slotPollMs: envInt("ULTRACODEX_SLOT_POLL_MS", 2000),
   slotStaleMs: envInt("ULTRACODEX_SLOT_STALE_MS", 60_000),
@@ -2440,8 +2441,7 @@ async function reapLeftovers(child, tracked, { platform = process.platform, job 
 
 // ─── the supervisor ─────────────────────────────────────────────────────────
 
-// A gap this long between ticks of a 1-second loop means the machine was suspended.
-const SUSPEND_GAP_MS = 30_000;
+// A gap this long between ticks of a 1-second loop means the machine was suspended (TIMING.suspendGapMs).
 
 // Suspend detector: after a sleep, nobody could poll and the wall clock jumped, so
 // the missing heartbeat is not abandonment and the lost time is not work.
@@ -2454,7 +2454,7 @@ export function makeClock(request) {
       const now = Date.now();
       const gap = now - last;
       last = now;
-      if (gap > SUSPEND_GAP_MS) {
+      if (gap > TIMING.suspendGapMs) {
         graceUntil = now + request.orphanAfterSec * 1000;
         return gap;
       }
@@ -3471,13 +3471,25 @@ async function superviseBody(runId, paths, stored, lock) {
       if (sessionOutcome.fallback) {
         // The same job, on exec, exactly as if it had never been steerable: same run id, same signed digest, the
         // attempts budget untouched (no turn ever started), and the deadline it was given.
-        const { reason, kind } = sessionOutcome.fallback;
-        log(`steerable job: the session backend could not start (${reason}); running it on codex exec instead`);
+        const { reason, kind, startedAt } = sessionOutcome.fallback;
         abandonSteerableState(paths, { reason, kind });
-        const left = Math.floor((request.timeoutSec * 1000 - (Date.now() - driverStartedAt)) / 1000);
-        request = { ...request, timeoutSec: Math.max(Math.max(1, TIMING.minTimeoutSec), left) };
+        // exec gets what is left of the job's budget (counted from when the job first held a slot, as an exec
+        // attempt's is) — never a renewed one: a start that used it all leaves the job out of time
+        const left = Math.floor((request.timeoutSec * 1000 - (Date.now() - (startedAt ?? driverStartedAt))) / 1000);
         sessionOutcome = null;
-        needsExec = true;
+        if (left < Math.max(1, TIMING.minTimeoutSec)) {
+          log(`steerable job: the session backend could not start (${reason}) and no work time is left for codex exec; the job ends as a timeout`);
+          envelope = failureEnvelope(request, runId, "timeout", {
+            kind: "timeout",
+            retryable: false,
+            message: compact(`the job's deadline was used up before its session backend failed over to codex exec (${reason})`),
+            status: null,
+          }, buildProvenance(request, { backend: "session", attempts: 0, durationMs: Date.now() - (startedAt ?? driverStartedAt), codexVersion: context.codexVersion, launcher: context.launcher.source }));
+        } else {
+          log(`steerable job: the session backend could not start (${reason}); running it on codex exec instead (${left} s of its budget left)`);
+          request = { ...request, timeoutSec: left };
+          needsExec = true;
+        }
       } else {
         envelope = sessionOutcome.envelope ?? null; // already written (result.json, state) by the driver
       }

@@ -57,8 +57,9 @@ app-server (sessions included) instead of assumed, and a node falls back to the 
 - **Fallback to exec.** If the driver fails before the first turn starts — `hermetic_violation`, `spawn`, an app-server or protocol
   start failure (initialize, `config/read`, `thread/start`) — the supervisor appends `backend_fallback {reason, kind}`, takes the
   session fields out of `state.json` (`backendFallback` records why), rejects what is in the inbox and runs the same job on
-  `codex exec`: same run id, same signed digest, the attempts budget untouched and the deadline it was given. A failure after a turn
+  `codex exec`: same run id, same signed digest, the attempts budget untouched and what is left of the deadline it was given (never a renewed budget: a start that used it all ends the job as `timeout`, and exec never runs). A failure after a turn
   started, a usage limit or a login problem is never a fallback reason.
+- **Races and budgets** (found in review). A cancel, close or abandonment that arrives while the backend starts is looked at again before `turn/start` and before a result is accepted, so a cancelled job ends `cancelled`, never `done`, and is not handed to exec; a suspension of the machine during the retry backoff (or a slot wait) moves the job's deadline as it does in every other wait; the `limitWaitedSec` of a usage-limit wait that ended without another turn is in the final `provenance`. Test-only knobs: `ULTRACODEX_SUSPEND_GAP_MS`, `ULTRACODEX_TEST_FAULT=suspend-in-backoff:<ms>`.
 - **Kill switch.** `ULTRACODEX_NODE_BACKEND=exec` (read by `start` and the supervisor) makes every steerable job run on exec as before.
 - Skills: `codex-steer` has "Steering a Workflow node"; `codex-workflow` documents `steerable` and the fallback and kill switch in
   `references/codex-headless.md` ("Verified isolation", "Steerable nodes"); README: "Steering a workflow node".

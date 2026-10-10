@@ -372,7 +372,7 @@ switch, read by `start` and the supervisor) says exec. If the driver fails **bef
 `thread/start`) — the supervisor logs it, appends the event `backend_fallback {reason, kind}`, takes the session fields out of
 `state.json` (`backendFallback` records why; messages still in the inbox are rejected `backend_fallback`) and runs **the same job on
 `codex exec`** as if it had never been steerable: same run id, same signed digest, the attempts budget untouched, the deadline it was
-given (`timeoutSec` less the time the failed start took). A failure after a turn started is never a fallback reason, and neither are
+given (`timeoutSec` less the time the failed start took, counted from when the job first held a slot — never a renewed budget: a start that used it all ends the job as `timeout`, and exec never runs). A failure after a turn started is never a fallback reason, and neither are
 `usage_limit` / `auth` (they have their own waits). `provenance.backend` is `session` or `exec` (fallbacks and the kill switch: `exec`).
 
 **Single-turn semantics.** Turn 1 is the task, with the job's schema and effort. The driver's continuation chain applies inside the
