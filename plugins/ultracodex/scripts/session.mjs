@@ -72,6 +72,7 @@ import {
   resultMac,
   runPaths,
   sleep,
+  sleepUnlessStopped,
   stopOwnedTree,
   stopReason,
   trackWindowsTree,
@@ -336,7 +337,12 @@ export function configuredMcpServers(env = process.env) {
 
 // `codex app-server --listen stdio://` plus what the request asks for. Hermetic: no plugins, no
 // apps, no notify hook, every configured MCP server disabled, and the Windows sandbox choice
-// carried over (what `--ignore-user-config` would otherwise take away from `codex exec`).
+// carried over (what `--ignore-user-config` would otherwise take away from `codex exec`). That is
+// only the first half of isolation — `app-server` has no --ignore-user-config, so what is left of
+// the user's config is judged by isolationViolations() from the app-server's own `config/read`
+// before any thread starts. The service tier is one of the settings the driver owns: a hermetic
+// session always states it ("default" unless the request names one), so the user's own
+// `service_tier` never reaches a node (`codex exec --ignore-user-config` never sees it either).
 export function buildAppServerArgs(request, { platform = process.platform, windowsSandbox = null, mcpServers = [] } = {}) {
   const args = ["app-server", "--listen", "stdio://"];
   if (request.hermetic) {
@@ -348,8 +354,81 @@ export function buildAppServerArgs(request, { platform = process.platform, windo
     args.push("-c", `sandbox_workspace_write.network_access=${request.network}`);
     args.push("-c", `sandbox_workspace_write.writable_roots=${JSON.stringify(request.addDirs ?? [])}`);
   }
-  if (request.serviceTier) args.push("-c", `service_tier="${request.serviceTier}"`);
+  if (request.serviceTier || request.hermetic) args.push("-c", `service_tier="${request.serviceTier ?? "default"}"`);
   return args;
+}
+
+// ─── verified isolation: what is left of the user's config in a hermetic app-server ─────────────
+
+// Client / UI / bookkeeping settings: nothing the model sees or can do depends on them.
+const INERT_PREFIXES = ["tui", "desktop", "notice", "marketplaces", "projects", "profiles", "history", "analytics", "feedback"];
+const INERT_KEYS = new Set(["file_opener", "check_for_update_on_startup", "disable_paste_burst", "hide_agent_reasoning", "suppress_unstable_features_warning"]);
+// Set explicitly by the driver on every thread / turn (thread/start|resume: model, sandbox, approvalPolicy,
+// approvalsReviewer; the `-c service_tier` flag; turn/start: effort), so the user's value never applies.
+const DRIVER_OWNED_KEYS = new Set(["model", "model_reasoning_effort", "approval_policy", "approvals_reviewer", "sandbox_mode", "service_tier"]);
+// What `-c` passes for a workspace-write request (a user value of these is overridden: origin sessionFlags).
+const WRITE_OWNED_KEYS = ["sandbox_workspace_write.network_access", "sandbox_workspace_write.writable_roots"];
+const MAX_ISOLATION_KEYS = 20;
+
+const underKey = (key, name) => key === name || key.startsWith(`${name}.`);
+
+// Decides from one `config/read` result ({config, origins}: the effective config, and for every
+// effective dotted key the layer it came from) whether anything the user's config.toml (or a project
+// layer) contributes could change what the model sees or can do in a hermetic run — the verification
+// `codex exec --ignore-user-config` gets for free. Defaults, managed / system / MDM / enterprise layers
+// apply to exec too, and session flags are ours; only the `user` and `project` layers are judged.
+//   inert        client / UI / bookkeeping keys
+//   neutralized  judged by the EFFECTIVE value (origins of array elements go stale after `-c`): plugins.* iff
+//                features.plugins is false, apps.* iff features.apps is false, mcp_servers.<n>.* iff that server
+//                is disabled, notify iff the effective notify hook list is empty
+//   driver-owned model, effort, approval policy and reviewer, sandbox mode, service tier (set on every thread / turn),
+//                and, for a workspace-write request, the two sandbox_workspace_write keys passed with `-c`
+//   carried      windows.sandbox (exec carries it too: readUserWindowsSandbox)
+// Everything else from those two layers is a violation. → { ok, keys } (keys: names only, never values,
+// sorted, at most ~20; `more` counts the rest), or { ok: false, keys: ["<unverifiable>"] } when `origins`
+// is missing or malformed — a check that cannot judge proves nothing.
+export function isolationViolations(configRead, { request = {} } = {}) {
+  const origins = isPlainObject(configRead) ? configRead.origins : null;
+  if (!isPlainObject(origins)) return { ok: false, keys: ["<unverifiable>"] };
+  const config = isPlainObject(configRead.config) ? configRead.config : {};
+  const features = isPlainObject(config.features) ? config.features : {};
+  const servers = isPlainObject(config.mcp_servers) ? config.mcp_servers : {};
+  const writable = request.sandbox === "workspace-write";
+  const serverOf = (rest) => {
+    // the longest effective server name the key starts with (a name may itself contain dots)
+    let found = null;
+    for (const name of Object.keys(servers)) {
+      if ((rest === name || rest.startsWith(`${name}.`)) && (found === null || name.length > found.length)) found = name;
+    }
+    return found;
+  };
+  const allowed = (key) => {
+    if (INERT_KEYS.has(key) || INERT_PREFIXES.some((prefix) => underKey(key, prefix))) return true;
+    if (DRIVER_OWNED_KEYS.has(key) || key === "windows.sandbox") return true;
+    if (underKey(key, "sandbox_workspace_write")) return !writable || WRITE_OWNED_KEYS.some((owned) => underKey(key, owned));
+    if (underKey(key, "plugins")) return features.plugins === false;
+    if (underKey(key, "apps")) return features.apps === false;
+    if (underKey(key, "notify")) return config.notify === undefined || (Array.isArray(config.notify) && config.notify.length === 0);
+    if (key === "mcp_servers") return Object.values(servers).every((server) => isPlainObject(server) && server.enabled === false);
+    if (key.startsWith("mcp_servers.")) {
+      const name = serverOf(key.slice("mcp_servers.".length));
+      return name !== null && isPlainObject(servers[name]) && servers[name].enabled === false;
+    }
+    return false;
+  };
+  const bad = new Set();
+  for (const [key, origin] of Object.entries(origins)) {
+    const type = origin?.name?.type;
+    if (typeof type !== "string") {
+      bad.add(key); // an origin that cannot be read cannot be judged
+      continue;
+    }
+    if (type !== "user" && type !== "project") continue;
+    if (!allowed(key)) bad.add(key);
+  }
+  if (!bad.size) return { ok: true, keys: [] };
+  const sorted = [...bad].sort();
+  return { ok: false, keys: sorted.slice(0, MAX_ISOLATION_KEYS), ...(sorted.length > MAX_ISOLATION_KEYS ? { more: sorted.length - MAX_ISOLATION_KEYS } : {}) };
 }
 
 // The client-side tool Codex calls to ask the orchestrating agent a question.
@@ -698,17 +777,31 @@ export function sessionSupervisorAlive(paths) {
 //
 // outcome of run(): { envelope } the session ended (result.json is written), { dormant: true },
 // or { fenced: true } another supervisor took the lock (nothing is written).
+//
+// `single: true` is the driver of a steerable workflow node (request `steerable`): ONE job, not a session. Its
+// turn 1 is the job's task; the continuations a usage limit, an account change or a transient failure ask for
+// run on the same thread and under the job's own deadline; the job's last envelope becomes result.json and the
+// driver ends — no idle period, no dormancy, no revive. outcome: { envelope } | { fenced: true } | { fallback:
+// { reason, kind } } when the app-server could not even be started for the first turn (the caller then runs the
+// very same job on `codex exec`). Steering, interrupting, cancelling and `events` work as in a session; a
+// message that would queue a follow-up, and an answer, are rejected (nothing asks a question here).
 export async function runSession(args) {
   const driver = new SessionDriver(args);
   try {
-    return await driver.run();
+    return await (driver.single ? driver.runJob() : driver.run());
   } finally {
     await driver.cleanup();
   }
 }
 
+// Failures of the first start that are not a reason to leave the session backend: the usage limit and the
+// login have their own waits (and exec would meet the same wall).
+const NO_FALLBACK_KINDS = new Set(["usage_limit", "auth"]);
+
 class SessionDriver {
-  constructor({ runId, request, paths, context, log, check, control, setSlot }) {
+  constructor({ runId, request, paths, context, log, check, control, setSlot, single = false }) {
+    this.single = Boolean(single);
+    this.steers = 0; // steering messages accepted by the app-server (a steerable job reports them in its provenance)
     this.runId = runId;
     this.request = request;
     this.paths = paths;
@@ -848,7 +941,11 @@ class SessionDriver {
 
   stopOutcome(stop) {
     if (stop === "fenced") return this.fence();
-    return this.endForGood(stop, { classification: classifyFailure({ cancelled: stop === "cancelled", abandoned: stop === "abandoned" }) });
+    // a `close` of a steerable job is a cancel: its sender is told "closed" once the job has ended
+    return this.endForGood(stop, {
+      classification: classifyFailure({ cancelled: stop === "cancelled", abandoned: stop === "abandoned" }),
+      closeMessage: this.single ? this.closeRequest?.message ?? null : null,
+    });
   }
 
   // A previous supervisor died mid-turn: its turn never wrote an envelope. Say so, so that
@@ -981,23 +1078,28 @@ class SessionDriver {
     if (typeof message.text !== "string" || !message.text.trim()) return this.finish(message, { outcome: "rejected", reason: "empty_message" });
     // a session that is being closed takes nothing new: a message acknowledged now would be lost
     if (this.closeRequest) return this.finish(message, { outcome: "rejected", reason: "session_closing" });
+    // a steerable job ends with its turn: there is no follow-up to queue, so only a steer can be taken
+    if (this.single && mode === "queue") return this.finish(message, { outcome: "rejected", reason: "single_turn" });
     const turn = this.active;
     // a turn being handed over to a new account takes nothing: the message goes into its continuation
     if (mode !== "queue" && (turn ? turn.interruptReason === "account_switch" : this.handoff)) return "defer";
     if (!turn) {
-      if (mode === "steer") return this.finish(message, { outcome: "rejected", reason: "no_active_turn" });
+      if (mode === "steer" || this.single) return this.finish(message, { outcome: "rejected", reason: "no_active_turn" });
       return this.enqueue(message, { started: !this.chain });
     }
     if (mode === "queue") return this.enqueue(message, { started: false });
     if (!turn.id) return "defer"; // the turn's id is not known yet: steering needs it
     if (!turn.steerable) {
-      if (mode === "steer") return this.finish(message, { outcome: "rejected", reason: "not_steerable" });
+      if (mode === "steer" || this.single) return this.finish(message, { outcome: "rejected", reason: "not_steerable" });
       return this.enqueue(message, { started: false });
     }
     const steer = await this.steer(turn, message.text);
     this.events.append("steer", { text: clip(message.text, 500), outcome: steer.ok ? "steered" : steer.reason });
-    if (steer.ok) return this.finish(message, { outcome: "steered", turn: turn.n });
-    if (mode === "steer") return this.finish(message, { outcome: "rejected", reason: steer.reason });
+    if (steer.ok) {
+      this.steers += 1;
+      return this.finish(message, { outcome: "steered", turn: turn.n });
+    }
+    if (mode === "steer" || this.single) return this.finish(message, { outcome: "rejected", reason: steer.reason });
     // auto: the turn just ended (start a turn instead) or cannot take input (queue after it)
     return this.enqueue(message, { started: steer.reason === "no_active_turn" });
   }
@@ -1047,6 +1149,7 @@ class SessionDriver {
   }
 
   onAnswer(message) {
+    if (this.single) return this.finish(message, { outcome: "rejected", reason: "single_turn" }); // nothing asks a question here
     const question = this.questions.find((entry) => entry.id === message.questionId);
     if (!question) return this.finish(message, { outcome: "no_such_question" });
     this.resolveQuestion(question, { text: String(message.text ?? ""), success: true, auto: false });
@@ -1054,6 +1157,10 @@ class SessionDriver {
   }
 
   async onClose(message) {
+    if (this.single) {
+      this.closeAsCancel(message);
+      return null;
+    }
     const busy = Boolean(this.active || this.chain || this.queue.length); // a queued follow-up was acknowledged: closing would drop it
     if (busy && !message.force) return this.finish(message, { outcome: "rejected", reason: "turn_active" });
     this.closeRequest = { message, force: Boolean(message.force), archive: Boolean(message.archive) };
@@ -1065,6 +1172,20 @@ class SessionDriver {
       await this.interruptTurn(this.active);
     }
     return null; // acknowledged when the session has closed
+  }
+
+  // A steerable job has no session to close: `close` is what `cancel RUN_ID` is — the same cancel file, so that
+  // every wait and the running turn see it — and its sender is told "closed" once the job has ended (stopOutcome).
+  closeAsCancel(message) {
+    try {
+      fs.writeFileSync(this.paths.cancel, nowIso());
+    } catch {
+      // the cancel file is how every wait learns of it: without it the close is refused
+      this.finish(message, { outcome: "rejected", reason: "cancel_failed" });
+      return false;
+    }
+    this.closeRequest = { message, force: true, archive: false };
+    return true; // acknowledged when the job has ended
   }
 
   // Handled from inside the Phase 1 waits and the slot wait, where nothing can be awaited: a
@@ -1084,10 +1205,11 @@ class SessionDriver {
         if (this.handoff && mode !== "queue") continue; // held until the continuation of an account switch runs: it takes it as a steer
         if (typeof message.text !== "string" || !message.text.trim()) this.finish(message, { outcome: "rejected", reason: "empty_message" });
         else if (this.closeRequest) this.finish(message, { outcome: "rejected", reason: "session_closing" });
+        else if (this.single) this.finish(message, { outcome: "rejected", reason: mode === "queue" ? "single_turn" : "no_active_turn" });
         else if (mode === "steer") this.finish(message, { outcome: "rejected", reason: "no_active_turn" });
         else this.enqueue(message, { started: false });
       } else if (message.kind === "answer") {
-        this.finish(message, { outcome: "no_such_question" });
+        this.finish(message, this.single ? { outcome: "rejected", reason: "single_turn" } : { outcome: "no_such_question" });
       } else if (message.kind === "interrupt") {
         if (this.waitingInChain) {
           this.events.append("interrupt", {});
@@ -1095,6 +1217,8 @@ class SessionDriver {
           return (this.waitAbort = "interrupted");
         }
         this.finish(message, { outcome: "no_active_turn" });
+      } else if (this.single) {
+        if (this.closeAsCancel(message)) return (this.waitAbort = "cancelled");
       } else {
         this.closeRequest = { message, force: Boolean(message.force), archive: Boolean(message.archive) };
         return (this.waitAbort = "closed");
@@ -1241,6 +1365,25 @@ class SessionDriver {
     return names;
   }
 
+  // `config/read` for a hermetic app-server, judged by isolationViolations: null when the configuration is
+  // isolated, else { keys, more?, message } — the key names only, never a value.
+  async configViolation(server) {
+    let read = null;
+    let readError = null;
+    try {
+      read = await server.client.request("config/read", { cwd: this.request.cwd, includeLayers: false }, { timeoutMs: TIMING.configReadTimeoutMs });
+    } catch (error) {
+      readError = error;
+    }
+    const verdict = readError ? { ok: false, keys: ["<unverifiable>"] } : isolationViolations(read, { request: this.request });
+    if (verdict.ok) return null;
+    const unverifiable = verdict.keys.length === 1 && verdict.keys[0] === "<unverifiable>";
+    const message = unverifiable
+      ? `could not verify that the app-server's configuration is isolated (${readError ? `config/read failed: ${readError.message}` : "config/read returned no readable origins"}); the app-server was stopped before any thread was started`
+      : `a hermetic app-server found settings from the user's or the project's config that would change what the model sees or can do: ${verdict.keys.join(", ")}${verdict.more ? ` (and ${verdict.more} more)` : ""}; the app-server was stopped before any thread was started`;
+    return { keys: verdict.keys, ...(verdict.more ? { more: verdict.more } : {}), message };
+  }
+
   // The app-server up, a thread on it (started, or resumed with the sandbox the request asked
   // for), the hermetic check passed. { ok: true, restartedForAccount } or { fail, fatal }.
   async ensureServer(restartReason, { fresh = false } = {}) {
@@ -1265,7 +1408,19 @@ class SessionDriver {
         { timeoutMs: 30_000 }
       );
       server.client.notify("initialized");
+      if (this.request.hermetic) {
+        // Verified isolation, before any thread exists: what is left of the user's config in this app-server
+        // (it has no --ignore-user-config) must be inert, neutralized or owned by the driver. A check that
+        // cannot run (an older Codex without config/read, a timeout) proves nothing.
+        const violation = await this.configViolation(server);
+        if (violation) {
+          this.events.append("hermetic_violation", { keys: violation.keys, ...(violation.more ? { more: violation.more } : {}) });
+          await this.stopServer({ force: true });
+          return { fail: { kind: "hermetic_violation", retryable: false, message: compact(violation.message), status: null }, fatal: true };
+        }
+      }
       const params = { sandbox: this.request.sandbox, approvalPolicy: "never", model: this.request.model };
+      if (this.request.hermetic) params.approvalsReviewer = "user"; // never the user's own `auto_review` subagent
       if (this.request.serviceTier) params.serviceTier = this.request.serviceTier;
       const resuming = !fresh && (Boolean(this.threadId) || this.request.mode === "resume");
       if (!resuming) {
@@ -1481,7 +1636,10 @@ class SessionDriver {
     }
     if (taken.stopped) return { kind: "stop", reason: taken.stopped };
     try {
-      const up = await this.ensureServer(spec.restart ? "account_change" : this.server ? null : "revive");
+      // a retry that cannot resume its thread starts a fresh one (spec.fresh): never on the old server's thread
+      const up = spec.fresh
+        ? await this.ensureServer("account_change", { fresh: true })
+        : await this.ensureServer(spec.restart ? "account_change" : this.server ? null : "revive");
       if (up.fail) {
         this.dequeue(spec.item);
         return { kind: "start_failed", classification: up.fail, fatal: up.fatal };
@@ -1681,19 +1839,24 @@ class SessionDriver {
     const { request, runId, context } = this;
     const durationMs = Date.now() - turn.startedAtMs;
     const provenance = buildProvenance(request, {
+      backend: "session",
       threadId: this.threadId,
       usage: turn.usage,
       usageTotal: this.usageTotal,
       durationMs,
+      ...(this.single ? { attempts: turn.n } : {}), // the turns this job has taken, as a one-shot run counts its attempts
       codexVersion: context.codexVersion,
       launcher: context.launcher.source,
     });
+    if (this.steers) provenance.steers = this.steers;
     if (this.threadIds.length) provenance.previousThreadIds = [...this.threadIds];
     if (chain.handoffs > chain.limitResumes) provenance.accountHandoffs = chain.handoffs - chain.limitResumes;
     if (chain.limitResumes) provenance.limitResumes = chain.limitResumes;
     if (context.limitWaitedMs) provenance.limitWaitedSec = Math.round(context.limitWaitedMs / 1000);
     if (chain.checkpoints) provenance.contextRestarts = chain.checkpoints;
-    const fail = (state, classification) => ({ ...failureEnvelope(request, runId, state, classification, provenance), session: { turn: turn.n } });
+    // a session's envelope says which turn it is; a steerable job's is a one-shot run's, field for field
+    const tag = this.single ? {} : { session: { turn: turn.n } };
+    const fail = (state, classification) => ({ ...failureEnvelope(request, runId, state, classification, provenance), ...tag });
     const completed = turn.completed;
     const status = completed?.status;
     const reason = turn.interruptReason;
@@ -1706,7 +1869,7 @@ class SessionDriver {
       return fail("timeout", { kind: "timeout", retryable: false, message: "the turn's deadline was reached and the app-server did not end the turn when interrupted; it was stopped", status: null });
     }
     if (turn.crashed || !completed) {
-      return fail("failed", { kind: "execution", retryable: false, message: compact(`the app-server exited${this.server?.exitCode != null ? ` (code ${this.server.exitCode})` : ""} while the turn was running; the session is dormant and can be revived`), status: null });
+      return fail("failed", { kind: "execution", retryable: false, message: compact(`the app-server exited${this.server?.exitCode != null ? ` (code ${this.server.exitCode})` : ""} while the turn was running${this.single ? "" : "; the session is dormant and can be revived"}`), status: null });
     }
     if (status === "interrupted") {
       if (reason === "timeout") return fail("timeout", { kind: "timeout", retryable: false, message: "the turn's deadline was reached; it was interrupted", status: null });
@@ -1719,9 +1882,10 @@ class SessionDriver {
       return fail("failed", classifySessionError(error));
     }
     const text = String(turn.final ?? turn.lastMessage ?? "").trim();
-    if (!text) return fail("failed", { kind: "empty_output", retryable: false, message: "the turn completed without a final message", status: null });
+    // (a one-shot run retries a clean exit without a final message; so does a steerable job)
+    if (!text) return fail("failed", { kind: "empty_output", retryable: this.single, message: "the turn completed without a final message", status: null });
     const digest = request.requestDigest ?? directDigest(request.task);
-    const base = { ...baseEnvelope(request, runId), ok: true, state: "done", session: { turn: turn.n } };
+    const base = { ...baseEnvelope(request, runId), ok: true, state: "done", ...tag };
     if (!request.schema) {
       return { ...base, text, resultHash: fnv1a(text), mac: resultMac(context.key, runId, digest, "text", text), provenance };
     }
@@ -1886,6 +2050,110 @@ class SessionDriver {
     return null;
   }
 
+  // ── a steerable job: one turn, its continuations and retries, then the end ──
+
+  // The whole job. Turn 1 is the task; after it, in the order a one-shot run applies them: the account / limit
+  // continuations (continuation(): the same thread, the job's own deadline), then a retry of a transient failure
+  // (retryTurn()). Whatever ends the chain — a result, a failure, a cancel, an interrupt, the deadline — is the
+  // job's envelope. → { envelope } | { fenced: true } | { fallback: { reason, kind } }
+  async runJob() {
+    // The lock may have changed hands while the job helper started: is the job still ours?
+    if (!this.control.fenced && this.control.stillHeld && !this.control.stillHeld()) this.control.fenced = true;
+    if (this.control.fenced) return this.fence();
+    const first = { id: "task", text: this.request.task, reason: "task", images: [], persisted: false };
+    this.queue = [first];
+    this.publish({ supervisorPid: process.pid });
+    const chain = { text: first.text, handoffs: 0, limitResumes: 0, checkpoints: 0, checkpointHandoff: 0, retries: 1 };
+    this.chain = chain;
+    this.context.limitWaitedMs = 0;
+    let spec = { item: first, text: first.text, reason: first.reason, images: [], deadlineAt: null, restart: false, fresh: false, retry: false };
+    let freshTried = false;
+    try {
+      for (;;) {
+        if (this.control.fenced) return this.fence();
+        const out = await this.executeTurn(spec, chain);
+        if (out.kind === "stop") return this.stopped(out.reason);
+        if (out.kind === "start_failed") {
+          const failure = out.classification;
+          // before any turn: the job has not started — it runs on exec instead (a start failure is not the job's)
+          if (this.turn === 0 && !NO_FALLBACK_KINDS.has(failure.kind)) return this.fallback(failure);
+          // a retry whose thread cannot be resumed starts a fresh thread with the original task, once
+          if (spec.retry && !out.fatal && !freshTried) {
+            freshTried = true;
+            this.log(`the thread cannot be resumed for the retry (${failure.kind}); retrying in a fresh thread with the original task`);
+            spec = { ...spec, text: this.request.task, fresh: true };
+            continue;
+          }
+          return this.endForGood("failed", { classification: failure });
+        }
+        if (out.envelope.ok) return this.endForGood(out.envelope.state, { envelope: out.envelope });
+        const kind = out.classification.kind;
+        if (kind === "interrupted") return this.endForGood("interrupted", { envelope: out.envelope }); // on request: never retried
+        const stop = this.stopNow();
+        if (stop) return this.stopOutcome(stop);
+        let next = await this.continuation(out, chain);
+        if (next?.stop) return this.stopped(next.stop);
+        if (next) chain.retries = 1; // a continuation starts the retry count again, as a resume does for a one-shot run
+        else {
+          next = await this.retryTurn(out, chain);
+          if (next?.stop) return this.stopped(next.stop);
+        }
+        if (!next) return this.endForGood(out.envelope.state, { envelope: out.envelope });
+        spec = next;
+      }
+    } finally {
+      this.chain = null;
+      this.waitAbort = null;
+      this.handoff = false;
+    }
+  }
+
+  // Why the chain stopped before an envelope of its own: a cancel (or a close, which is one), an abandoned caller,
+  // a lost lock, or an interrupt that reached a wait.
+  stopped(reason) {
+    if (reason === "interrupted") {
+      return this.endForGood("interrupted", { classification: { kind: "interrupted", retryable: false, message: "the job was interrupted on request", status: null } });
+    }
+    return this.stopOutcome(reason);
+  }
+
+  // The app-server could not be started for the first turn: give the job back untouched.
+  fallback(failure) {
+    const reason = clip(failure.message, 300);
+    this.events.append("backend_fallback", { reason, kind: failure.kind });
+    this.log(`the session backend could not start the job (${failure.kind}): ${reason}`);
+    return { fallback: { reason, kind: failure.kind } };
+  }
+
+  // A retryable failure with attempts left: back off (stoppable), then a continuation turn on the same thread
+  // that says a transient error interrupted the turn. The job's deadline is the first turn's, so it bounds
+  // the retries too. → the next turn's spec, { stop }, or null.
+  async retryTurn(out, chain) {
+    const { request, context } = this;
+    const failure = out.classification;
+    if (!failure.retryable || chain.retries >= request.maxAttempts) return null;
+    context.recoveryDeadlineAt = out.turn.deadlineAt;
+    if (context.recoveryDeadlineAt - Date.now() < Math.max(1, TIMING.minTimeoutSec) * 1000) {
+      this.log(`turn ${out.turn.n} failed (${failure.kind}) but too little work time is left for a retry`);
+      return null;
+    }
+    chain.retries += 1;
+    this.log(`turn ${out.turn.n} failed (${failure.kind}); backing off`);
+    this.phase = "backoff";
+    this.idleUntil = null;
+    this.publish({ state: "backoff", attempt: out.turn.n });
+    this.waitingInChain = true;
+    const stop = await sleepUnlessStopped(TIMING.backoffMs * out.turn.n, () => this.waitStopHook() ?? this.check());
+    this.waitingInChain = false;
+    if (stop) return { stop };
+    // the wait may have used up what was left of the job's time
+    if (context.recoveryDeadlineAt - Date.now() < Math.max(1, TIMING.minTimeoutSec) * 1000) {
+      this.log("no work time is left after the backoff; the job ends with its failure");
+      return null;
+    }
+    return { item: null, text: continuationPrompt("retry", chain.text), reason: "continuation", images: [], deadlineAt: context.recoveryDeadlineAt, restart: false, fresh: false, retry: true };
+  }
+
   // A fresh Codex thread on a new app-server (the checkpoint fallback), registered as the session's.
   async freshThread() {
     const up = await this.ensureServer("account_change", { fresh: true });
@@ -1897,6 +2165,10 @@ class SessionDriver {
   // The envelope a session ends with: the last turn's, with the final state.
   finalEnvelope(finalState, classification, extra = {}) {
     const last = latestTurnEnvelope(this.paths);
+    if (this.single) {
+      const provenance = last?.provenance ?? buildProvenance(this.request, { backend: "session", threadId: this.threadId, usageTotal: this.usageTotal });
+      return this.shapeJob(failureEnvelope(this.request, this.runId, finalState, classification ?? { kind: "execution", retryable: false, message: "the job ended without a result", status: null }, provenance));
+    }
     const session = { turn: this.turn, ended: finalState, ...extra };
     if (classification) {
       const provenance = last?.provenance ?? buildProvenance(this.request, { threadId: this.threadId, usageTotal: this.usageTotal });
@@ -1926,18 +2198,30 @@ class SessionDriver {
     return this.endForGood("closed", { extra: archive ? { archived } : {}, closeMessage: message, archiveError });
   }
 
-  async endForGood(finalState, { classification = null, extra = {}, closeMessage = null, archiveError = null } = {}) {
+  // A steerable job's envelope is a one-shot run's: no `session` field, the backend it ran on, the turns it took
+  // (`attempts`), the steering messages it accepted, and the slot-lost mark the supervisor keeps.
+  shapeJob(envelope) {
+    const out = { ...envelope };
+    delete out.session;
+    const provenance = { ...(out.provenance ?? {}), backend: "session" };
+    if (this.turn) provenance.attempts = this.turn;
+    if (this.steers) provenance.steers = this.steers;
+    if (this.control.slotLost) provenance.slotLost = true;
+    return { ...out, provenance };
+  }
+
+  async endForGood(finalState, { classification = null, extra = {}, closeMessage = null, archiveError = null, envelope = null } = {}) {
     this.ending = true;
     this.failQuestions("The session ended.");
     await this.stopServer();
     if (finalState === "closed") this.events.append("closed", {});
     else if (finalState === "cancelled") this.events.append("cancelled", {});
     else if (finalState === "abandoned") this.events.append("cancelled", { reason: "abandoned" });
-    else if (classification && classification.kind !== "hermetic_violation") {
+    else if (classification && !["hermetic_violation", "interrupted"].includes(classification.kind)) {
       this.events.append("error", { kind: classification.kind, message: clip(classification.message, 500), willRetry: false }); // hermetic_violation has its own event
     }
-    const envelope = this.finalEnvelope(finalState, classification, extra);
-    writeJsonAtomic(this.paths.result, envelope);
+    const final = envelope ? this.shapeJob(envelope) : this.finalEnvelope(finalState, classification, extra);
+    writeJsonAtomic(this.paths.result, final);
     this.phase = finalState;
     this.idleUntil = null;
     updateState(this.paths, { state: finalState, finishedAt: nowIso(), turnActive: false, steerable: false, idleUntil: null, question: null, queued: 0, supervisorPid: null });
@@ -1948,7 +2232,7 @@ class SessionDriver {
       this.finish(entry.message ?? { id: entry.id }, { outcome: "rejected", reason: "session_ended" });
     }
     if (closeMessage) this.finish(closeMessage, { outcome: "closed", turn: this.turn, ...(archiveError || "archived" in extra ? { archived: Boolean(extra.archived), ...(archiveError ? { archiveError } : {}) } : {}) });
-    return { envelope };
+    return { envelope: final };
   }
 }
 
@@ -1979,6 +2263,21 @@ function settleCrashedTurn({ request, runId, paths, state, events, context = nul
   events.append("turn_completed", { status: "failed", ok: false, durationMs: null, usage: null, kind: "execution" });
   tryUpdateState(paths, { turnActive: false, question: null });
   return true;
+}
+
+// A steerable job whose session backend could not start (or was switched off) runs on exec after all: it is not a
+// session any more, so what the driver and the starting command recorded for one is taken back — the session
+// fields of state.json, and the messages in its inbox, which are told why nobody will read them. The event feed
+// stays as a record of what happened; `backendFallback` in state.json says why.
+export function abandonSteerableState(paths, { reason = null, kind = null } = {}) {
+  for (const entry of sessionPendingMessages(paths)) {
+    moveInbox(paths, entry.id);
+    writeAck(paths, entry.id, { outcome: "rejected", reason: "backend_fallback", message: "this job runs on codex exec now and cannot be steered" });
+  }
+  const unset = Object.fromEntries(
+    ["session", "singleTurn", "turn", "turnActive", "steerable", "threadId", "threadIds", "idleUntil", "question", "queued", "usageTotal", "eventsCapped", "attempt", "attemptStartedAt", "deadlineAt"].map((key) => [key, undefined])
+  );
+  tryUpdateState(paths, { ...unset, state: "queued", backendFallback: { reason: clip(reason ?? "", 300) || null, kind } });
 }
 
 // ─── a short-lived app-server (archiving a thread of a dormant session) ─────
@@ -2055,11 +2354,16 @@ export async function endDormantSession(runId, finalState, { archive = false } =
     const last = latestTurnEnvelope(paths);
     const session = { turn: state.turn ?? 0, ended: finalState, ...(archive ? { archived } : {}) };
     const cancelled = finalState === "cancelled" ? classifyFailure({ cancelled: true }) : null;
-    const envelope = cancelled
+    let envelope = cancelled
       ? { ...failureEnvelope(request, runId, finalState, cancelled, last?.provenance ?? buildProvenance(request, { threadId: state.threadId ?? null })), session }
       : last
         ? { ...last, state: finalState, session: { ...(last.session ?? {}), ...session } }
         : { ...failureEnvelope(request, runId, finalState, { kind: "closed", retryable: false, message: "the session was closed before any turn completed", status: null }, buildProvenance(request, { threadId: state.threadId ?? null })), session };
+    if (state.singleTurn) {
+      // a steerable job whose supervisor is gone is cancelled like any run: an envelope of a one-shot run's shape
+      delete envelope.session;
+      envelope = { ...envelope, provenance: { ...(envelope.provenance ?? {}), backend: "session", ...(state.turn ? { attempts: state.turn } : {}) } };
+    }
     writeJsonAtomic(paths.result, envelope);
     updateState(paths, { state: finalState, finishedAt: nowIso(), turnActive: false, steerable: false, idleUntil: null, question: null, queued: 0, supervisorPid: null });
     await finalAckDelay();
@@ -2167,13 +2471,13 @@ function sessionRun(runId, pretty, { needOpen = true } = {}) {
   }
   const state = readJsonSafe(paths.state) ?? {};
   if (!state.session) {
-    printAck(runId, { outcome: "rejected", reason: "not_a_session", message: "this run was not started with \"session\": true" }, pretty);
+    printAck(runId, { outcome: "rejected", reason: "not_a_session", message: "this run was not started with \"session\": true (nor as a steerable job: \"steerable\": true)" }, pretty);
     return null;
   }
   writeText(paths.heartbeat, String(Date.now())); // any of these commands is a poll
   const result = readJsonSafe(paths.result);
   if (needOpen && result) {
-    printAck(runId, { outcome: "rejected", reason: "session_ended", message: `the session ended (${result.state})` }, pretty);
+    printAck(runId, { outcome: "rejected", reason: "session_ended", message: `the ${state.singleTurn ? "job" : "session"} ended (${result.state})` }, pretty);
     return null;
   }
   return { paths, state, result };
@@ -2211,7 +2515,7 @@ async function deliver(runId, run, fields, { waitMs = TIMING.ackWaitMs, revive =
         const late = readJsonSafe(ackFile);
         if (late) return printAck(runId, late, pretty);
         // no ack even so: the end speaks for itself. A close that found the session closed is a close.
-        if (fields.kind === "close" && ended.state === "closed") {
+        if (fields.kind === "close" && (ended.state === "closed" || (ended.state === "cancelled" && (readJsonSafe(paths.state) ?? {}).singleTurn))) {
           const info = ended.session ?? {};
           return printAck(runId, { outcome: "closed", turn: info.turn ?? (readJsonSafe(paths.state) ?? {}).turn ?? 0, ...(info.archived !== undefined ? { archived: Boolean(info.archived) } : {}) }, pretty);
         }
@@ -2244,6 +2548,13 @@ export async function cmdSend(runId, options) {
   if (!["auto", "steer", "queue"].includes(mode)) throw new UsageError("--mode must be one of: auto, steer, queue");
   const run = sessionRun(runId, options.pretty);
   if (!run) return 1;
+  if (run.state.singleTurn) {
+    // a steerable job ends with its turn: it can be steered while it runs, never given a follow-up — and it is
+    // never revived: without a supervisor there is nobody to steer
+    if (mode === "queue") return printAck(runId, { outcome: "rejected", reason: "single_turn", message: "this job ends with its turn: only --mode steer (or auto) can reach it, while it runs" }, options.pretty);
+    if (!sessionSupervisorAlive(run.paths)) return printAck(runId, { outcome: "rejected", reason: "no_active_turn", message: "the job's supervisor is not running" }, options.pretty);
+    return deliver(runId, run, { kind: "send", text, mode }, { revive: false, pretty: options.pretty });
+  }
   return deliver(runId, run, { kind: "send", text, mode }, { pretty: options.pretty });
 }
 
@@ -2262,6 +2573,7 @@ export async function cmdAnswer(runId, questionId, options) {
   if (text === null) throw new UsageError("answer needs (--text TEXT | --file FILE)");
   const run = sessionRun(runId, options.pretty);
   if (!run) return 1;
+  if (run.state.singleTurn) return printAck(runId, { outcome: "rejected", reason: "single_turn", message: "a steerable job asks no questions: nothing waits for an answer" }, options.pretty);
   if (!sessionSupervisorAlive(run.paths)) return printAck(runId, { outcome: "no_such_question", reason: "supervisor_not_running" }, options.pretty);
   return deliver(runId, run, { kind: "answer", questionId: String(questionId), text }, { revive: false, pretty: options.pretty });
 }
@@ -2270,6 +2582,15 @@ export async function cmdClose(runId, options) {
   const run = sessionRun(runId, options.pretty, { needOpen: false });
   if (!run) return 1;
   const { paths } = run;
+  if (run.state.singleTurn) {
+    // a steerable job has no session to close: close is cancel (force and archive mean nothing here)
+    if (run.result) return printAck(runId, { outcome: "rejected", reason: "session_ended", message: `the job ended (${run.result.state})` }, options.pretty);
+    if (!sessionSupervisorAlive(paths)) {
+      const ended = await endDormantSession(runId, "cancelled");
+      if (ended.ok) return printAck(runId, { outcome: "closed", turn: (readJsonSafe(paths.state) ?? {}).turn ?? 0 }, options.pretty);
+    }
+    return deliver(runId, run, { kind: "close", force: true, archive: false }, { waitMs: TIMING.closeWaitMs, revive: false, pretty: options.pretty });
+  }
   if (run.result) {
     const closed = run.result.state === "closed";
     return printAck(runId, closed ? { outcome: "closed", turn: run.result.session?.turn ?? run.state.turn ?? 0, message: "already closed" } : { outcome: "rejected", reason: "session_ended", message: `the session ended (${run.result.state})` }, options.pretty);

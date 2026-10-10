@@ -129,6 +129,10 @@ function itemFor(run, event, answered) {
   const seq = Number.isInteger(event.seq) ? event.seq : null;
   const base = { runId: run.runId, label: run.label };
   const item = (out) => ({ out, runId: run.runId, seq });
+  // A steerable workflow node's result is collected by its workflow: one line per node (a review runs a dozen)
+  // for a finished turn, an error or the end would only be noise. What the owner wants to know is that work is
+  // paused on a usage limit, and that it went on (limit_wait and resumed stay).
+  if (run.steerable && ["turn_completed", "error", "hermetic_violation", "cancelled"].includes(event.type)) return null;
   switch (event.type) {
     case "question": {
       const questionId = String(event.id ?? "");
@@ -153,7 +157,14 @@ function itemFor(run, event, answered) {
       return event.willRetry === true ? null : item({ codex: "error", ...base, kind: event.kind ?? "execution", message: clip(event.message, ERROR_MAX) });
     case "hermetic_violation": {
       const servers = Array.isArray(event.servers) ? event.servers.map(String) : [];
-      const message = servers.length ? `a hermetic session found MCP servers with tools: ${servers.join(", ")}` : "the hermetic check could not be completed";
+      const keys = Array.isArray(event.keys) ? event.keys.map(String) : [];
+      const message = keys.length
+        ? keys[0] === "<unverifiable>"
+          ? "the hermetic check of the app-server's configuration could not be completed"
+          : `a hermetic session's configuration is not isolated (settings of the user's or the project's config: ${keys.join(", ")})`
+        : servers.length
+          ? `a hermetic session found MCP servers with tools: ${servers.join(", ")}`
+          : "the hermetic check could not be completed";
       return item({ codex: "error", ...base, kind: "hermetic_violation", message: clip(message, ERROR_MAX) });
     }
     case "cancelled":
@@ -245,7 +256,7 @@ export class Watcher {
   }
 
   adopt(runId, paths, state, items) {
-    const run = { runId, label: state.label ?? null, paths };
+    const run = { runId, label: state.label ?? null, paths, steerable: state.singleTurn === true };
     const result = readJsonSafe(paths.result);
     const finished = result !== null;
     const known = Object.hasOwn(this.cursor.runs, runId);
@@ -322,7 +333,7 @@ export class Watcher {
       }
       if (result) {
         // a session that failed says why in an `error` event; this line says it is over
-        if (!track.endedDone && result.state === "failed") {
+        if (!track.endedDone && result.state === "failed" && !run.steerable) {
           items.push({ out: { codex: "ended", runId, label: run.label, state: "failed", ...(result.error?.kind ? { kind: result.error.kind } : {}) }, runId, seq: null, ended: true });
         }
         track.endedDone = true;

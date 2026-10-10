@@ -33,6 +33,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { cmdNotify } from "./notify.mjs";
 import {
+  abandonSteerableState,
   buildAppServerArgs,
   claimSupervisorLock,
   cmdAnswer,
@@ -52,7 +53,7 @@ import {
   sessionWaitPrint,
 } from "./session.mjs";
 
-export const RUNNER_VERSION = "0.5.0";
+export const RUNNER_VERSION = "0.6.0";
 export const RUNNER_FILE = fileURLToPath(import.meta.url);
 
 export const EFFORTS = Object.freeze(["low", "medium", "high", "xhigh", "max", "ultra"]);
@@ -109,6 +110,19 @@ export function defaultFollowAccountSwitch(env = process.env) {
   return env.ULTRACODEX_FOLLOW_ACCOUNT_SWITCH !== "0";
 }
 
+// Which backend a steerable job (request `steerable: true`) runs on: `session` — one turn of a session on a
+// private `codex app-server`, so it can be steered while it runs — or `exec`, plain `codex exec`, as before.
+// ULTRACODEX_NODE_BACKEND=exec is the kill switch: every steerable job then runs on exec. A job whose
+// session backend cannot start (isolation not verifiable, no app-server) falls back to exec by itself.
+export function nodeBackend(env = process.env) {
+  return env.ULTRACODEX_NODE_BACKEND === "exec" ? "exec" : "session";
+}
+
+// Does this request run through the session driver (a session, or a steerable job on the session backend)?
+export function drivenBySession(request, env = process.env) {
+  return Boolean(request?.session) || (Boolean(request?.steerable) && nodeBackend(env) === "session");
+}
+
 // Timing knobs; the env overrides exist so the offline tests run in seconds.
 export const TIMING = Object.freeze({
   pollMs: envInt("ULTRACODEX_POLL_MS", 1000),
@@ -125,6 +139,7 @@ export const TIMING = Object.freeze({
   closeWaitMs: envInt("ULTRACODEX_CLOSE_WAIT_MS", 60_000), // how long close waits for a live supervisor to wind the session down
   lockWaitMs: envInt("ULTRACODEX_LOCK_WAIT_MS", 8000), // how long a new supervisor waits for the lock of one that is winding down
   limitProbeTimeoutMs: envInt("ULTRACODEX_LIMIT_PROBE_TIMEOUT_MS", 20_000),
+  configReadTimeoutMs: envInt("ULTRACODEX_CONFIG_READ_TIMEOUT_MS", 60_000), // how long a hermetic app-server may take to answer config/read (the isolation check)
   slotPollMs: envInt("ULTRACODEX_SLOT_POLL_MS", 2000),
   slotStaleMs: envInt("ULTRACODEX_SLOT_STALE_MS", 60_000),
   killGraceMs: envInt("ULTRACODEX_KILL_GRACE_MS", 5000),
@@ -665,6 +680,7 @@ const REQUEST_FIELDS = new Set([
   "review",
   "resume",
   "session",
+  "steerable",
   "idleTtlSec",
   "askOrchestrator",
   "askTimeoutSec",
@@ -817,6 +833,20 @@ export function validateRequest(raw, { catalog = null, requestDigest: signedDige
   if (!session) {
     const stray = ["idleTtlSec", "askOrchestrator", "askTimeoutSec"].filter((name) => raw[name] !== undefined && raw[name] !== null);
     if (stray.length) throw new RequestError("invalid_request", `${stray.join(", ")} need session: true`);
+  }
+  // A steerable job is a plain one-shot job (an exec-mode task, any kind) that runs as ONE turn of a session on a
+  // private app-server, so that it can be steered while it runs; it ends with its turn. Not a review (that is the
+  // direct `review` mode), not a resume, not itself a session, no images, no profile (the app-server has no -p).
+  const steerable = expectBoolean(raw, "steerable", false);
+  if (steerable) {
+    const refuse = (what) => {
+      throw new RequestError("invalid_request", `a steerable job cannot ${what}`);
+    };
+    if (session) refuse("also be a session (a session is already steerable and outlives its first turn)");
+    if (mode === "review") refuse("run a review (the direct review mode runs on codex exec)");
+    if (mode === "resume") refuse("resume a thread (start a session instead)");
+    if (raw.profile !== undefined && raw.profile !== null) refuse("use a profile (the app-server has no -p)");
+    if (raw.images !== undefined && !(Array.isArray(raw.images) && raw.images.length === 0)) refuse("take images");
   }
   const tier = expectEnum(raw, "tier", TIERS, "daily");
   const defaultKind = mode === "review" ? "review" : sandbox === "workspace-write" ? "implement" : "ask";
@@ -985,12 +1015,14 @@ export function validateRequest(raw, { catalog = null, requestDigest: signedDige
     profile: raw.profile ?? null,
     review,
     resume,
-    // Steerable session: the supervisor drives a private `codex app-server` instead of `codex exec`
+    // Steerable job (see session.mjs, single-turn mode): the same driver as a session, for ONE turn and its
+    // continuations; the job ends with it. Steerable session: the supervisor drives a private `codex app-server` instead of `codex exec`
     // (direct runs only; see session.mjs). idleTtlSec: how long the app-server stays up after a
     // turn when nothing is pending, then the session goes dormant (process gone, thread on disk,
     // revived by the next message). askTimeoutSec: an unanswered ask_orchestrator question gets an
     // automatic reply after this long.
     session,
+    steerable,
     idleTtlSec: session ? expectInteger(raw, "idleTtlSec", 0, 86_400, 1200) : null,
     askOrchestrator: session ? expectBoolean(raw, "askOrchestrator", true) : false,
     askTimeoutSec: session ? expectInteger(raw, "askTimeoutSec", Math.max(1, TIMING.minAskTimeoutSec), 86_400, 1800) : null,
@@ -2813,6 +2845,7 @@ async function runAttempt(request, paths, attempt, context) {
   const stderr = readTextSafe(files.stderr) ?? "";
   const lastMessage = (readTextSafe(files.lastMessage) ?? "").trim();
   const provenance = buildProvenance(request, {
+    backend: "exec",
     threadId: summary.threadId,
     usage: summary.usage,
     durationMs,
@@ -2912,12 +2945,14 @@ const CONTINUATION_REASONS = Object.freeze({
   usage_limit: "the usage limit was reached and the ChatGPT account was then switched",
   auth: "the login was rejected and the ChatGPT account was then switched",
   rate_limit: "the rate limit was hit and the ChatGPT account was then switched",
+  retry: "a transient error interrupted your turn",
 });
 const CONTINUATION_REQUEST_MAX = 8000;
 
 // The input of a continuation: a new turn on a thread whose previous turn the system stopped before it was
 // finished — after an account switch (`switch`), a usage limit and an account change (`usage_limit`,
-// `auth`, `rate_limit`) or a limit reset (`reset`). A bare "continue the unfinished task" let a model
+// `auth`, `rate_limit`), a limit reset (`reset`) or, for a steerable job, a transient failure its retry
+// continues after (`retry`). A bare "continue the unfinished task" let a model
 // decide it was done (measured: luna@low skipped the last command of its request after a handoff right at
 // a step boundary, with an output schema pulling it towards an answer), so the notice is factual and
 // explicit and repeats the request that was interrupted (`request`: the turn's input text — the original
@@ -3280,8 +3315,8 @@ export async function superviseRun(runId) {
   const paths = runPaths(runId);
   const stored = readJsonSafe(paths.request);
   if (!stored) return;
-  if (!stored.session) return superviseBody(runId, paths, stored, null);
-  // A session has exactly one supervisor at a time: it takes the lock before it spawns anything
+  if (!drivenBySession(stored)) return superviseBody(runId, paths, stored, null);
+  // A session (and a steerable job on the session backend) has exactly one supervisor at a time: it takes the lock before it spawns anything
   // (the Job Object helper, the app-server) and gives it up when it exits. A supervisor that
   // loses the race for it just leaves — the winner runs the session.
   const log = (line) => appendLine(paths.log, `${nowIso()} ${line}`);
@@ -3298,13 +3333,17 @@ export async function superviseRun(runId) {
     return await superviseBody(runId, paths, stored, lock);
   } finally {
     lock.release();
-    // A message that arrived while this supervisor wound down has nobody to read it: hand it on.
-    if (readJsonSafe(paths.result) === null && sessionPendingMessages(paths).length) launchSupervisor(runId);
+    // A message that arrived while this supervisor wound down has nobody to read it: hand it on. (A steerable
+    // job is never revived: it ends with its turn, and a supervisor that is gone leaves it "lost", as for exec.)
+    if (!stored.steerable && readJsonSafe(paths.result) === null && sessionPendingMessages(paths).length) launchSupervisor(runId);
   }
 }
 
 async function superviseBody(runId, paths, stored, lock) {
-  const request = { ...stored, task: readTextSafe(paths.task) ?? "", schema: stored.hasSchema ? readJsonSafe(paths.schema) : null };
+  let request = { ...stored, task: readTextSafe(paths.task) ?? "", schema: stored.hasSchema ? readJsonSafe(paths.schema) : null };
+  // a steerable job runs as one turn of a session unless the kill switch says exec (or the session backend cannot
+  // start: then it falls back to exec below, as the very same job)
+  const steerBackend = !request.session && drivenBySession(request);
   const legacy = readJsonSafe(paths.accountRecovery);
   const log = (line) => appendLine(paths.log, `${nowIso()} ${line}`);
   // A revived session that finds nothing to do (a spurious revive, a message already handled)
@@ -3313,6 +3352,16 @@ async function superviseBody(runId, paths, stored, lock) {
     log("revived with nothing to do; dormant again");
     updateState(paths, { state: "dormant", dormantAt: nowIso(), turnActive: false, supervisorPid: null });
     return;
+  }
+  if (steerBackend && sessionIsRevive(paths)) {
+    // a steerable job ends with its turn: nothing revives it, and a second supervisor must never run it again
+    log("this steerable job has started before; it is never revived");
+    return;
+  }
+  if (request.steerable && !steerBackend && readJsonSafe(paths.state)?.singleTurn) {
+    // the kill switch (ULTRACODEX_NODE_BACKEND=exec) was set for this supervisor but not for the process that started it
+    log("ULTRACODEX_NODE_BACKEND=exec: this steerable job runs on codex exec");
+    abandonSteerableState(paths, { reason: "kill_switch", kind: null });
   }
   writeText(paths.alive, String(Date.now()));
   updateState(paths, { state: "queued", supervisorPid: process.pid });
@@ -3338,6 +3387,7 @@ async function superviseBody(runId, paths, stored, lock) {
       // stale window); one failed renewal can be a reclaimer that put the slot back.
       // Say so: this run now counts above the machine-wide cap.
       slotLost = true;
+      control.slotLost = true; // a steerable job's driver stamps its own envelope
       log("slot lease lost to another run; this run continues above the machine-wide cap");
       try {
         updateState(paths, { slotLost: true });
@@ -3348,6 +3398,7 @@ async function superviseBody(runId, paths, stored, lock) {
   }, TIMING.aliveMs);
   let envelope;
   let sessionOutcome = null;
+  let needsExec = false;
   // Windows: joining a Job Object before anything is spawned lets the kernel, not PID
   // bookkeeping, say which processes belong to this run (see "process-tree teardown").
   let job = process.platform === "win32" && process.env.ULTRACODEX_NO_JOB !== "1" ? startWindowsJob() : null;
@@ -3402,14 +3453,32 @@ async function superviseBody(runId, paths, stored, lock) {
         message: `effort ${request.effort} is not supported by ${request.model}`,
         status: null,
       });
-    } else if (request.session) {
+    } else if (request.session || steerBackend) {
       // The session driver (session.mjs) runs the turns on a private app-server; it holds a slot
       // only while a turn runs, and decides whether the session ends for good (an envelope, which
-      // becomes result.json), goes dormant (no result: it can be revived) or was fenced off.
+      // becomes result.json), goes dormant (no result: it can be revived) or was fenced off. A steerable
+      // job is the same driver in single-turn mode: one turn and its continuations, then the job ends —
+      // or, when the driver cannot even start that turn, it hands the job back (`fallback`).
       if (TIMING.sessionStartDelayMs) await sleep(TIMING.sessionStartDelayMs);
-      sessionOutcome = await runSession({ runId, request, paths, context, log, check, control, setSlot: (next) => { slot = next; } });
-      envelope = sessionOutcome.envelope ?? null; // already written (result.json, state) by the driver
+      const driverStartedAt = Date.now();
+      sessionOutcome = await runSession({ runId, request, paths, context, log, check, control, setSlot: (next) => { slot = next; }, single: steerBackend });
+      if (sessionOutcome.fallback) {
+        // The same job, on exec, exactly as if it had never been steerable: same run id, same signed digest, the
+        // attempts budget untouched (no turn ever started), and the deadline it was given.
+        const { reason, kind } = sessionOutcome.fallback;
+        log(`steerable job: the session backend could not start (${reason}); running it on codex exec instead`);
+        abandonSteerableState(paths, { reason, kind });
+        const left = Math.floor((request.timeoutSec * 1000 - (Date.now() - driverStartedAt)) / 1000);
+        request = { ...request, timeoutSec: Math.max(Math.max(1, TIMING.minTimeoutSec), left) };
+        sessionOutcome = null;
+        needsExec = true;
+      } else {
+        envelope = sessionOutcome.envelope ?? null; // already written (result.json, state) by the driver
+      }
     } else {
+      needsExec = true;
+    }
+    if (needsExec) {
       slot = await acquireSlots(request.weight, runId, check);
       if (slot.stopped) {
         envelope = failureEnvelope(request, runId, slot.stopped, classifyFailure({ cancelled: slot.stopped === "cancelled", abandoned: slot.stopped === "abandoned" }));
@@ -3665,7 +3734,9 @@ function persistRun(request) {
   delete stored.schema;
   writeJsonAtomic(paths.request, stored);
   writeText(paths.heartbeat, String(Date.now()));
-  if (request.session) {
+  // a steerable job on the session backend is a single-turn session: the same files, a job that ends with its turn
+  const driven = drivenBySession(request);
+  if (driven) {
     for (const dir of [paths.inboxDone, paths.outbox, paths.turns, paths.queue]) fs.mkdirSync(dir, { recursive: true });
   }
   writeJsonAtomic(paths.state, {
@@ -3682,7 +3753,8 @@ function persistRun(request) {
     cwd: request.cwd,
     owner: owner?.id ?? null,
     ownerSource: owner?.source ?? null,
-    ...(request.session ? { session: true, turn: 0, turnActive: false, queued: 0, question: null } : {}),
+    ...(driven ? { session: true, turn: 0, turnActive: false, queued: 0, question: null } : {}),
+    ...(driven && !request.session ? { singleTurn: true } : {}),
   });
   return { runId, paths };
 }
@@ -3889,6 +3961,7 @@ function startedLine(runId, request, state) {
     kind: request.kind,
     timeoutSec: request.timeoutSec,
     ...(request.session ? { session: true, idleTtlSec: request.idleTtlSec, events: `events ${runId} --follow` } : {}),
+    ...(request.steerable && drivenBySession(request) ? { steerable: true } : {}),
     next: `wait ${runId}`,
   };
 }
@@ -4065,7 +4138,8 @@ export async function cmdWait(runId, { maxWaitSec = DEFAULT_MAX_WAIT_SEC, pretty
     }
     writeText(paths.heartbeat, String(Date.now()));
     const state = readJsonSafe(paths.state) ?? {};
-    if (state.session && !finalOnly) {
+    // a steerable job is not a session as far as the caller can tell: no question, no idle turn to hand over
+    if (state.session && !state.singleTurn && !finalOnly) {
       const early = sessionWaitPrint(runId, paths, state, pretty);
       if (early !== null) return early;
     }
@@ -4086,7 +4160,7 @@ export async function cmdWait(runId, { maxWaitSec = DEFAULT_MAX_WAIT_SEC, pretty
           error: {
             kind: "supervisor_lost",
             retryable: false,
-            message: state.session
+            message: state.session && !state.singleTurn
               ? "the session's supervisor stopped reporting (its app-server ends with it). `send` revives the session — the turn it was running is then recorded as failed — and `close` ends it; nothing is stopped automatically."
               : `the supervisor stopped reporting; codex pid ${state.codexPid ?? "?"} may still be running. ` +
                 "It is NOT stopped automatically — check `status` and ask the owner before stopping anything.",
@@ -4112,7 +4186,8 @@ export async function cmdWait(runId, { maxWaitSec = DEFAULT_MAX_WAIT_SEC, pretty
           attempt: state.attempt ?? null,
           elapsedSec: Math.round((Date.now() - startedAt) / 1000),
           timeoutSec: state.timeoutSec ?? null,
-          ...(state.session ? { session: true, turn: state.turn ?? 0, turnActive: Boolean(state.turnActive), queued: state.queued ?? 0 } : {}),
+          ...(state.session && !state.singleTurn ? { session: true, turn: state.turn ?? 0, turnActive: Boolean(state.turnActive), queued: state.queued ?? 0 } : {}),
+          ...(state.singleTurn ? { steerable: true } : {}),
           next: `wait ${runId}`,
         },
         pretty
@@ -4170,6 +4245,9 @@ function describeRun(runId) {
           queued: result ? 0 : state.queued ?? 0,
         }
       : {}),
+    // a steerable workflow node: found by its label, steered with send --mode steer, ends with its turn
+    ...(state.singleTurn ? { steerable: true } : {}),
+    ...(state.backendFallback ? { backendFallback: state.backendFallback } : {}),
   };
 }
 
@@ -4286,7 +4364,9 @@ export async function cmdCancelOrphaned({ pretty = false } = {}) {
 export function cmdResult(runId, { pretty = false, turn = null } = {}) {
   if (!RUN_ID_RE.test(String(runId ?? ""))) throw new UsageError("result needs a run id");
   const paths = runPaths(runId);
-  if (turn !== null || readJsonSafe(paths.state)?.session) {
+  const state = readJsonSafe(paths.state);
+  // a steerable job has one result, like any one-shot run: its turns are only shown when asked for (--turn)
+  if (turn !== null || (state?.session && !state.singleTurn)) {
     const shown = sessionResult(runId, paths, turn, pretty);
     if (shown !== null) return shown;
   }
@@ -4749,6 +4829,7 @@ export {
   clamp,
   compact,
   describeRun,
+  sleepUnlessStopped,
   extractJsonObject,
   failureEnvelope,
   isDirSync,

@@ -100,6 +100,20 @@ if (argv[0] === "debug" && argv[1] === "models") {
 //    FAKE_CODEX_RESUME_FAILS=1 (thread/resume fails), FAKE_CODEX_RESUME_MS=n (thread/resume answers after n ms: a wide
 //    window for what happens during an account handoff), FAKE_CODEX_TURN_MS=n (the default length of every turn). Each thread writes a Codex-style rollout file
 //    under $CODEX_HOME/sessions (visible messages and tool output) for the checkpoint fallback.
+//    config/read (the runner's isolation check of a hermetic app-server): FAKE_CODEX_CONFIG_READ =
+//      (unset) | clean   the effective config and origins of exactly the flags this app-server was started with,
+//                        all `sessionFlags` — a user config that contributes nothing
+//      owner             clean + the keys a real owner's config.toml contributes (driver-owned, inert, neutralized)
+//      leak:<key>[,<key>]          clean + those keys with origin `user` (value "leaked-value-must-not-print")
+//      leak-project:<key>[,<key>]  the same with origin `project`
+//      missing | malformed         a result without usable `origins`
+//      error             a JSON-RPC "method not found" (an older Codex)      hang   never answers
+//      <path>            that JSON file's content, verbatim, as the result
+//    FAKE_CODEX_APP_SERVER_EXIT=n makes the app-server exit with code n before it answers anything.
+//    FAKE_FAIL_FIRST=n (a turn directive; counted per task in ${FAKE_CODEX_STATE}.fail-*) fails the first n turns of that
+//    task with FAKE_FAIL_KIND (default serverOverloaded; any codexErrorInfo name, e.g. badRequest);
+//    FAKE_FAIL_EXIT=1 makes the app-server exit 100 ms after such a failure. FAKE_CODEX_FAIL_TURNS=n (with FAKE_FAIL_KIND)
+//    fails the first n turns of any kind, a retry's or a continuation's included.
 if (argv[0] === "app-server") {
   if (argv[1] !== "--listen" || argv[2] !== "stdio://") {
     process.stderr.write(`fake-codex: unsupported app-server invocation: ${argv.join(" ")}\n`);
@@ -113,6 +127,7 @@ if (argv[0] === "app-server") {
     if (process.env.FAKE_CODEX_SESSION_LOG) fs.appendFileSync(process.env.FAKE_CODEX_SESSION_LOG, JSON.stringify({ ...entry, pid: process.pid, at: Date.now() }) + "\n");
   };
   slog({ kind: "spawn", flags, cwd: process.cwd() });
+  if (process.env.FAKE_CODEX_APP_SERVER_EXIT) process.exit(Number(process.env.FAKE_CODEX_APP_SERVER_EXIT));
   const scriptFile = process.env.FAKE_CODEX_RATE_LIMITS;
   const nextAnswer = () => {
     const entries = JSON.parse(fs.readFileSync(scriptFile, "utf8"));
@@ -228,6 +243,23 @@ if (argv[0] === "app-server") {
         if (fakeFile) fs.appendFileSync(fakeFile, "applied once\n");
         notify("item/started", { threadId: thread.id, turnId: active.id, item: item({ type: "reasoning", summary: [], content: ["PRIVATE_REASONING_MUST_NOT_BE_COPIED"] }) });
         return sendLimitFailure(active);
+      }
+    }
+    // two ways to script a failure, like the usage limit: a directive (the first n turns of that task) and
+    // FAKE_CODEX_FAIL_TURNS (the first n turns of any kind, a retry's or a continuation's included)
+    const failFirst = Number(lineDirective(text, "FAIL_FIRST") ?? 0);
+    const failTurns = Number(process.env.FAKE_CODEX_FAIL_TURNS ?? 0);
+    if ((failFirst > 0 || failTurns > 0) && process.env.FAKE_CODEX_STATE) {
+      const counter = `${process.env.FAKE_CODEX_STATE}.fail-${failFirst > 0 ? text.split("\n")[0].replace(/[^A-Za-z0-9]/g, "_").slice(0, 40) : "turns"}`;
+      const seen = fs.existsSync(counter) ? Number(fs.readFileSync(counter, "utf8")) : 0;
+      if (seen < (failFirst > 0 ? failFirst : failTurns)) {
+        fs.writeFileSync(counter, String(seen + 1));
+        const info = lineDirective(text, "FAIL_KIND") ?? process.env.FAKE_FAIL_KIND ?? "serverOverloaded";
+        const error = { message: `fake failure: ${info}`, codexErrorInfo: info, additionalDetails: null };
+        notify("error", { error, willRetry: false, threadId: thread.id, turnId: active.id });
+        notify("turn/completed", { threadId: thread.id, turn: turnObject(active, "failed", error) });
+        if (lineDirective(text, "FAIL_EXIT") === "1") setTimeout(() => process.exit(7), 100); // the app-server dies after the failure
+        return;
       }
     }
     if (process.env.FAKE_CODEX_ENCRYPTED_RESUME === "1" && thread.accountChanged) {
@@ -361,6 +393,77 @@ if (argv[0] === "app-server") {
     });
   };
 
+  // ── config/read ──
+  const splitKey = (dotted) => [...dotted.matchAll(/"((?:[^"\\]|\\.)*)"|([^.]+)/g)].map((match) => match[1] ?? match[2]);
+  const setPath = (object, segments, value) => {
+    let at = object;
+    for (const segment of segments.slice(0, -1)) at = at[segment] = at[segment] && typeof at[segment] === "object" ? at[segment] : {};
+    at[segments.at(-1)] = value;
+  };
+  const origin = (type) => ({ name: type === "sessionFlags" ? { type } : { type, file: "C:\\fake\\config.toml" }, version: "sha256:fake" });
+  const parseValue = (raw) => {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+  };
+  // the effective config and origins of exactly the flags this app-server was started with
+  const flagConfig = () => {
+    const config = {};
+    const origins = {};
+    const put = (dotted, value, type = "sessionFlags") => {
+      setPath(config, splitKey(dotted), value);
+      origins[splitKey(dotted).join(".")] = origin(type);
+    };
+    for (let index = 0; index < flags.length; index += 1) {
+      if (flags[index] === "--disable") put(`features.${flags[(index += 1)]}`, false);
+      else if (flags[index] === "-c") {
+        const setting = flags[(index += 1)];
+        const at = setting.indexOf("=");
+        put(setting.slice(0, at), parseValue(setting.slice(at + 1)));
+      }
+    }
+    return { config, origins };
+  };
+  // what a real owner's config.toml contributes on top of the flags (nothing here changes what a node sees)
+  const ownerConfig = () => {
+    const { config, origins } = flagConfig();
+    const user = (dotted, value) => {
+      setPath(config, [dotted], value);
+      origins[dotted] = origin("user");
+    };
+    for (const [key, value] of [["approval_policy", "on-request"], ["approvals_reviewer", "auto_review"], ["model", "owner-model"], ["model_reasoning_effort", "xhigh"], ["service_tier", "fast"], ["windows.sandbox", "elevated"]]) {
+      setPath(config, splitKey(key), value);
+      origins[key] = origin("user");
+    }
+    origins["notify.0"] = origin("user"); // stale: the effective notify is []
+    origins["notify.1"] = origin("user");
+    for (const key of ["projects.C:\\work\\repo.trust_level", "tui.theme", "desktop.sidebar", "notice.hide_rate_limit_model_nudge", "marketplaces.main.source", "plugins.fake@market.enabled", "mcp_servers.fake_server.command", "mcp_servers.fake_server.args.0"]) user(key, "owner-value");
+    origins["mcp_servers.fake_server.enabled"] = origin("sessionFlags"); // switched off by a flag (the effective value is false)
+    setPath(config, ["mcp_servers", "fake_server", "enabled"], false);
+    return { config, origins };
+  };
+  const configRead = (id) => {
+    const mode = process.env.FAKE_CODEX_CONFIG_READ ?? "clean";
+    if (mode === "error") return rpcError(id, -32601, "method not found");
+    if (mode === "hang") return;
+    if (mode === "missing") return reply(id, { result: { config: flagConfig().config } });
+    if (mode === "malformed") return reply(id, { result: { config: flagConfig().config, origins: "nope" } });
+    if (mode === "owner") return reply(id, { result: ownerConfig() });
+    const leak = /^leak(-project)?:(.+)$/.exec(mode);
+    if (leak) {
+      const { config, origins } = flagConfig();
+      for (const key of leak[2].split(",")) {
+        setPath(config, splitKey(key), "leaked-value-must-not-print");
+        origins[key] = origin(leak[1] ? "project" : "user");
+      }
+      return reply(id, { result: { config, origins } });
+    }
+    if (mode !== "clean") return reply(id, { result: JSON.parse(fs.readFileSync(mode, "utf8")) });
+    return reply(id, { result: flagConfig() });
+  };
+
   const handle = async (message) => {
     if (message.id !== undefined && message.method === undefined) {
       // an answer to a request this fake sent (the ask_orchestrator tool call)
@@ -388,6 +491,8 @@ if (argv[0] === "app-server") {
         if (answer.exit !== undefined) process.exit(answer.exit);
         return reply(id, answer.error ? { error: answer.error } : { result: anchored(answer.result) });
       }
+      case "config/read":
+        return configRead(id);
       case "thread/start": {
         if (params.dynamicTools && !experimental) return rpcError(id, -32600, "dynamicTools requires capabilities.experimentalApi");
         if (!["read-only", "workspace-write"].includes(params.sandbox) || params.approvalPolicy !== "never") return rpcError(id, -32602, "invalid sandbox/approvalPolicy");

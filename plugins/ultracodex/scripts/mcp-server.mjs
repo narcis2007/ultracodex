@@ -101,7 +101,8 @@ export const TOOLS = [
     name: "codex_sessions",
     description:
       "List Codex sessions: the ones this Claude session started, or everyone's with all=true. Per session: runId, label, state (queued, running, backoff, idle, dormant, closed, cancelled, failed), turn, turnActive, " +
-      "waitingForAnswer (and the pending question), idleUntil, owner (mine/other/none). A dormant session is revived by codex_send. Also says which owner id this server uses (ownerSource).",
+      "waitingForAnswer (and the pending question), idleUntil, owner (mine/other/none). A dormant session is revived by codex_send. Also says which owner id this server uses (ownerSource). " +
+      "A running Workflow node (a review lens, a verifier, ...) is listed too, with steerable:true and its label: steer it with codex_send mode steer, stop it with codex_interrupt; it takes no follow-up and ends with its turn.",
     inputSchema: object({ all: { type: "boolean", description: "include sessions of other Claude sessions" } }),
     readOnly: true,
   },
@@ -110,7 +111,8 @@ export const TOOLS = [
     description:
       "Send a message to a Codex session. While a turn runs (mode auto or steer) it is a steer: Codex reads it at its next step boundary, after the command or tool call it is in the middle of, so give one clear instruction, not a stream of corrections. " +
       "When the session is idle or dormant (a dormant one is revived), or with mode queue, it starts the next turn on the same thread: same context, effort and schema, so write a complete instruction. " +
-      "Returns {outcome: steered | started | queued | rejected | pending, turn}. codex_interrupt stops a turn now.",
+      "Returns {outcome: steered | started | queued | rejected | pending, turn}. codex_interrupt stops a turn now. " +
+      "A Workflow node (steerable:true in codex_sessions) can only be steered while it runs (mode steer or auto): queue is rejected (reason single_turn) because the node ends with its turn.",
     inputSchema: object(
       {
         runId: runIdProp,
@@ -350,6 +352,7 @@ const HANDLERS = {
       const entry = {
         runId: run.runId,
         label: run.label,
+        ...(run.steerable ? { steerable: true } : {}),
         state: run.state,
         turn: run.turn,
         turnActive: run.turnActive,

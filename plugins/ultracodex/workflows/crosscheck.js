@@ -18,11 +18,16 @@ export const meta = {
 //   • the final text when there is no schema;
 //   • or { _codex_error: true, kind, message, retryable, runId } — "no data", never a
 //     pass or a refutation. Test with isCodexError(x) before using a result.
+// Steering: a node runs steerable by default (opts.steerable, default true): the runner drives it as one turn of a
+// session on a private codex app-server, so the owner — or the main Claude session, through codex_sessions /
+// codex_send / codex_interrupt — can steer or stop it while it runs, find it by its label and watch its events.
+// Same request, same result, same signatures; if the runner cannot run it that way it runs it on codex exec, and
+// steerable: false (or ULTRACODEX_NODE_BACKEND=exec in the runner's environment) always does.
 // Routing (runner policy): tier 'light' → gpt-6-luna@max · 'daily' → gpt-6.1-sol@xhigh
 // for every kind · 'final' → gpt-6-astra@max for exceptional critical work. Pin
 // model/effort only to override with a reason. Concurrency is capped intrinsically: 4 Codex jobs
 // per workflow, an astra job counting as 2 — do not wrap calls in another gate.
-const UCX_VERSION = '0.5.0'
+const UCX_VERSION = '0.6.0'
 const UCX_RELAY = 'ultracodex:codex-relay'
 const UCX_TIER_MODEL = { light: 'gpt-6-luna', daily: 'gpt-6.1-sol', final: 'gpt-6-astra' }
 const UCX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
@@ -376,7 +381,8 @@ function ucxUnwrap(env, raw, expected = {}) {
       return ucxError('unauthenticated_result', 'the result is not signed by this machine\'s runner for this request — not trusted', env.runId)
     }
     const prov = { runId: env.runId, threadId: p.threadId, model: p.model, effort: p.effort, tier: p.tier,
-      usage: p.usageTotal || p.usage, durationMs: p.durationMs, attempts: p.attempts, accountHandoffs: p.accountHandoffs || 0, limitResumes: p.limitResumes || 0, contextRestarts: p.contextRestarts || 0, codexVersion: p.codexVersion, slotLost: p.slotLost || false }
+      usage: p.usageTotal || p.usage, durationMs: p.durationMs, attempts: p.attempts, accountHandoffs: p.accountHandoffs || 0, limitResumes: p.limitResumes || 0, contextRestarts: p.contextRestarts || 0, codexVersion: p.codexVersion, slotLost: p.slotLost || false,
+      backend: p.backend, steers: p.steers || 0 }
     ucxRecordUsage(prov)
     if (wantsResult) {
       Object.defineProperty(env.result, '_codex', { value: prov, enumerable: false })
@@ -401,7 +407,7 @@ function codexNode(task, opts = {}) {
   // orphanAfterSec 900: a collector may queue behind other agents before it resumes polling.
   // An unpolled run is not torn down (onOrphan: finish is the runner's default): a resumed workflow joins it.
   const { schema = null, schemaPreset = null, tier = 'daily', kind = 'verify', model, effort, cwd, timeoutSec,
-    maxAttempts = 2, orphanAfterSec = 900, workItems = 1, serviceTier, limitWaitSec, label, phase, meta } = opts
+    maxAttempts = 2, orphanAfterSec = 900, workItems = 1, serviceTier, limitWaitSec, steerable = true, label, phase, meta } = opts
   if (typeof task !== 'string' || !task.trim()) throw new Error('codexNode: task must be a non-empty string')
   if (!UCX_TIER_MODEL[tier]) throw new Error('codexNode: tier must be light, daily or final')
   if (!UCX_KINDS.includes(kind)) throw new Error('codexNode: kind must be verify, ask or review (implementation is not a workflow node)')
@@ -415,6 +421,7 @@ function codexNode(task, opts = {}) {
   if (!(Number.isInteger(workItems) && workItems >= 1 && workItems <= 256)) throw new Error('codexNode: workItems must be an integer 1..256')
   if (serviceTier !== undefined && !['default', 'priority'].includes(serviceTier)) throw new Error('codexNode: serviceTier must be default or priority')
   if (limitWaitSec !== undefined && !(Number.isInteger(limitWaitSec) && limitWaitSec >= 0 && limitWaitSec <= 691200)) throw new Error('codexNode: limitWaitSec must be an integer 0..691200')
+  if (typeof steerable !== 'boolean') throw new Error('codexNode: steerable must be true or false')
 
   const text = ucxNormalize(task)
   const wantsResult = Boolean(schema || schemaPreset)
@@ -428,6 +435,7 @@ function codexNode(task, opts = {}) {
   if (workItems > 1) base.workItems = workItems                     // the runner scales the deadline for a batch
   if (serviceTier) base.serviceTier = serviceTier
   if (limitWaitSec !== undefined) base.limitWaitSec = limitWaitSec    // how long a usage-limited run waits for the limit to reset (runner default: 24 h)
+  if (steerable) base.steerable = true                                // signed with the rest: a relay cannot add or drop it. Omitted when false, so a runner that predates the field still accepts the request
   if (schemaPreset) base.schemaPreset = schemaPreset
   if (label) base.label = String(label).replace(/[^\w .:/@#+=-]/g, '_').slice(0, 120)
   if (meta !== undefined) base.meta = meta

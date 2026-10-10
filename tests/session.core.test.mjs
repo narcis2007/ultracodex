@@ -94,6 +94,9 @@ test("buildAppServerArgs: hermetic disables, sandbox settings, service tier", ()
   assert.ok(readOnly.includes('mcp_servers."d.e".enabled=false'), "a name that is not a bare key is quoted");
   assert.ok(!readOnly.some((arg) => arg.startsWith("sandbox_workspace_write")), "no write settings for a read-only session");
   assert.ok(!readOnly.some((arg) => arg.startsWith("windows.sandbox")), "no Windows setting off Windows");
+  assert.equal(readOnly.at(-1), 'service_tier="default"', "a hermetic session always states its service tier (the user's own never applies)");
+  assert.equal(buildAppServerArgs({ ...base, serviceTier: "priority" }, { platform: "linux" }).filter((arg) => arg.startsWith("service_tier")).join(), 'service_tier="priority"');
+  assert.equal(buildAppServerArgs({ ...base, hermetic: false }, { platform: "linux" }).some((arg) => arg.startsWith("service_tier")), false, "a non-hermetic session leaves the user's config alone");
   assert.ok(buildAppServerArgs(base, { platform: "win32", windowsSandbox: "elevated" }).includes('windows.sandbox="elevated"'));
   const open = buildAppServerArgs({ ...base, hermetic: false, sandbox: "workspace-write", network: true, addDirs: ["/c/x y"], serviceTier: "priority" }, { platform: "win32", windowsSandbox: "elevated", mcpServers: ["a"] });
   assert.deepEqual(open, ["app-server", "--listen", "stdio://", "-c", "sandbox_workspace_write.network_access=true", "-c", 'sandbox_workspace_write.writable_roots=["/c/x y"]', "-c", 'service_tier="priority"']);
@@ -163,7 +166,10 @@ test("a session runs one turn on a private app-server; wait returns the turn's e
   assert.equal(turnStart.effort, "medium");
   assert.deepEqual(turnStart.outputSchema, SCHEMA);
   assert.deepEqual(turnStart.input, [{ type: "text", text: "do it\nFAKE_ANSWER=hello", text_elements: [] }]);
-  assert.deepEqual(requests(log).map((entry) => entry.method).slice(0, 4), ["initialize", "initialized", "thread/start", "mcpServerStatus/list"], "the hermetic check comes before the first turn");
+  assert.deepEqual(requests(log).map((entry) => entry.method).slice(0, 5), ["initialize", "initialized", "config/read", "thread/start", "mcpServerStatus/list"], "the isolation check (config/read) comes before the thread, the MCP check before the first turn");
+  assert.deepEqual(requests(log, "config/read")[0].params, { cwd: process.cwd(), includeLayers: false });
+  assert.equal(start.approvalsReviewer, "user", "the user's own auto_review reviewer never applies to a hermetic thread");
+  assert.ok(spawns(log)[0].flags.includes('service_tier="default"'), "the service tier is stated even when the request names none");
 
   // status and result
   const status = (await runCli(["status", runId], { env })).json.runs[0];
