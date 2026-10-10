@@ -7,6 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { continuationPrompt } from "../plugins/ultracodex/scripts/codex-node.mjs";
 import { announce, eventually, fastEnv, frame, makeHome, runCli, signedHeader, startAndWait, writeRequest } from "./helpers.mjs";
 
 const SECRET_ACCOUNT = "ACCOUNT-ID-MUST-NOT-LEAK";
@@ -42,11 +43,14 @@ function limitHome(t, answers, extraEnv = {}) {
   fs.writeFileSync(rateLimits, JSON.stringify(answers.map(({ resetsAt, ...answer }) => answer)));
   const argvLog = path.join(home, "argv.jsonl");
   const probeLog = path.join(home, "probe.jsonl");
-  const env = fastEnv(home, { FAKE_CODEX_RATE_LIMITS: rateLimits, FAKE_CODEX_PROBE_LOG: probeLog, FAKE_CODEX_ARGV_LOG: argvLog, FAKE_CODEX_STATE: path.join(home, "fake-state"), ...extraEnv });
-  return { home, env, argvLog, probeLog };
+  const promptsLog = path.join(home, "prompts.jsonl");
+  const env = fastEnv(home, { FAKE_CODEX_RATE_LIMITS: rateLimits, FAKE_CODEX_PROBE_LOG: probeLog, FAKE_CODEX_ARGV_LOG: argvLog, FAKE_CODEX_PROMPTS_LOG: promptsLog, FAKE_CODEX_STATE: path.join(home, "fake-state"), ...extraEnv });
+  return { home, env, argvLog, probeLog, promptsLog };
 }
 
 const jsonLines = (file) => (fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : []);
+// the prompts the fake Codex was given, one per attempt (the runner ends the stdin text with a newline)
+const promptsOf = (promptsLog) => jsonLines(promptsLog).map((entry) => entry.prompt.replace(/\n$/, ""));
 const probeReads = (probeLog) => jsonLines(probeLog).filter((entry) => entry.method === "account/rateLimits/read").length;
 const runFile = (home, runId, name) => path.join(home, "runs", runId, name);
 const readState = (home, runId) => JSON.parse(fs.readFileSync(runFile(home, runId, "state.json"), "utf8"));
@@ -65,7 +69,7 @@ test("a usage-limited job waits for the reset, then resumes its thread with the 
   // blocked until a reset 3 s away, then allowed: the second probe must come right after the
   // reset (the regular cadence is a minute), not from a timer
   const answers = [limitAnswer({ allowed: false, resetsInSec: 3 }), limitAnswer({ allowed: true, usedPercent: 0 })];
-  const { home, env, argvLog, probeLog } = limitHome(t, answers, { ULTRACODEX_LIMIT_WAIT_SEC: "120", ULTRACODEX_LIMIT_PROBE_MS: "60000" });
+  const { home, env, argvLog, probeLog, promptsLog } = limitHome(t, answers, { ULTRACODEX_LIMIT_WAIT_SEC: "120", ULTRACODEX_LIMIT_PROBE_MS: "60000" });
   const { started, final } = await startAndWait(env, usageLimited(home, { sandbox: "workspace-write", timeoutSec: 30 }), { home });
   assert.equal(final.ok, true, JSON.stringify(final));
   assert.equal(final.runId, started.json.runId);
@@ -84,6 +88,11 @@ test("a usage-limited job waits for the reset, then resumes its thread with the 
   assert.equal(provenance.threadId, thread);
   assert.ok(calls[1].argv.includes('sandbox_mode="workspace-write"'));
   assert.ok(calls[1].argv.includes("sandbox_workspace_write.network_access=false"));
+  // the resume says why the attempt was stopped and repeats the request it was working on
+  const prompts = promptsOf(promptsLog);
+  assert.equal(prompts[0], usageLimited(home).task, "the first attempt got the task as it is");
+  assert.equal(prompts[1], continuationPrompt("reset", usageLimited(home).task));
+  assert.match(prompts[1], /the usage limit was reached and has now reset/);
 
   // two probes (at entry, and right after the reset), both read-only
   assert.equal(probeReads(probeLog), 2);
@@ -110,7 +119,7 @@ test("a usage-limited job waits for the reset, then resumes its thread with the 
 
 test("while a limit wait runs, status and wait show backoff, waitingForLimit and resumesAt; an account switch ends it", async (t) => {
   const blocked = limitAnswer({ allowed: false, resetsAt: Math.floor(Date.now() / 1000) + 3600 });
-  const { home, env, argvLog, probeLog } = limitHome(t, [blocked], { ULTRACODEX_LIMIT_WAIT_SEC: "600" });
+  const { home, env, argvLog, probeLog, promptsLog } = limitHome(t, [blocked], { ULTRACODEX_LIMIT_WAIT_SEC: "600" });
   const runId = await start(env, home, usageLimited(home));
   assert.ok(await inLimitWait(home, runId), "the run entered the limit wait");
   // a wait that returns at once; resumesAt appears with the first probe
@@ -142,6 +151,9 @@ test("while a limit wait runs, status and wait show backoff, waitingForLimit and
   const calls = jsonLines(argvLog);
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[1].argv.slice(0, 3), ["exec", "resume", final.json.provenance.threadId]);
+  const resumePrompt = promptsOf(promptsLog)[1];
+  assert.equal(resumePrompt, continuationPrompt("usage_limit", usageLimited(home).task));
+  assert.match(resumePrompt, /the usage limit was reached and the ChatGPT account was then switched/);
   const done = (await runCli(["status", runId], { env })).json.runs[0];
   assert.equal(done.waitingForLimit, undefined, "finished runs report no wait");
 });

@@ -32,7 +32,6 @@ import path from "node:path";
 import process from "node:process";
 
 import {
-  ACCOUNT_CONTINUATION,
   INBOX_ID_RE,
   MAX_ACCOUNT_HANDOFFS,
   MAX_TASK_BYTES,
@@ -49,6 +48,7 @@ import {
   classifyFailure,
   compact,
   compactEnvelope,
+  continuationPrompt,
   directDigest,
   extractJsonObject,
   failureEnvelope,
@@ -1827,7 +1827,7 @@ class SessionDriver {
       if (!(!request.ephemeral && typeof thread === "string" && SESSION_RE.test(thread) && chain.handoffs < MAX_ACCOUNT_HANDOFFS && context.recoveryDeadlineAt - Date.now() >= minWork)) return null;
       chain.handoffs += 1;
       this.log(`continuing the thread on the newly selected account (handoff ${chain.handoffs - chain.limitResumes})`);
-      return { item: null, text: ACCOUNT_CONTINUATION, reason: "continuation", images: [], deadlineAt: context.recoveryDeadlineAt, restart: true };
+      return { item: null, text: continuationPrompt("switch", chain.text), reason: "continuation", images: [], deadlineAt: context.recoveryDeadlineAt, restart: true };
     }
     if (kind === "encrypted_history" && chain.handoffs > chain.checkpointHandoff && context.recoveryDeadlineAt - Date.now() >= minWork) {
       // the new account cannot read the saved reasoning: continue from the visible history in a
@@ -1880,7 +1880,7 @@ class SessionDriver {
       this.log(change.reset
         ? `usage is available again; continuing the thread (limit resume ${chain.limitResumes}, ${Math.round((context.recoveryDeadlineAt - Date.now()) / 1000)} s of work time left)`
         : `continuing the thread on the newly selected account (handoff ${chain.handoffs - chain.limitResumes})`);
-      return { item: null, text: ACCOUNT_CONTINUATION, reason: "continuation", images: [], deadlineAt: context.recoveryDeadlineAt, restart: Boolean(change.changed) };
+      return { item: null, text: continuationPrompt(change.reset ? "reset" : kind, chain.text), reason: "continuation", images: [], deadlineAt: context.recoveryDeadlineAt, restart: Boolean(change.changed) };
     }
     if (change.expired) this.log(`the usage limit did not reset within ${request.limitWaitSec} s; giving up`);
     return null;

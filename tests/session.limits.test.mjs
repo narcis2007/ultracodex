@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { ACCOUNT_CONTINUATION } from "../plugins/ultracodex/scripts/codex-node.mjs";
+import { continuationPrompt } from "../plugins/ultracodex/scripts/codex-node.mjs";
 import { eventually, pidAlive, runCli } from "./helpers.mjs";
 import { hasResult, jsonLines, readJson, readState, requests, runDir, send, serverSpawns, sessionEvents, sessionHome, startSession, untilEvent, untilState, wait } from "./helpers-session.mjs";
 
@@ -58,7 +58,7 @@ test("a usage-limited turn waits for the reset, then continues the same thread o
   assert.equal(requests(calls(), "thread/resume").length, 0);
   const texts = turnTexts(calls());
   assert.equal(texts.length, 2);
-  assert.equal(texts[1], ACCOUNT_CONTINUATION, "the existing continuation prompt, not the task again");
+  assert.equal(texts[1], continuationPrompt("reset", limited(work)), "the continuation notice with the interrupted request, not the bare task again");
   assert.equal(fs.readFileSync(work, "utf8"), "applied once\n", "the work was not replayed");
   const provenance = final.json.provenance;
   assert.equal(provenance.limitResumes, 1);
@@ -101,7 +101,7 @@ test("an account switch during the wait restarts the app-server, resumes the thr
   assert.deepEqual([resume.threadId, resume.sandbox, resume.approvalPolicy], [final.json.provenance.threadId, "workspace-write", "never"]);
   const methods = requests(calls()).map((entry) => `${entry.pid === firstServer ? "old" : "new"}:${entry.method}`);
   assert.ok(methods.indexOf("new:thread/resume") < methods.indexOf("new:mcpServerStatus/list") && methods.indexOf("new:mcpServerStatus/list") < methods.lastIndexOf("new:turn/start"), "resume, hermetic check, then the continuation");
-  assert.equal(turnTexts(calls())[1], ACCOUNT_CONTINUATION);
+  assert.equal(turnTexts(calls())[1], continuationPrompt("usage_limit", limited(work)), "the usage limit, then the account switch");
   assert.equal(fs.readFileSync(work, "utf8"), "applied once\n");
   assert.deepEqual(sessionEvents(home, runId).filter((event) => event.type === "resumed").map((event) => event.reason), ["account_change"]);
   assert.deepEqual(serverSpawns(calls())[1].flags.filter((flag) => flag.startsWith("sandbox_workspace_write")).length, 2);
@@ -299,4 +299,20 @@ test("an ephemeral session still ends instead of sleeping when the account chang
   assert.ok(await eventually(() => hasResult(home, runId), { timeoutMs: 20_000 }));
   assert.equal(readJson(path.join(runDir(home, runId), "result.json")).state, "closed");
   assert.equal(eventTypes(home, runId).includes("dormant"), false);
+});
+
+test("a usage limit on a follow-up turn: the continuation names the follow-up, not the first task", async (t) => {
+  const { home, env, calls, work } = limitHome(t, [limitAnswer({ allowed: false, resetsInSec: 3 }), limitAnswer({ allowed: true, usedPercent: 0 })]);
+  const runId = await startSession(env, home, { task: "first job\nFAKE_ANSWER=one", tier: "light" });
+  assert.equal((await wait(env, runId)).json.text, "one");
+  const followUp = limited(work);
+  assert.equal((await send(env, runId, followUp)).json.outcome, "started");
+  const final = await wait(env, runId, 60);
+  assert.deepEqual([final.json.ok, final.json.session.turn], [true, 3], final.stdout);
+  const texts = turnTexts(calls());
+  assert.equal(texts.length, 3);
+  assert.equal(texts[2], continuationPrompt("reset", followUp));
+  assert.ok(texts[2].includes("<<<\nimplement once"), "the interrupted turn's request");
+  assert.ok(!texts[2].includes("first job"));
+  assert.match(texts[2], /\(the usage limit was reached and has now reset\)/);
 });

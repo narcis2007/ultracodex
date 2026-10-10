@@ -78,7 +78,11 @@ whichever comes first, then runs `codex exec resume` for that exact thread:
   between resumes), so a limit the verdict does not reflect cannot burn the 8 continuations.
 
 Claude keeps polling the same job and receives its original authenticated result.
-The continuation keeps the original model, schema, directory, sandbox and network
+The continuation's input is a factual system notice — the previous turn was stopped by the system before it
+was finished, why (account switched, usage limit reset, ...), that the request is not complete — followed by
+the request it interrupted (the original task, or the follow-up message; clipped to 8000 characters) and the
+instruction to do the remaining steps without repeating completed ones; a bare "continue" let a model take
+a handoff at a step boundary for the end of its work. The continuation keeps the original model, schema, directory, sandbox and network
 permissions (a resume restates them on every call: `codex exec resume` alone
 would run read-only). Time spent waiting does not count against the job's deadline.
 While waiting, `status` and `wait` show `backoff` with `waitingForLimit: true`,

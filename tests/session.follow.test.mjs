@@ -10,7 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { ACCOUNT_CONTINUATION, MAX_ACCOUNT_HANDOFFS } from "../plugins/ultracodex/scripts/codex-node.mjs";
+import { MAX_ACCOUNT_HANDOFFS, continuationPrompt } from "../plugins/ultracodex/scripts/codex-node.mjs";
 import { RUNNER, eventually, runCli } from "./helpers.mjs";
 import { readJson, readState, requests, runDir, send, serverSpawns, sessionEvents, sessionHome, startSession, untilEvent, untilState, wait } from "./helpers-session.mjs";
 
@@ -63,7 +63,7 @@ test("a switch during a model step is followed within seconds: the turn is inter
   const resume = requests(calls(), "thread/resume")[0].params;
   assert.deepEqual([resume.threadId, resume.sandbox], [final.json.provenance.threadId, "workspace-write"], "same thread, same sandbox");
   assert.equal(requests(calls(), "turn/interrupt").length, 1);
-  assert.deepEqual(turnTexts(calls())[1], ACCOUNT_CONTINUATION);
+  assert.deepEqual(turnTexts(calls())[1], continuationPrompt("switch", "long\nFAKE_TURN_MS=30000"));
   assert.ok(requests(calls(), "mcpServerStatus/list").length >= 2, "the hermetic check ran on the new app-server too");
   await pause(500);
   assert.equal(readState(home, runId).state, "idle", "the new app-server started after the switch: nothing more to follow");
@@ -278,4 +278,22 @@ test("a switch that is real again after a cancelled one is followed", async (t) 
   assert.deepEqual([final.json.ok, final.json.session.turn], [true, 2], final.stdout);
   assert.deepEqual(switches(home, runId), ["pending", "cancelled", "pending", "interrupting"]);
   assert.deepEqual(resumes(home, runId), ["account_change"]);
+});
+
+test("the continuation names the turn that was interrupted: a follow-up's text, not the first task", async (t) => {
+  const { home, env, calls, switchTo } = followHome(t);
+  const runId = await startSession(env, home, { task: "first job\nFAKE_ANSWER=one", tier: "light" });
+  assert.equal((await wait(env, runId)).json.text, "one");
+  const followUp = "second job: run the checks\nFAKE_TURN_MS=30000";
+  assert.equal((await send(env, runId, followUp)).json.outcome, "started");
+  assert.ok(await eventually(() => sessionEvents(home, runId).filter((event) => event.type === "command").length >= 2, { timeoutMs: 30_000, stepMs: 25 }), "the follow-up turn is running");
+  switchTo("account-b");
+  const final = await wait(env, runId, 60);
+  assert.deepEqual([final.json.ok, final.json.text, final.json.session.turn], [true, "continued", 3], final.stdout);
+  const texts = turnTexts(calls());
+  assert.deepEqual(texts.slice(0, 2), ["first job\nFAKE_ANSWER=one", followUp]);
+  assert.equal(texts[2], continuationPrompt("switch", followUp));
+  assert.ok(texts[2].includes("<<<\nsecond job: run the checks"), "the interrupted turn's request");
+  assert.ok(!texts[2].includes("first job"), "not the session's first task");
+  assert.match(texts[2], /\(the ChatGPT account was switched\)/);
 });

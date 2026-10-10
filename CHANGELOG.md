@@ -39,6 +39,14 @@ the one-shot behaviour and the Workflow path are unchanged.
   own cursor namespace; `ULTRACODEX_CHANNEL=0` turns it off. Registered only when Claude Code is started with
   `--dangerously-load-development-channels plugin:ultracodex@ultracodex`; otherwise the notifications are dropped
   silently and the tools work as before.
+- **Continuations say what happened.** The input of every continuation — after an account switch, after a usage limit and an account change,
+  after a limit reset; sessions and one-shot runs alike — is no longer the bare "continue the unfinished task" (live, a model with an output
+  schema took the handoff at a step boundary for the end and skipped the last command of its request). It is a factual "SYSTEM NOTICE (from
+  the ultracodex runner, not the user)": the previous turn was stopped by the system before it was finished, why (the ChatGPT account was
+  switched / the usage limit was reached and has now reset / …), that nothing in the request has changed and it is NOT complete, the request
+  it was working on (the interrupted turn's input: the original task, or the follow-up message; clipped to 8000 characters), and the
+  instructions to look at what is done, not repeat completed commands, edits or external actions, do the remaining steps and give the final
+  answer the request asks for. The checkpoint fallback's own prompt carries the same notice.
 - **PrimerSwitch: running work follows an account switch within seconds** (at the next step boundary; running commands are never stopped;
   `followAccountSwitch: false` to opt out). Until now a turn or an attempt that was running when the owner switched ChatGPT accounts
   went on, on the old account, until it finished or failed. Now, while it runs, the supervisor compares the managed account with the

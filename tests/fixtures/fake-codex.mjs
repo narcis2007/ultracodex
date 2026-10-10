@@ -12,6 +12,10 @@ import path from "node:path";
 
 const argv = process.argv.slice(2);
 
+// A continuation after the system stopped a turn (see continuationPrompt) repeats the interrupted request
+// between <<< and >>>: its FAKE_ lines and ASK: belong to that request, not to the turn that continues it.
+const withoutRequest = (text) => (text.startsWith("SYSTEM NOTICE") ? text.replace(/<<<[\s\S]*>>>/, "") : text);
+
 const CATALOG = {
   models: [
     {
@@ -154,7 +158,7 @@ if (argv[0] === "app-server") {
   };
   const textOf = (input) => (Array.isArray(input) ? input.filter((part) => part?.type === "text").map((part) => String(part.text ?? "")).join("\n") : "");
   const lineDirective = (text, name) => {
-    const match = new RegExp(`^FAKE_${name}=(.*)$`, "m").exec(text);
+    const match = new RegExp(`^FAKE_${name}=(.*)$`, "m").exec(withoutRequest(text));
     return match ? match[1].trim() : null;
   };
   const rpcError = (id, code, message, data) => reply(id, { error: { code, message, ...(data ? { data } : {}) } });
@@ -285,7 +289,7 @@ if (argv[0] === "app-server") {
     }
     let answered = null;
     const callTool = lineDirective(text, "CALL_TOOL");
-    const ask = callTool ? [null, "q"] : /^ASK: (.*)$/m.exec(text);
+    const ask = callTool ? [null, "q"] : /^ASK: (.*)$/m.exec(withoutRequest(text));
     if (ask) {
       const id = `srv-${++serverRequests}`;
       const call = item({ type: "dynamicToolCall", tool: "ask_orchestrator", namespace: null, arguments: { question: ask[1] }, status: "inProgress", contentItems: null, success: null, durationMs: null });
@@ -498,8 +502,10 @@ if (process.env.FAKE_CODEX_ARGV_LOG) {
 
 const prompt = fromStdin ? fs.readFileSync(0, "utf8") : "";
 if (process.env.FAKE_CODEX_PROMPT_LOG) fs.writeFileSync(process.env.FAKE_CODEX_PROMPT_LOG, prompt);
+// FAKE_CODEX_PROMPTS_LOG: every attempt's prompt, in order (a resume's included)
+if (process.env.FAKE_CODEX_PROMPTS_LOG) fs.appendFileSync(process.env.FAKE_CODEX_PROMPTS_LOG, JSON.stringify({ resume: resumeId, pid: process.pid, prompt }) + "\n");
 const directive = (name) => {
-  const match = new RegExp(`^FAKE_${name}=(.*)$`, "m").exec(prompt);
+  const match = new RegExp(`^FAKE_${name}=(.*)$`, "m").exec(withoutRequest(prompt));
   return match ? match[1].trim() : null;
 };
 const emit = (event) => process.stdout.write(JSON.stringify(event) + "\n");

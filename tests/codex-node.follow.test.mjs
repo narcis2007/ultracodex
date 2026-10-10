@@ -13,6 +13,7 @@ import test from "node:test";
 import {
   AttemptSwitchWatch,
   MAX_ACCOUNT_HANDOFFS,
+  continuationPrompt,
   managedAccountIdentity,
   validateRequest,
 } from "../plugins/ultracodex/scripts/codex-node.mjs";
@@ -27,10 +28,12 @@ function followHome(t, extra = {}) {
   const identity = path.join(home, "identity.txt");
   fs.writeFileSync(identity, "account-a");
   const argvLog = path.join(home, "argv.jsonl");
+  const promptsLog = path.join(home, "prompts.jsonl");
   const env = fastEnv(home, {
     ULTRACODEX_TEST_ACCOUNT_IDENTITY_FILE: identity,
     ULTRACODEX_ACCOUNT_CHECK_MS: "100",
     FAKE_CODEX_ARGV_LOG: argvLog,
+    FAKE_CODEX_PROMPTS_LOG: promptsLog,
     FAKE_CODEX_OUTPUT: "continued",
     ...extra,
   });
@@ -42,6 +45,8 @@ function followHome(t, extra = {}) {
     attempt: (runId, n) => path.join(home, "runs", runId, `attempt-${n}`),
     log: (runId) => fs.readFileSync(path.join(home, "runs", runId, "supervisor.log"), "utf8"),
     execCalls: () => jsonLines(argvLog),
+    // what each attempt was given on stdin (the runner ends it with a newline)
+    prompts: () => jsonLines(promptsLog).map((entry) => entry.prompt.replace(/\n$/, "")),
   };
 }
 
@@ -65,7 +70,7 @@ const streamHas = (file, text) => eventually(() => fs.existsSync(file) && fs.rea
 const threadOf = (file) => JSON.parse(fs.readFileSync(file, "utf8").split("\n").find((line) => line.includes("thread.started"))).thread_id;
 
 test("a switch during a model step: the attempt is stopped and its thread resumed on the new account, with the sandbox restated", async (t) => {
-  const { home, env, switchTo, attempt, log, execCalls } = followHome(t);
+  const { home, env, switchTo, attempt, log, execCalls, prompts } = followHome(t);
   const runId = await start(env, home, { task: "work\nFAKE_STEPS=model:30000", tier: "light", sandbox: "workspace-write", timeoutSec: 120 });
   const first = path.join(attempt(runId, 1), "events.jsonl");
   assert.ok(await streamHas(first, "thread.started"));
@@ -93,6 +98,12 @@ test("a switch during a model step: the attempt is stopped and its thread resume
   assert.match(text, /attempt 1: the managed account changed; stopping this attempt at the next step boundary/);
   assert.match(text, /stopping codex pid \d+: account_switch/);
   assert.match(text, /resuming the saved thread on the newly selected account \(handoff 1\)/);
+  // the resume says the system stopped the attempt, why, that the request is not complete, and repeats it
+  const [given, resumed] = prompts();
+  assert.equal(given, "work\nFAKE_STEPS=model:30000", "the first attempt got the task as it is");
+  assert.equal(resumed, continuationPrompt("switch", "work\nFAKE_STEPS=model:30000"));
+  assert.match(resumed, /^SYSTEM NOTICE \(from the ultracodex runner, not the user\): your previous turn was stopped by the system before it was finished \(the ChatGPT account was switched\)\./);
+  assert.ok(resumed.includes("<<<\nwork\nFAKE_STEPS=model:30000\n>>>"));
 });
 
 test("a switch during a command waits for it: the stream shows the command complete before the attempt is stopped", async (t) => {
