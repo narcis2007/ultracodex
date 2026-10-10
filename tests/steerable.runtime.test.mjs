@@ -38,6 +38,25 @@ test("a usage-limited node waits for the reset and continues its thread under th
   assert.equal(final.json.session, undefined);
 });
 
+test("close, interrupt and messages are handled while a node waits for a usage limit: close cancels, interrupt ends it interrupted, a steer has no turn to reach", async (t) => {
+  for (const command of ["close", "interrupt"]) {
+    const { home, env } = limitHome(t, [limitAnswer({ allowed: false, resetsInSec: 3600 })]);
+    const runId = await startNode(env, home, { task: "limited\nFAKE_USAGE_LIMIT=1", tier: "light", timeoutSec: 30 });
+    assert.ok(await untilEvent(home, runId, (event) => event.type === "limit_wait"));
+    const refused = await runCli(["send", runId, "--message", "hello", "--mode", "steer"], { env });
+    assert.deepEqual([refused.json.outcome, refused.json.reason], ["rejected", "no_active_turn"], "between turns: nothing to steer");
+    const queued = await runCli(["send", runId, "--message", "hello", "--mode", "queue"], { env });
+    assert.deepEqual([queued.json.outcome, queued.json.reason], ["rejected", "single_turn"]);
+    const startedAt = Date.now();
+    const out = await runCli([command, runId], { env });
+    assert.equal(out.json.ok, true, `${command}: ${out.stdout}`);
+    const final = await wait(env, runId, 30);
+    assert.ok(Date.now() - startedAt < 25_000, "not after the hour the limit would take");
+    assert.deepEqual([final.json.ok, final.json.state], [false, command === "close" ? "cancelled" : "interrupted"], `${command}: ${final.stdout}`);
+    assert.equal(final.json.session, undefined);
+  }
+});
+
 test("an account switch while a node runs: handed over at a step boundary, the thread continues on a new app-server", async (t) => {
   const { home, env, calls, switchTo } = followHome(t);
   const task = "long\nFAKE_TURN_MS=30000";

@@ -393,13 +393,13 @@ const underKey = (key, name) => key === name || key.startsWith(`${name}.`);
 // Everything else from those two layers is a violation. → { ok, keys } (keys: names only, never values,
 // sorted, at most ~20; `more` counts the rest), or { ok: false, keys: ["<unverifiable>"] } when `origins`
 // is missing or malformed — a check that cannot judge proves nothing.
-export function isolationViolations(configRead, { request = {} } = {}) {
+export function isolationViolations(configRead, { request = null } = {}) {
   const origins = isPlainObject(configRead) ? configRead.origins : null;
   if (!isPlainObject(origins)) return { ok: false, keys: ["<unverifiable>"] };
   const config = isPlainObject(configRead.config) ? configRead.config : {};
   const features = isPlainObject(config.features) ? config.features : {};
   const servers = isPlainObject(config.mcp_servers) ? config.mcp_servers : {};
-  const writable = request.sandbox === "workspace-write";
+  const writable = request?.sandbox !== "read-only"; // not provably read-only: judged as a writing request
   const serverOf = (rest) => {
     // the longest effective server name the key starts with (a name may itself contain dots)
     let found = null;

@@ -1020,13 +1020,14 @@ export function validateRequest(raw, { catalog = null, requestDigest: signedDige
     profile: raw.profile ?? null,
     review,
     resume,
-    // Steerable job (see session.mjs, single-turn mode): the same driver as a session, for ONE turn and its
-    // continuations; the job ends with it. Steerable session: the supervisor drives a private `codex app-server` instead of `codex exec`
+    // Steerable session: the supervisor drives a private `codex app-server` instead of `codex exec`
     // (direct runs only; see session.mjs). idleTtlSec: how long the app-server stays up after a
     // turn when nothing is pending, then the session goes dormant (process gone, thread on disk,
     // revived by the next message). askTimeoutSec: an unanswered ask_orchestrator question gets an
     // automatic reply after this long.
     session,
+    // Steerable job: the same driver, for ONE turn and its continuations; the job ends with it (and, unlike a
+    // session, it is allowed in a relayed request: it is signed).
     steerable,
     idleTtlSec: session ? expectInteger(raw, "idleTtlSec", 0, 86_400, 1200) : null,
     askOrchestrator: session ? expectBoolean(raw, "askOrchestrator", true) : false,
@@ -4167,7 +4168,7 @@ export async function cmdWait(runId, { maxWaitSec = DEFAULT_MAX_WAIT_SEC, pretty
             retryable: false,
             message: state.session && !state.singleTurn
               ? "the session's supervisor stopped reporting (its app-server ends with it). `send` revives the session — the turn it was running is then recorded as failed — and `close` ends it; nothing is stopped automatically."
-              : `the supervisor stopped reporting; codex pid ${state.codexPid ?? "?"} may still be running. ` +
+              : `the supervisor stopped reporting; ${state.singleTurn ? "its codex app-server (a steerable job is never revived)" : `codex pid ${state.codexPid ?? "?"}`} may still be running. ` +
                 "It is NOT stopped automatically — check `status` and ask the owner before stopping anything.",
             status: null,
           },

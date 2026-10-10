@@ -137,6 +137,9 @@ test("isolationViolations: the sandbox_workspace_write keys are ours only for a 
   };
   assert.equal(judged(owned, writable).ok, true, "overridden by the flags");
   assert.deepEqual(judged((read) => { owned(read); read.origins["sandbox_workspace_write.exclude_tmpdir_env_var"] = user; }, writable).keys, ["sandbox_workspace_write.exclude_tmpdir_env_var"]);
+  const unknown = ownerLike();
+  unknown.origins["sandbox_workspace_write.exclude_slash_tmp"] = user;
+  assert.deepEqual(isolationViolations(unknown).keys, ["sandbox_workspace_write.exclude_slash_tmp"], "a request that is not provably read-only is judged as a writing one");
   assert.equal(judged((read) => { read.origins.windows = user; }).ok, false, "only windows.sandbox is carried on purpose");
   assert.equal(judged((read) => { read.origins["windows.sandbox_private_desktop"] = user; }).ok, false);
 });
