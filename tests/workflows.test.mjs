@@ -674,6 +674,37 @@ test("codexNode sends limitWaitSec only when given, validated, and the relay acc
   }
 });
 
+test("codexNode makes its nodes steerable in the signed header unless asked not to; batch nodes pass it through; provenance says which backend ran", async () => {
+  const headers = [];
+  const agent = async (prompt) => {
+    const { request, framed } = receive(prompt); // the runner's own validation, signature included
+    headers.push({ header: parseFramed(framed, { encoded: true }).header, request });
+    const provenance = { threadId: "01a0-thread", model: request.model, effort: request.effort, tier: request.tier, taskHash: request.taskHash, usage: { input_tokens: 100, output_tokens: 7 }, backend: "session", steers: 2, attempts: 1 };
+    return okEnvelope(request, { refuted: false, confidence: 1, reasoning: "r", results: [] }, { provenance });
+  };
+  const out = await runHelper([
+    "const a = await codexNode('default', { schemaPreset: 'verdict' })",
+    "await codexNode('off', { schemaPreset: 'verdict', steerable: false })",
+    "await codexNode('on', { schemaPreset: 'verdict', steerable: true })",
+    "await codexBatchNode('batch', [{ id: 'a' }])",
+    "await codexBatchNode('batch off', [{ id: 'a' }], { steerable: false })",
+    "const text = await codexNode('plain text', { kind: 'ask' })",
+    "return a._codex",
+  ], agent);
+  assert.equal(headers[0].header.steerable, true, "on by default, in the signed header");
+  assert.equal(headers[0].request.steerable, true);
+  assert.equal("steerable" in headers[1].header, false, "omitted when off: a runner that predates the field still accepts the request");
+  assert.equal(headers[1].request.steerable, false);
+  assert.equal(headers[2].header.steerable, true);
+  assert.equal(headers[3].header.steerable, true, "a batch node too");
+  assert.equal("steerable" in headers[4].header, false);
+  assert.equal(headers[5].header.steerable, true);
+  assert.deepEqual([out.backend, out.steers, out.attempts, out.runId, out.accountHandoffs], ["session", 2, 1, RUN_ID, 0]);
+  for (const bad of ["'yes'", "1", "null"]) {
+    await assert.rejects(runHelper([`await codexNode('x', { schemaPreset: 'verdict', steerable: ${bad} })`], agent), /steerable must be true or false/, bad);
+  }
+});
+
 test("the helper gate keeps at most 4 Codex jobs in flight, astra counting double", async () => {
   let active = 0;
   let peak = 0;

@@ -19,6 +19,11 @@
 // started it (state.json `owner`), and `notify` (scripts/notify.mjs) prints one line per actionable event
 // of that owner's sessions — for Claude Code's Monitor tool, the plugin monitor and the MCP server's channel.
 //
+// A request with `"steerable": true` (what the Workflow helper sends for every node) is a one-shot job that the
+// supervisor runs as ONE turn of such a session, so that the owner can steer or interrupt it while it runs; it ends
+// with its turn and its result is a one-shot run's. If the session backend cannot be started it runs on `codex exec`
+// after all, and ULTRACODEX_NODE_BACKEND=exec makes every such job do so.
+//
 // Every command prints exactly one JSON line tagged {"ultracodex":1,...} (`events` prints the
 // feed's own lines). Exit codes: 0 done/ok, 1 failed or rejected, 2 usage error, 3 still running.
 
@@ -4476,6 +4481,9 @@ export async function cmdPreflight({ live = false, pretty = false } = {}) {
     report.catalogError = error.message;
   }
   report.windowsSandbox = process.platform === "win32" ? readUserWindowsSandbox() : null;
+  // where a steerable job runs (ULTRACODEX_NODE_BACKEND=exec is the kill switch); the session backend verifies each
+  // app-server's isolation with config/read before any thread (see session.mjs), and falls back to exec when it cannot
+  report.nodeBackend = nodeBackend();
   if (process.platform === "win32") report.windowsJob = await probeWindowsJob();
   report.home = ucxHome();
   report.maxConcurrent = maxConcurrent();
@@ -4540,10 +4548,12 @@ export async function cmdDryRun(options) {
       ok: true,
       modelCallMade: false,
       codex: { path: launcher.displayPath, source: launcher.source },
-      // a session starts an app-server (its flags below), not `codex exec`
-      args: request.session
+      // a session (or a steerable job on the session backend) starts an app-server (its flags below), not `codex exec`
+      args: drivenBySession(request)
         ? buildAppServerArgs(request, { windowsSandbox: request.hermetic ? readUserWindowsSandbox() : null, mcpServers: request.hermetic ? configuredMcpServers() : [] })
         : buildCodexArgs(request, files, { windowsSandbox: request.hermetic ? readUserWindowsSandbox() : null }),
+      backend: drivenBySession(request) ? "session" : "exec",
+      ...(request.steerable ? { steerable: true } : {}),
       ...(request.session ? { session: true, idleTtlSec: request.idleTtlSec, askOrchestrator: request.askOrchestrator } : {}),
       model: request.model,
       effort: request.effort,
@@ -4592,6 +4602,11 @@ function helpText() {
     "  node codex-node.mjs status --mine                                only the runs this Claude session started",
     "  node codex-node.mjs status --sessions [--mine | --owner ID | --all] [--limit N]   only session runs, newest first (default 50)",
     "  node codex-node.mjs result RUN_ID [--turn N]                     the latest (or turn N's) envelope of a session",
+    "",
+    "  Steerable jobs (request \"steerable\": true — Workflow nodes are, by default): a one-shot job that runs as ONE turn of a session,",
+    "  so `send --mode steer`, `interrupt`, `events` and `close` (= cancel) reach it while it runs; queue-mode messages and answers are",
+    "  rejected, it ends with its turn, and `wait`/`result` print it as any one-shot run. Found by label in `status --sessions`.",
+    "  ULTRACODEX_NODE_BACKEND=exec runs every steerable job on codex exec instead.",
     "",
     "Exit codes: 0 done, 1 failed/rejected, 2 usage error, 3 still running.",
   ].join("\n");

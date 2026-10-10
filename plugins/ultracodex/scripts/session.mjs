@@ -21,6 +21,12 @@
 // (the supervisor's acknowledgement of each), turns/<n>.json (the envelope of turn n), queue/
 // (accepted follow-ups not yet started) and supervisor.lock (one supervisor at a time).
 //
+// A steerable job (request `"steerable": true`: every Workflow node, relayed ones included) is the same driver in
+// single-turn mode (`runSession({single: true})`, see runJob): one turn of a session, so the job can be steered
+// while it runs, and it ends with that turn — its envelope is a one-shot run's. Before it may run that way a
+// hermetic app-server's isolation is verified with config/read (isolationViolations), and a job whose first turn
+// cannot be started is handed back to the caller to run on `codex exec` (`{fallback}`).
+//
 // This module imports the runner back (codex-node.mjs imports it too): every name taken from it
 // is only ever used inside a function, never at load time.
 
@@ -1841,7 +1847,7 @@ class SessionDriver {
     const provenance = buildProvenance(request, {
       backend: "session",
       threadId: this.threadId,
-      usage: turn.usage,
+      usage: turn.usage ?? (this.single ? this.usageTotal : null), // a node's result is trusted only with token usage: a turn that reported none shows the job's total
       usageTotal: this.usageTotal,
       durationMs,
       ...(this.single ? { attempts: turn.n } : {}), // the turns this job has taken, as a one-shot run counts its attempts

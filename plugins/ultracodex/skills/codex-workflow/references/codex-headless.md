@@ -25,7 +25,7 @@ shell. Every command prints one JSON line tagged `{"ultracodex":1,...}`; exit co
 | `preflight [--live]` | CLI, auth, catalog, policy models, home dir; `--live` = one tiny luna call |
 | `dry-run --request FILE` | show the exact codex argv, model, effort, deadline — no model call |
 | `policy` · `models` · `schema PRESET` · `schema-check --schema FILE` · `gc` | helpers (`gc` also removes dormant sessions older than `--older-than-days`) |
-| `send` · `interrupt` · `answer` · `events` · `close` · `result RUN --turn N` | steerable sessions — see "Sessions" below; never for relays or readers |
+| `send` · `interrupt` · `answer` · `events` · `close` · `result RUN --turn N` | steerable sessions and steerable Workflow nodes — see "Sessions" and "Steerable nodes" below; never for relays or readers |
 
 Request fields (unknown fields are rejected): `task` or `taskFile`; `schema` / `schemaFile` /
 `schemaPreset` (`verdict`, `score`, `review`, `implement`); `cwd`; `sandbox` (`read-only` default,
@@ -42,13 +42,15 @@ reset before failing with `usage_limit`; 0 = only the 15-minute account wait); `
 `label`; `meta` (echoed back); `serviceTier` (`priority` = Fast); `addDirs`; `images`;
 `profile`; `review: {base|commit|uncommitted, title}`; `resume: {sessionId}`; for a session (direct runs only):
 `session` (default false), `idleTtlSec` (0–86400, default 1200), `askOrchestrator` (default true), `askTimeoutSec` (60–86400,
-default 1800) — see "Sessions".
+default 1800) — see "Sessions"; `steerable` (default false; allowed in relayed requests, where it is signed — the Workflow
+helper sends it for every node) — see "Steerable nodes".
 
 Envelope: `ok: true` + `result` (schema) or `text` — never both —, `resultHash` (FNV-1a of the
 body, so a relay's transcription can be verified), `mac` (see "Signed requests and results"),
 and `provenance` {threadId, model, effort, tier, mode, sandbox, hermetic, usage (last attempt),
 usageTotal (all attempts), durationMs, attempts, codexVersion, launcher, taskHash, teardown,
-slotLost, accountHandoffs, limitResumes, limitWaitedSec}. Failures: `ok: false`, `state` (`failed`, `timeout`, `cancelled`, `abandoned`,
+slotLost, accountHandoffs, limitResumes, limitWaitedSec, backend (`exec` | `session`: where it ran), steers (steering
+messages a steerable node accepted; absent when none)}. Failures: `ok: false`, `state` (`failed`, `timeout`, `cancelled`, `abandoned`,
 `rejected`, `lost`) and `error` {kind, retryable, message}.
 
 ### Signed requests and results
@@ -268,8 +270,9 @@ other fields need `session: true`) makes the supervisor drive a private
 
 **Wire.** Spawn `<launcher> app-server --listen stdio://` (+ flags below) in the Job Object like `exec`; `initialize`
 `{clientInfo, capabilities: {experimentalApi: true}}` (required for `dynamicTools`) then `initialized`;
-`thread/start` `{model, cwd, sandbox, approvalPolicy: "never", ephemeral, dynamicTools?, serviceTier?}` or
-`thread/resume` `{threadId, sandbox, approvalPolicy: "never", model, excludeTurns: true}` (every revive, every account-change
+`config/read` (hermetic only, see "Verified isolation"), then
+`thread/start` `{model, cwd, sandbox, approvalPolicy: "never", approvalsReviewer: "user" (hermetic), ephemeral, dynamicTools?, serviceTier?}` or
+`thread/resume` `{threadId, sandbox, approvalPolicy: "never", approvalsReviewer: "user" (hermetic), model, excludeTurns: true}` (every revive, every account-change
 restart, and the first start of `resume` mode — the resumed sandbox is honoured, dynamic tools registered at `thread/start`
 are restored; a resumed external thread cannot gain `ask_orchestrator`); `turn/start` `{threadId, input, effort,
 outputSchema?}` (`localImage` items for `images`); `turn/steer` `{threadId, expectedTurnId, input}`; `turn/interrupt`;
@@ -280,9 +283,31 @@ with the Job Object like any run's tree, and whatever it left behind goes too. H
 `app-server`): `--disable plugins --disable apps -c notify=[]`, `-c mcp_servers.<name>.enabled=false` for every
 `[mcp_servers.<name>]` table (bare or quoted; also `name = {…}` under `[mcp_servers]` and dotted top-level keys) in
 `$CODEX_HOME/config.toml`, the Windows sandbox `-c`; workspace-write adds `sandbox_workspace_write.network_access` and
-`writable_roots` (= `addDirs`); `serviceTier` → `-c service_tier`. After every `thread/start|resume` a hermetic run calls
+`writable_roots` (= `addDirs`); `-c service_tier="<serviceTier>"` (a hermetic run always states it, `"default"` unless the request
+names one; a non-hermetic one only when named). After every `thread/start|resume` a hermetic run calls
 `mcpServerStatus/list` (following `nextCursor`): any server with tools — or a list that cannot be read — stops the app-server
 and ends the run as `hermetic_violation` before a turn starts.
+
+**Verified isolation (0.6.0).** The flags above only switch things off; what else the user's `config.toml` (or a project's
+`.codex/config.toml`) contributes is *verified*, not assumed: right after `initialize` and before any thread, a hermetic
+app-server is asked `config/read {cwd, includeLayers: false}` (60 s; `ULTRACODEX_CONFIG_READ_TIMEOUT_MS`) and
+`isolationViolations()` judges the answer — the effective `config` and, for every effective dotted key, the layer it came from
+(`origins[key].name.type`: `packagedDefaults`, `mdm`, `system`, `enterpriseManaged`, `user`, `project`, `sessionFlags`,
+`legacyManagedConfigToml…`). Only keys whose origin is `user` or `project` are judged (defaults, managed layers and our own flags
+apply to `codex exec --ignore-user-config` too). Allowed: **inert** client / UI / bookkeeping keys (`tui.*`, `desktop.*`,
+`notice.*`, `marketplaces.*`, `projects.*`, `profiles.*` — definitions only, a top-level `profile` is a violation —, `history.*`,
+`analytics.*`, `feedback.*`, `file_opener`, `check_for_update_on_startup`, `disable_paste_burst`, `hide_agent_reasoning`,
+`suppress_unstable_features_warning`); **neutralized** keys, judged by the *effective* value (the origins of array elements go
+stale after `-c`): `plugins.*` iff `features.plugins` is false, `apps.*` iff `features.apps` is false, `mcp_servers.<n>.*` iff
+that server's effective `enabled` is false, `notify` / `notify.*` iff the effective `notify` is empty; **driver-owned** keys (set
+on every thread / turn): `model`, `model_reasoning_effort`, `approval_policy`, `approvals_reviewer`, `sandbox_mode`,
+`service_tier`, and `sandbox_workspace_write.*` for a read-only request (for workspace-write only the two keys passed with `-c`);
+and `windows.sandbox` (exec carries it too). Anything else from those layers — `developer_instructions`, `instructions`,
+`model_instructions_file`, `model_provider(s)`, `profile`, `shell_environment_policy.*`, `hooks.*`, other `features.*`, `tools.*`,
+`web_search`, `model_verbosity`, `model_reasoning_summary`, `otel.*`, `skills.*`, an MCP server that is not disabled, … — is a
+violation. A violation, an error (an older Codex without `config/read`), an unreadable answer or a timeout is
+`hermetic_violation` (fail closed): event `hermetic_violation {keys}` (names only, never values; `<unverifiable>` when it could not
+be judged), the app-server is stopped, no thread is started. The MCP check above stays as the second check.
 
 **State machine.** `queued` (starting, waiting for a slot) → `running` (turn active; `steerable` false after
 `activeTurnNotSteerable`) → `idle` (`idleUntil`; events `idle`) → `dormant` (stdin closed, process gone, lock released, the
@@ -331,6 +356,52 @@ or idle work looks at the managed account, default 2000), `ULTRACODEX_TEST_ACCOU
 that text, trimmed, is the managed account (an empty or unreadable file falls back to the real login), so the follow-the-switch mechanics can be
 checked live — "switching" is writing other text into it — without ever touching the real `auth.json`; Codex itself keeps using its real login),
 `ULTRACODEX_TEST_FAULT=unclean-teardown` (tests only: an account-switch stop reports an unverifiable teardown), `ULTRACODEX_MCP_OUTPUT_CAP` (the MCP server's collection cap for one runner call, default 360000 characters; a test lowers it).
+
+## Steerable nodes (0.6.0)
+
+`"steerable": true` makes a plain one-shot job — exec mode, any `kind`, not a review / resume / session, no `images`, no `profile` —
+run as **one turn of a session** (the same driver, `single: true`) so it can be steered while it runs, and end with its turn. The
+Workflow helper sends it for every node (`codexNode(task, { steerable: false })` leaves it out); it is part of the signed header, so
+a relay can neither add nor drop it, and it is allowed in relayed requests, which stay read-only and hermetic (`session`,
+`idleTtlSec`, `askOrchestrator`, `askTimeoutSec` stay refused). The request, the signed digest, the envelope and the result `mac` are
+exactly a one-shot run's; a runner that does not know the field rejects the request (`unknown request fields`), loudly.
+
+**Backend and fallback.** The supervisor runs a steerable job on the session driver unless `ULTRACODEX_NODE_BACKEND=exec` (the kill
+switch, read by `start` and the supervisor) says exec. If the driver fails **before the first turn starts** — `hermetic_violation`
+(including an isolation check that cannot be judged), `spawn`, an app-server or protocol start failure (initialize, `config/read`,
+`thread/start`) — the supervisor logs it, appends the event `backend_fallback {reason, kind}`, takes the session fields out of
+`state.json` (`backendFallback` records why; messages still in the inbox are rejected `backend_fallback`) and runs **the same job on
+`codex exec`** as if it had never been steerable: same run id, same signed digest, the attempts budget untouched, the deadline it was
+given (`timeoutSec` less the time the failed start took). A failure after a turn started is never a fallback reason, and neither are
+`usage_limit` / `auth` (they have their own waits). `provenance.backend` is `session` or `exec` (fallbacks and the kill switch: `exec`).
+
+**Single-turn semantics.** Turn 1 is the task, with the job's schema and effort. The driver's continuation chain applies inside the
+job exactly as for a session: usage-limit wait, account handoffs and follow-the-switch, the checkpoint fallback. Additionally a
+**retry**: a retryable turn failure (`rate_limit`, `server`, `network`, `empty_output` — what exec retries) with attempts left (`maxAttempts`
+counts the turns of this job; a system continuation starts the count again, as a resume does for exec) backs off `ULTRACODEX_BACKOFF_MS × turn`
+(stoppable by cancel, an interrupt and the orphan rules), then runs a continuation turn on the same thread whose input is
+`continuationPrompt("retry", task)` ("a transient error interrupted your turn" + the request); a thread that cannot be resumed gets a
+fresh thread with the original task, once. The deadline (`timeoutSec`, scaled by `workItems`) bounds the **whole** job, retries included
+(a retry that would start with less than `ULTRACODEX_MIN_TIMEOUT_SEC` left is not started); limit waits extend it as they do for exec.
+When the chain ends the driver writes `result.json` (state `done` / `failed` / `timeout` / `cancelled` / `abandoned` / `interrupted`),
+stops the app-server and ends: no idle period, no dormancy, no revive (a second supervisor for it leaves at once). Orphan rules,
+cancel (`cancel RUN`, `cancel --orphaned`) and slots (held while a turn runs) are exec's.
+
+**Envelope.** The result is a one-shot run's field for field (`wait`, `result`, `status` print it as they print an exec run's: no
+`session` field), plus `provenance.backend: "session"`, `provenance.attempts` (the turns taken) and `provenance.steers` (steering
+messages accepted; absent when none). `turns/<n>.json` keeps each turn's own envelope.
+
+**Control while it runs** (`state.json` has `session: true` and `singleTurn: true`; `status` shows `steerable: true`): `send --mode
+steer` (and `auto`) steers the running turn (counted in `steers`, an event `steer`); `send --mode queue` is rejected
+(`{outcome: "rejected", reason: "single_turn"}`) and so is a message with no running turn (`no_active_turn`: between a failed turn
+and its retry, or while waiting for a slot); `interrupt` interrupts the turn and the job ends `interrupted` (never retried); `answer` is
+rejected (`single_turn`: no `ask_orchestrator`); `close` is a cancel (acknowledged `closed` once the job ended); `events` works.
+`status --sessions` / `codex_sessions` list running and ended nodes with their `label` and `steerable: true` (a node that fell back to
+exec is no longer a session and is not listed). `notify` and the channel never report a node's `turn_done`, `error` or `ended`; its
+`limit_wait` and `resumed` stay.
+
+Knobs: `ULTRACODEX_NODE_BACKEND` (`exec` = kill switch), `ULTRACODEX_CONFIG_READ_TIMEOUT_MS` (the isolation check, default 60000),
+`ULTRACODEX_BACKOFF_MS` (the retry backoff, default 20000 × turn). `preflight` shows `nodeBackend`; `dry-run` shows `backend`.
 
 ## Model catalog (codex debug models)
 

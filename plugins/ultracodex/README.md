@@ -13,7 +13,8 @@ Codex (GPT-6 via `codex exec`) inside Claude Code.
   confined type for Claude stages that read reviewed code (Read, Grep, Glob, read-only git).
 - **Runner**: `scripts/codex-node.mjs` (the session driver is `scripts/session.mjs`) — run
   `node scripts/codex-node.mjs help`. A direct run with `"session": true` is a steerable session on a
-  private `codex app-server`: `send` / `interrupt` / `answer` / `events --follow` / `close` (README: "Sessions").
+  private `codex app-server`: `send` / `interrupt` / `answer` / `events --follow` / `close` (README: "Sessions"). Workflow nodes are
+  steerable by default (one turn of such a session; README: "Steering a workflow node").
 - **MCP server**: `scripts/mcp-server.mjs` (declared in `plugin.json`) — Codex sessions as native tools,
   `mcp__plugin_ultracodex_ultracodex__codex_start|sessions|send|interrupt|answer|events|wait|result|close`, and a
   channel (research preview; `claude --dangerously-load-development-channels plugin:ultracodex@ultracodex`) that

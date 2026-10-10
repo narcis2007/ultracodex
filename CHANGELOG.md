@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.6.0 — 2026-10-10 (steerable workflow nodes, verified isolation)
+
+Workflow nodes (`codexNode`, relayed by `codex-relay`, signed with the machine key) can now be steered while they run:
+the owner, or the main Claude session through the `codex_*` tools, can send a steer to one review lens, interrupt a node
+cleanly and watch its live events — without changing the relay protocol and without weakening isolation. Phase 4 had been
+skipped because `codex app-server` has no `--ignore-user-config`; it became possible once the app-server's own `config/read`
+turned out to say, for every effective setting, which layer it came from — so isolation is **verified** for every hermetic
+app-server (sessions included) instead of assumed, and a node falls back to the old exec path whenever it cannot be proven.
+
+- **Verified isolation (every hermetic app-server, sessions too).** Right after `initialize` and before any `thread/start|resume`,
+  the driver calls `config/read {cwd, includeLayers: false}` (60 s; `ULTRACODEX_CONFIG_READ_TIMEOUT_MS`) and the pure function
+  `isolationViolations(configRead, {request})` judges it: per effective key in `origins`, a key whose origin is not `user` or
+  `project` is fine (defaults, managed / system / MDM / enterprise layers apply to exec too; `sessionFlags` are ours); a `user` or
+  `project` key is allowed only if it is **inert** (`tui.*`, `desktop.*`, `notice.*`, `marketplaces.*`, `projects.*`, `profiles.*`
+  — a top-level `profile` is a violation —, `history.*`, `analytics.*`, `feedback.*`, `file_opener`, `check_for_update_on_startup`,
+  `disable_paste_burst`, `hide_agent_reasoning`, `suppress_unstable_features_warning`), **neutralized** — judged by the *effective*
+  value, because the origins of array elements go stale after `-c` (`plugins.*` iff `features.plugins` is false, `apps.*` iff
+  `features.apps` is false, `mcp_servers.<n>.*` iff that server's effective `enabled` is false, `notify` iff the effective hook list is
+  empty), **driver-owned** (`model`, `model_reasoning_effort`, `approval_policy`, `approvals_reviewer`, `sandbox_mode`,
+  `service_tier`; `sandbox_workspace_write.*` for a read-only request, and for workspace-write only the two keys passed with `-c`) or
+  **carried on purpose** (`windows.sandbox`, as exec carries it). Everything else (`developer_instructions`, `instructions`,
+  `model_provider(s)`, `profile`, `shell_environment_policy.*`, `hooks.*`, other `features.*`, `tools.*`, `web_search`, `otel.*`,
+  `skills.*`, an MCP server that is not disabled, …) is a violation. A violation, a `config/read` error (an older Codex), an
+  unreadable answer or a timeout stops the app-server before any thread and ends the run `hermetic_violation` (fail closed); the
+  event `hermetic_violation {keys}` names keys, never values (`<unverifiable>` when it could not judge). The `mcpServerStatus/list`
+  check stays as the second check after the thread starts.
+- **Driver-owned settings are explicit.** `thread/start` and `thread/resume` of a hermetic run pass `approvalsReviewer: "user"` (the
+  owner's own `auto_review` subagent never applies), and the app-server is always started with `-c service_tier="<tier>"` (`"default"`
+  unless the request names one), as `--ignore-user-config` never sees the user's. `dry-run` shows the flags; `preflight` reports
+  `nodeBackend`.
+- **Request field `steerable`** (boolean, default false): run this one-shot job as a single-turn session on a private app-server so it
+  can be steered while it runs; it ends with its turn. Plain exec-mode jobs only (any `kind` and, for direct requests, any sandbox):
+  not a review, a resume, a session, with images or a profile. It is part of the signed header (so a relay can neither add nor drop it —
+  tested), allowed in relayed requests, which stay read-only and hermetic; `session`, `idleTtlSec`, `askOrchestrator`,
+  `askTimeoutSec` stay refused for relays. A runner that does not know the field rejects the request (`unknown request fields`).
+- **`codexNode(task, { steerable = true })`**: the helper puts `steerable: true` in the signed header (and leaves it out with
+  `steerable: false`, so an old runner still accepts the request); `codexBatchNode` passes it through; the `_codex` provenance now
+  carries `backend` and `steers`. The generated workflows and `workflow-templates.md` are rebuilt.
+- **Single-turn semantics** (the session driver with `single: true`). Turn 1 is the job's task with its schema and effort. The
+  continuation chain applies as for a session — usage-limit wait, account handoffs and follow-the-switch, the checkpoint fallback —
+  plus **retries**: a retryable failure (what exec retries: `rate_limit`, `server`, `network`, `empty_output`) with attempts left
+  (`maxAttempts`) backs off `ULTRACODEX_BACKOFF_MS × turn` (stoppable by cancel, interrupt and the orphan rules) and continues the
+  same thread with a notice that "a transient error interrupted your turn" (`continuationPrompt("retry", task)`); a thread that cannot
+  be resumed gets a fresh thread with the original task, once. `timeoutSec` bounds the whole job, retries included; orphans, cancel and
+  slots behave like exec's. When the chain ends the driver writes `result.json` and stops the app-server: no idle period, no
+  dormancy, no revive. **`wait` / `result` / `status` print exactly what they print for an exec run** — the same envelope fields
+  (`ok`, `state`, `text` / `result`, `resultHash`, `mac` signed with the request digest, `provenance`), no `session` field — plus
+  `provenance.backend` (`session`, or `exec` for exec runs and fallbacks) and `provenance.steers` (steering messages accepted).
+- **Control while it runs.** `send --mode steer` / `auto` (and `codex_send`) steers the running turn; `send --mode queue` is
+  rejected (`{outcome: "rejected", reason: "single_turn"}`); `interrupt` ends the job `interrupted` (never retried); `answer` is
+  rejected; `close` is a cancel; `events` works. `status --sessions` / `codex_sessions` list running and ended nodes with their
+  `label` and `steerable: true`.
+- **Quiet notifications.** `notify` and the channel never emit `turn_done`, `ended` or `error` for a node (a review workflow would
+  post one line per lens); `limit_wait` and `resumed` stay.
+- **Fallback to exec.** If the driver fails before the first turn starts — `hermetic_violation`, `spawn`, an app-server or protocol
+  start failure (initialize, `config/read`, `thread/start`) — the supervisor appends `backend_fallback {reason, kind}`, takes the
+  session fields out of `state.json` (`backendFallback` records why), rejects what is in the inbox and runs the same job on
+  `codex exec`: same run id, same signed digest, the attempts budget untouched and the deadline it was given. A failure after a turn
+  started, a usage limit or a login problem is never a fallback reason.
+- **Kill switch.** `ULTRACODEX_NODE_BACKEND=exec` (read by `start` and the supervisor) makes every steerable job run on exec as before.
+- Skills: `codex-steer` has "Steering a Workflow node"; `codex-workflow` documents `steerable` and the fallback and kill switch in
+  `references/codex-headless.md` ("Verified isolation", "Steerable nodes"); README: "Steering a workflow node".
+- Test fixtures: the fake Codex answers `config/read` (`FAKE_CODEX_CONFIG_READ`: clean, owner, leak, missing, error, hang, a file) and
+  can fail turns (`FAKE_FAIL_FIRST`, `FAKE_CODEX_FAIL_TURNS`, `FAKE_FAIL_EXIT`).
+
 ## 0.5.0 — 2026-10-10 (native tools + notifications)
 
 Codex sessions feel like Claude Code's own agent messaging: native tools instead of Bash commands, and a

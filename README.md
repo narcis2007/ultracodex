@@ -24,7 +24,7 @@ see [CHANGELOG.md](CHANGELOG.md) for what changed.
 | Skill `codex-workflow` | Modes and cost levers; how to blend Codex nodes into custom Workflow scripts (the `codexNode` helper). |
 | Skill `codex-review` | Standalone adversarial review of a branch / commit / uncommitted change, with triage. |
 | Skill `codex-implement` | Delegate implementation to Codex in a worktree, verify, iterate, review. |
-| Skill `codex-steer` | Talk to a running Codex session: steer it, send follow-ups, see what it does, answer its questions, close it. |
+| Skill `codex-steer` | Talk to a running Codex session — or steer / stop a running Workflow node: steer it, send follow-ups, see what it does, answer its questions, close it. |
 | Agent `codex-relay` | Internal: the Bash-only relay that runs one Codex job for a Workflow node. |
 | Agent `codex-key` | Internal: fetches the runner key and a nonce once per workflow, and announces each request to the runner (no task text in its prompt). |
 | Agent `codex-reader` | Internal: the confined type for Claude stages that read reviewed code — Read, Grep, Glob and read-only git. |
@@ -136,7 +136,7 @@ cancel --orphaned` cancels every unfinished run on this machine whose caller sto
 ## Sessions: steer a running Codex job
 
 A one-shot run cannot be talked to. A **session** can: add `"session": true` to the request of a direct run
-(`codex-implement`, `codex-ask`; never a Workflow node — a relayed request with `session` is refused) and
+(`codex-implement`, `codex-ask`; a relayed request with `session` is refused — Workflow nodes are steerable differently, see "Steering a workflow node") and
 the supervisor drives a private `codex app-server --listen stdio://` (JSON-RPC over stdio) instead of
 `codex exec`. One session is one Codex thread; Claude can
 
@@ -177,8 +177,11 @@ until `askTimeoutSec` (default 1800) passes and it is told to proceed on its bes
 running meanwhile.
 
 **Safety.** Hermetic sessions (the default) disable every MCP server of `~/.codex/config.toml`, plugins and apps
-(`app-server` has no `--ignore-user-config`) and then check with `mcpServerStatus/list` that none reports a tool
-— before any turn, failing closed (`hermetic_violation`). A writable request whose `cwd` or `addDirs` contains or
+(`app-server` has no `--ignore-user-config`) and then **verify** the isolation, before any turn and failing closed
+(`hermetic_violation`): the app-server's own `config/read` says which layer every effective setting came from, and anything
+from the user's or a project's config that could change what the model sees or can do (instructions, providers, profiles, shell
+environment, hooks, other features, an enabled MCP server, …) stops the run before a thread starts — see "Verified isolation"
+below — and `mcpServerStatus/list` must show that no MCP server reports a tool. A writable request whose `cwd` or `addDirs` contains or
 lies inside the runner's home (`~/.ultracodex`) is refused: a Codex job must never write its own inbox. One
 supervisor per session (an exclusive `supervisor.lock`); the relay guard still allows relays and readers only
 their own commands, so none of `send`, `answer`, `interrupt`, `events`, `close` is available to them.
@@ -256,6 +259,42 @@ when no session exists. The MCP server needs Claude Code to start plugin MCP ser
 asks for MCP protocol revision 2025-06-18 whatever the client prefers, because a channel server that negotiates the
 newer revision cannot deliver channel messages.
 
+## Steering a workflow node
+
+Since 0.6.0 the nodes of the workflows — a review lens, a verifier, a juror (`codexNode`) — run **steerable** by default: the
+runner drives each as **one turn** of a session on a private `codex app-server` instead of `codex exec`. The request is the same, the
+result is the same (signed for the same request, same envelope, plus `provenance.backend` and `steers`), the relay protocol is
+unchanged — but while a node runs you, or the main Claude session, can reach it:
+
+```text
+codex_sessions                                  # your nodes, running or ended: runId, label, state, steerable: true
+codex_send     {runId, message, mode: "steer"}  # Codex reads it at its next step boundary
+codex_interrupt {runId}                         # stop it now: the node ends as interrupted (never retried)
+codex_events   {runId, waitSec}                 # what it is doing, live
+```
+
+From the shell: `node scripts/codex-node.mjs status --sessions [--all]`, `send RUN --mode steer --message …`, `interrupt RUN`,
+`events RUN --follow`, `cancel RUN` (`close` is a cancel here). Find a node by its `label` (the workflows give each one). What
+differs from a session: a node **ends with its turn** — queue-mode messages are rejected (`single_turn`), there is no follow-up, no
+idle period, no revive and no `ask_orchestrator` (`answer` is rejected); `notify` and the channel stay quiet about its turns,
+errors and end (a review runs a dozen nodes) and only report a usage-limit wait and its resume. Everything else is the node's own
+rules: deadline (`timeoutSec` bounds the whole job, retries included), orphans, slots, the usage-limit wait, following an account
+switch, and the retry of a transient failure on the same thread (`maxAttempts`).
+
+**Verified isolation.** A node on `codex exec --ignore-user-config` never sees your config; `app-server` has no such flag, so before
+any thread starts the runner asks it `config/read` and judges, key by key, where each effective setting came from. What your
+`config.toml` contributes is allowed only if it is *inert* (UI and bookkeeping: `tui`, `notice`, `projects`, `marketplaces`, …),
+*neutralized* (plugins, apps and MCP servers that are switched off, an empty `notify`), *owned by the runner* (model, effort,
+approval policy and reviewer, sandbox mode, service tier — set explicitly on every thread and turn) or carried on purpose
+(`windows.sandbox`). Anything else — instructions, providers, profiles, shell environment, hooks, other features, an MCP server that
+is enabled, … — fails the check, as does a Codex without `config/read` or an answer it cannot read: the app-server is stopped
+(`hermetic_violation`, naming the keys, never their values). This covers sessions too.
+
+**Fallback and kill switch.** If the session backend cannot be used before the first turn starts — the isolation cannot be verified,
+the app-server does not start — the very same job runs on `codex exec`, as if it had never been steerable (same run id, same
+signature, same deadline and attempts; event `backend_fallback`, `provenance.backend: "exec"`). `ULTRACODEX_NODE_BACKEND=exec` in
+the environment of the runner makes every node run on exec; `codexNode(task, { steerable: false })` does it for one node.
+
 ## Install
 
 ```text
@@ -305,7 +344,8 @@ Workflow script ──agent({agentType:'ultracodex:codex-key'})────▶ k
   through a separate key agent; no job relay ever holds it. Large results travel in verified
   pages.
 - **Hermetic by default.** Verification and review runs ignore `~/.codex/config.toml` (no user
-  MCP servers); the Windows sandbox setting is carried over.
+  MCP servers); the Windows sandbox setting is carried over. A node that runs on an app-server (steerable, the
+  default) gets the same isolation, verified with `config/read` before its thread starts.
 - **Own processes only.** The supervisor stops only the tree it started (deadline, cancel, or a
   relay that stopped polling) — on Windows exactly the members of the run's Job Object, so an
   orphan whose parent exited is still stopped and nothing of another session ever is. It
@@ -323,7 +363,7 @@ Workflow script ──agent({agentType:'ultracodex:codex-key'})────▶ k
 ## Development
 
 ```bash
-npm test           # 240+ offline tests (fake Codex CLI, stubbed workflow runtime) — no quota
+npm test           # 340+ offline tests (fake Codex CLI, stubbed workflow runtime) — no quota
 npm run build      # regenerate plugins/ultracodex/workflows/*.js and the helper block in the docs
 npm run check      # build --check + tests
 npm run preflight

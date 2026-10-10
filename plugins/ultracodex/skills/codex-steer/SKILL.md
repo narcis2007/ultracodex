@@ -5,9 +5,11 @@ description: >-
   follow-up after its answer, see what it is doing, answer a question it asked, stop it, close the
   session, list the open ones, get told when it asks or finishes. Use for "tell codex …", "message /
   steer the codex agent", "what is codex doing", "answer codex's question", "stop / interrupt codex",
-  "close the codex session", "list codex sessions", or whenever a run started with "session": true
-  needs an input. Sessions come from `codex-implement` and `codex-ask` (direct runs only — never
-  Workflow nodes); this skill is the tool and command reference and the etiquette.
+  "close the codex session", "list codex sessions", "steer / stop that review lens", or whenever a run
+  started with "session": true needs an input — and for a running Workflow node (a review lens, a
+  verifier: listed by label in codex_sessions, steerable: true). Sessions come from `codex-implement`
+  and `codex-ask`; nodes are steerable by default; this skill is the tool and command reference and the
+  etiquette.
 ---
 
 # Steer a running Codex session
@@ -18,8 +20,8 @@ A **session** is a Codex job you can talk to. You start it with `"session": true
 (`codex-implement` and `codex-ask` do that, or `codex_start`); the runner then drives a private
 `codex app-server` for it instead of a one-shot `codex exec`. One session = one Codex thread: every
 message goes to the same conversation, with its context, until you close it. Sessions are for
-**direct** runs (the conversation → the runner). Workflow nodes and relays never use them, and a
-relayed request that says `session` is refused.
+**direct** runs (the conversation → the runner); a relayed request that says `session` is refused.
+A running **Workflow node** is not a session, but you can steer it too — see "Steering a Workflow node" below.
 
 ## Tools first, CLI as the fallback
 
@@ -30,7 +32,7 @@ composing Bash commands. Full names; the short names are what the tools are call
 | tool | what it does | CLI equivalent |
 | --- | --- | --- |
 | `mcp__plugin_ultracodex_ultracodex__codex_start` | start a session (always `session: true`, never attached): `task` or `taskFile`, absolute `cwd`, `sandbox`, `tier`, `kind`, `schemaPreset`, `label`, … | `start --request FILE` |
-| `mcp__plugin_ultracodex_ultracodex__codex_sessions` | your sessions (`all: true` = everyone's), with the pending question; says which owner id the server uses | `status --mine` |
+| `mcp__plugin_ultracodex_ultracodex__codex_sessions` | your sessions and running Workflow nodes (`steerable: true`; `all: true` = everyone's), with the pending question; says which owner id the server uses | `status --mine` |
 | `mcp__plugin_ultracodex_ultracodex__codex_send` | `runId`, `message`, `mode` auto / steer / queue | `send` |
 | `mcp__plugin_ultracodex_ultracodex__codex_interrupt` | `runId` | `interrupt` |
 | `mcp__plugin_ultracodex_ultracodex__codex_answer` | `runId`, `questionId`, `answer` | `answer` |
@@ -213,6 +215,36 @@ your best judgement and state the assumption" and goes on. The turn's deadline k
   nothing but still shows in `status` until it is closed or `gc` removes it.
 - Never stop Codex processes this plugin did not start. `cancel RUN_ID` (immediately ends the session,
   state `cancelled`) only for your own run and only when the owner asks.
+
+## Steering a Workflow node
+
+Since 0.6.0 the nodes of the shipped workflows (`codexNode`: review lenses, verifiers, jurors, …) run
+**steerable** by default: the runner drives each as **one turn** of a session on a private
+`codex app-server` instead of `codex exec`, so you can reach it while it runs. Its request, result and
+signatures are those of any node — the workflow collects the result as before — and it **ends with its turn**.
+
+- **Find it.** `codex_sessions` (or `status --sessions`) lists the nodes of this Claude session, running or
+  ended, with `steerable: true` and the node's `label` (the workflow gives each node one: a lens, a finding
+  batch). `all: true` / `--all` for everyone's. `codex_events` / `events RUN_ID --follow` is its live feed.
+- **Steer it.** `codex_send` with `mode: "steer"` (or the default `auto`, which steers a running turn):
+  Codex reads it at its next step boundary, as in a session. The node's result then reports `provenance.steers`.
+  **Queue-mode messages are rejected** (`outcome: "rejected"`, `reason: "single_turn"`): a node takes no
+  follow-up — it ends with its turn. A message between turns (while it backs off for a retry, or waits for a
+  slot) is rejected `no_active_turn`. Steer sparingly: a lens reviewing a change reads a steer as part of its
+  brief, and the workflow trusts its answer as it would any node's.
+- **Stop it.** `codex_interrupt` ends the node as `interrupted` (never retried; the workflow sees a failed
+  node, not a pass). `codex_close` / `close` and `cancel RUN_ID` end it as `cancelled` — `close` is a cancel
+  here. After a node ended, every command answers `rejected` / `session_ended`; a node is never revived.
+- **No questions.** A node has no `ask_orchestrator`: `answer` is rejected (`single_turn`); nothing waits for you.
+- **Notifications are quiet.** `notify` and the channel report a node's `limit_wait` and `resumed` (work is paused
+  on a usage limit) but never its turns, errors or end — a review would otherwise post one line per lens.
+- **The same rules as any node.** Limit waits, account switches (followed at a step boundary), the retry of a
+  transient failure (`maxAttempts`, on the same thread: a continuation that says a transient error interrupted
+  the turn), deadlines (`timeoutSec` bounds the whole job, retries included), orphans (`onOrphan`) and slots.
+- **If the session backend cannot start** — the app-server's configuration cannot be proven isolated, it has no
+  `config/read`, it does not start — the node runs on `codex exec` after all, as the very same job (event
+  `backend_fallback`, `provenance.backend: "exec"`); it is then not listed and cannot be steered.
+  `ULTRACODEX_NODE_BACKEND=exec` in the runner's environment makes every node run on exec.
 
 ## Listing sessions
 

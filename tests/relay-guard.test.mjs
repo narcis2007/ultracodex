@@ -224,3 +224,36 @@ test("the hook judges by agent type — never by what an agent asks for", () => 
   assert.match(denied.permissionDecisionReason, /ultracodex guard/);
   assert.equal(hook({ agent_type: RELAY, agent_id: "a1", tool_name: "Write", tool_input: { file_path: "x" } }).permissionDecision, "deny");
 });
+
+test("relays, key agent and readers cannot reach a steerable node: send, interrupt, answer, close, events, listings", () => {
+  // a node is a session as far as the runner's commands go; the guard allows relays part/wait/page and nothing else
+  const NODE = "20261010T180507Z-270339";
+  const READER = "ultracodex:codex-reader";
+  const commands = [
+    `send ${NODE} --message "stop doing that" --mode steer`,
+    `send ${NODE} --message-file C:/x/m.txt`,
+    `interrupt ${NODE}`,
+    `answer ${NODE} call-1 --text yes`,
+    `close ${NODE}`,
+    `close ${NODE} --force`,
+    `events ${NODE}`,
+    `events ${NODE} --follow --max-wait 60`,
+    `status --sessions --all`,
+    `status ${NODE}`,
+    `result ${NODE} --turn 1`,
+    `cancel ${NODE}`,
+    `cancel --orphaned`,
+    `notify --all --forever`,
+  ];
+  for (const command of commands) {
+    const text = `node "${RUNNER}" ${command}`;
+    for (const agent of [RELAY, KEY_AGENT, READER]) {
+      assert.notEqual(checkAgentCommand(agent, text, PLUGIN_ROOT, { cwd: ROOT }), null, `${agent}: ${command}`);
+    }
+    const out = hook({ agent_type: RELAY, agent_id: "a1", tool_name: "Bash", tool_input: { command: text } });
+    assert.equal(out.permissionDecision, "deny", command);
+  }
+  // what a relay is for stays allowed, node or not
+  assert.equal(checkRelayCommand(`node "${RUNNER}" wait ${NODE} --max-wait 570`, PLUGIN_ROOT), null);
+  assert.equal(checkRelayCommand(`node "${RUNNER}" page ${NODE} 2`, PLUGIN_ROOT), null);
+});

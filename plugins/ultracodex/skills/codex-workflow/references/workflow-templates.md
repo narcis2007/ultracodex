@@ -24,10 +24,13 @@ Two ways to use Codex nodes in a Workflow:
 (`verify` · `ask` · `review`), optional `model`/`effort` overrides, `cwd` (the tree Codex may
 read), `timeoutSec`, `maxAttempts`, `orphanAfterSec` (default 900), `limitWaitSec` (how long a usage-limited
 run waits for the limit to reset; runner default 24 h, 0 = no limit wait), `workItems` (set by
-`codexBatchNode`), `serviceTier` (`'priority'` = Fast: more usage, less waiting), `label`,
-`phase`, `meta`. It resolves to the parsed object
-(provenance in the non-enumerable `_codex`), the final text (no schema), or
-`{ _codex_error: true, kind, message, retryable, runId }`. Always test with `isCodexError(x)`.
+`codexBatchNode`), `serviceTier` (`'priority'` = Fast: more usage, less waiting), `steerable` (default
+`true`: the node runs as one turn of a session, so the owner — or the main session through `codex_sessions` /
+`codex_send` — can steer or stop it while it runs; `false` keeps it on plain `codex exec`; see `codex-steer` and
+`references/codex-headless.md`), `label`, `phase`, `meta`. It resolves to the parsed object
+(provenance in the non-enumerable `_codex`: runId, threadId, model, effort, usage, attempts, `backend`, `steers`, …), the final text
+(no schema), or `{ _codex_error: true, kind, message, retryable, runId }`. Always test with `isCodexError(x)`.
+Give nodes a `label` — it is how a node is found (and steered) while the workflow runs.
 
 Also in the block: `codexBatchNode(instruction, items, opts)` (N small items, one Codex run,
 id integrity enforced, deadline scaled to N), `ucxPartition(items, verdictOf)` (fail-closed
