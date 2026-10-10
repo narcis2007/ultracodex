@@ -48,6 +48,8 @@ const MAX_TEXT = 90_000; // characters in one tool result (Claude Code truncates
 const MAX_EVENTS = 200;
 const EVENTS_BUDGET = 60_000; // characters of events in one codex_events result
 const MAX_LINE = 16 * 1024 * 1024;
+// how much of a runner's output is collected (ULTRACODEX_MCP_OUTPUT_CAP: a test knob); past it, `truncated`
+const OUTPUT_CAP = Number(process.env.ULTRACODEX_MCP_OUTPUT_CAP) > 0 ? Number(process.env.ULTRACODEX_MCP_OUTPUT_CAP) : 4 * MAX_TEXT;
 
 const INSTRUCTIONS = [
   "Codex (GPT) sessions as tools. codex_start begins a session (a Codex thread that works in the background);",
@@ -219,16 +221,21 @@ function clipText(text) {
 }
 
 // The runner's own JSON line(s). Exit codes 0 (done), 1 (refused, ended) and 3 (still running) are
-// answers; 2 (usage) and a runner that died are tool errors.
-function runRunner(args, { owner, timeoutMs, signal }) {
+// answers; 2 (usage) and a runner that died are tool errors. Output is decoded as UTF-8 across chunk
+// boundaries (a multibyte character, a Romanian diacritic, may be split by the pipe); `truncated` says
+// that output past OUTPUT_CAP was dropped. `file` is the runner (a test points it elsewhere).
+export function runRunner(args, { owner, timeoutMs, signal, file = RUNNER_FILE }) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [RUNNER_FILE, ...args], {
+    const child = spawn(process.execPath, [file, ...args], {
       env: { ...process.env, ULTRACODEX_OWNER: owner.id },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     let stdout = "";
     let stderr = "";
+    let truncated = false;
     let settled = false;
     const finish = (value) => {
       if (settled) return;
@@ -254,20 +261,28 @@ function runRunner(args, { owner, timeoutMs, signal }) {
     }, timeoutMs);
     signal?.addEventListener("abort", onAbort, { once: true });
     child.stdout.on("data", (chunk) => {
-      if (stdout.length < 4 * MAX_TEXT) stdout += chunk;
+      if (truncated) return;
+      const room = OUTPUT_CAP - stdout.length;
+      if (chunk.length <= room) stdout += chunk;
+      else {
+        stdout += chunk.slice(0, room);
+        truncated = true; // what is kept ends mid-text: callers that parse it must not
+      }
     });
     child.stderr.on("data", (chunk) => {
       if (stderr.length < 8000) stderr += chunk;
     });
     child.on("error", (error) => finish({ error: `could not start the runner: ${error.message}` }));
-    child.on("close", (code) => finish({ code, stdout: stdout.trim(), stderr: stderr.trim() }));
+    child.on("close", (code) => finish({ code, stdout: stdout.trim(), stderr: stderr.trim(), truncated }));
   });
 }
 
-async function viaRunner(args, ctx, { timeoutMs = 120_000 } = {}) {
+// whole: the caller parses the output, so a cut-off one is an error, never half a JSON line
+async function viaRunner(args, ctx, { timeoutMs = 120_000, whole = false } = {}) {
   const out = await runRunner(args, { owner: ctx.owner, timeoutMs, signal: ctx.signal });
   if (out.aborted) return null;
   if (out.error) throw new ToolError(out.error);
+  if (whole && out.truncated) throw new ToolError(`the runner's output is longer than this tool reads (${out.stdout.length} characters were kept); nothing was parsed`);
   if (out.code === 2) throw new ToolError(out.stdout || out.stderr || "the runner rejected the command");
   if (out.code !== 0 && out.code !== 1 && out.code !== 3) throw new ToolError(`the runner exited with ${out.code}: ${out.stderr || out.stdout || "no output"}`);
   return out.stdout || JSON.stringify({ ultracodex: 1, ok: out.code === 0, note: "the runner printed nothing", exitCode: out.code });
@@ -284,6 +299,7 @@ function withTempFile(name, text, work) {
 
 // ─── tool handlers ──────────────────────────────────────────────────────────
 
+const SESSIONS_LIMIT = 40;
 const START_FIELDS = ["task", "taskFile", "cwd", "sandbox", "tier", "kind", "model", "effort", "schemaPreset", "label", "network", "addDirs", "idleTtlSec", "timeoutSec", "limitWaitSec", "askOrchestrator"];
 
 const HANDLERS = {
@@ -313,11 +329,16 @@ const HANDLERS = {
   },
 
   async codex_sessions(args, ctx) {
-    const text = await viaRunner(["status", "--all"], ctx, { timeoutMs: 60_000 });
+    // the runner does the filtering: only session runs, newest first, at most SESSIONS_LIMIT — the whole
+    // history of runs (hundreds on a busy machine) is never what this tool has to read
+    const text = await viaRunner(["status", "--sessions", ...(args.all ? ["--all"] : ["--owner", ctx.owner.id]), "--limit", String(SESSIONS_LIMIT)], ctx, { timeoutMs: 60_000, whole: true });
     if (text === null) return null;
     let runs = [];
+    let omitted = 0;
     try {
-      runs = JSON.parse(text.split("\n").at(-1)).runs ?? [];
+      const status = JSON.parse(text.split("\n").at(-1));
+      runs = status.runs ?? [];
+      omitted = Number(status.truncated) || 0;
     } catch {
       throw new ToolError(`could not read the runner's status: ${text.slice(0, 300)}`);
     }
@@ -343,15 +364,14 @@ const HANDLERS = {
       }
       sessions.push(entry);
     }
-    const shown = sessions.slice(0, 40);
     return JSON.stringify({
       ultracodex: 1,
       ok: true,
       owner: ctx.owner.id,
       ownerSource: ctx.owner.source,
       all: Boolean(args.all),
-      sessions: shown,
-      ...(sessions.length > shown.length ? { truncated: sessions.length - shown.length } : {}),
+      sessions,
+      ...(omitted ? { truncated: omitted } : {}),
     });
   },
 

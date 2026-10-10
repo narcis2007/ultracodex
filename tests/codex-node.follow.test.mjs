@@ -340,3 +340,78 @@ test("followAccountSwitch: a boolean, true unless the request or ULTRACODEX_FOLL
   assert.equal(follows({}), true);
   assert.throws(() => follows({ followAccountSwitch: "yes" }), /followAccountSwitch must be a boolean/);
 });
+
+// ── review findings ──
+
+test("AttemptSwitchWatch drains a backlog larger than one read before it judges the boundary, and never decides with a line unread", (t) => {
+  const { home, identity } = useIdentity(t, "account-a");
+  const file = path.join(home, "events.jsonl");
+  const account = managedAccountIdentity();
+  const filler = JSON.stringify({ type: "item.completed", item: { id: "m", type: "agent_message", text: "x".repeat(1000) } });
+  // 5 MiB of finished work, then a command that has started: readNewEvents reads 4 MiB at a time
+  const lines = [JSON.stringify({ type: "thread.started", thread_id: "thread-1" })];
+  for (let size = 0; size < 5 * 1024 * 1024; size += filler.length + 1) lines.push(filler);
+  lines.push(JSON.stringify({ type: "item.started", item: { id: "c", type: "command_execution" } }));
+  fs.writeFileSync(file, `${lines.join("\n")}\n`);
+  const logged = [];
+  const watch = new AttemptSwitchWatch({ file, account, followable: () => null, log: (line) => logged.push(line) });
+  fs.writeFileSync(identity, "account-b");
+  assert.equal(pollNow(watch), false, "the command at the end of the backlog is in flight: not a boundary");
+  assert.equal(watch.inFlight.size, 1);
+  assert.equal(watch.threadId, "thread-1");
+  fs.appendFileSync(file, `${JSON.stringify({ type: "item.completed", item: { id: "c", type: "command_execution" } })}\n`);
+  assert.equal(pollNow(watch), true, "now it is");
+
+  // a line still being written may be an item.started: no decision while bytes are unread
+  const partial = path.join(home, "partial.jsonl");
+  fs.writeFileSync(partial, `${JSON.stringify({ type: "thread.started", thread_id: "thread-2" })}\n{"type":"item.started","item":{"id":"c2","type":"command_exec`);
+  const half = new AttemptSwitchWatch({ file: partial, account, followable: () => null, log: () => {} });
+  assert.equal(pollNow(half), false);
+  assert.equal(half.unread, true);
+  assert.equal(half.inFlight.size, 0, "the half line is not an event yet, and it is why nothing is decided");
+  fs.appendFileSync(partial, 'ution"}}\n');
+  assert.equal(pollNow(half), false, "complete: the command is in flight");
+  fs.appendFileSync(partial, `${JSON.stringify({ type: "item.completed", item: { id: "c2", type: "command_execution" } })}\n`);
+  assert.equal(pollNow(half), true);
+});
+
+test("AttemptSwitchWatch judges the boundary on fresh facts: an undone switch and a budget that ran out meanwhile are not followed", (t) => {
+  const { home, identity } = useIdentity(t, "account-a");
+  const file = path.join(home, "events.jsonl");
+  const write = (event) => fs.appendFileSync(file, `${JSON.stringify(event)}\n`);
+  const account = managedAccountIdentity();
+  const logged = [];
+  let refusal = null;
+  const watch = new AttemptSwitchWatch({ file, account, followable: () => refusal, log: (line) => logged.push(line) });
+  write({ type: "thread.started", thread_id: "thread-1" });
+  write({ type: "item.started", item: { id: "c", type: "command_execution" } });
+  fs.writeFileSync(identity, "account-b");
+  assert.equal(pollNow(watch), false, "pending behind the command");
+  // the account goes back before the next identity check, and the command completes
+  fs.writeFileSync(identity, "account-a");
+  write({ type: "item.completed", item: { id: "c", type: "command_execution" } });
+  assert.equal(watch.poll(), false, "no identity check is due, but the boundary looks again: the switch is undone");
+  assert.match(logged.at(-1), /back to the one this attempt started on/);
+
+  // the switch is real again, and the work time runs out while the next command runs
+  fs.writeFileSync(identity, "account-b");
+  write({ type: "item.started", item: { id: "d", type: "command_execution" } });
+  assert.equal(pollNow(watch), false);
+  refusal = "too little work time is left";
+  write({ type: "item.completed", item: { id: "d", type: "command_execution" } });
+  assert.equal(pollNow(watch), false, "not interrupted: the attempt finishes on the old account");
+  assert.match(logged.at(-1), /not followed \(too little work time is left\)/);
+  assert.equal(pollNow(watch), false, "and it is not asked again");
+});
+
+test("a switch that waits behind a command until too little work time is left is not followed: the attempt finishes on the old account", async (t) => {
+  const { home, env, switchTo, attempt, log, execCalls } = followHome(t, { ULTRACODEX_MIN_TIMEOUT_SEC: "60" });
+  const runId = await start(env, home, { task: "work\nFAKE_STEPS=command:3000,model:1500\nFAKE_OUTPUT=old", tier: "light", timeoutSec: 62 });
+  assert.ok(await streamHas(path.join(attempt(runId, 1), "events.jsonl"), "item.started"));
+  switchTo("account-b");
+  const out = await finish(env, runId);
+  assert.deepEqual([out.json.ok, out.json.text, out.json.provenance.attempts], [true, "old", 1], out.stdout);
+  assert.equal(execCalls().length, 1);
+  assert.match(log(runId), /waiting|next step boundary/);
+  assert.match(log(runId), /not followed \(too little work time is left\)/);
+});

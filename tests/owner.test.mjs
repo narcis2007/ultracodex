@@ -8,9 +8,9 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { OWNER_RE, currentOwner } from "../plugins/ultracodex/scripts/codex-node.mjs";
+import { OWNER_RE, currentOwner, newRunId } from "../plugins/ultracodex/scripts/codex-node.mjs";
 import { ownerLine } from "../plugins/ultracodex/scripts/session-start.mjs";
-import { ROOT, announce, frame, runCli, signedHeader } from "./helpers.mjs";
+import { ROOT, announce, fastEnv, frame, makeHome, runCli, signedHeader } from "./helpers.mjs";
 import { readState, sessionHome, startSession } from "./helpers-session.mjs";
 
 const HOOK = path.join(ROOT, "plugins", "ultracodex", "scripts", "session-start.mjs");
@@ -107,4 +107,42 @@ test("the exported line is what a Bash command sees: the owner of the next run i
   if (sh.error) return; // no bash on this machine
   assert.equal(sh.stdout, "7c1d:2e.f_g-h");
   assert.equal(currentOwner({ ULTRACODEX_OWNER: sh.stdout })?.id, "7c1d:2e.f_g-h");
+});
+
+// ── status --sessions: the runner filters, so a caller never has to read the whole history ──
+
+function handMadeRun(home, at, state) {
+  const runId = newRunId(new Date(Date.UTC(2026, 0, 1, 0, 0, at)));
+  const dir = path.join(home, "runs", runId);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify({ runId, state: "done", ...state }));
+  return runId;
+}
+
+test("status --sessions: only session runs, newest first, by owner, capped, with the number left out", async (t) => {
+  const home = makeHome(t);
+  const env = fastEnv(home, { ULTRACODEX_OWNER: "owner-a" });
+  for (let at = 0; at < 30; at += 1) handMadeRun(home, at, { label: "plain" });
+  const s1 = handMadeRun(home, 100, { session: true, owner: "owner-a", state: "idle" });
+  const s2 = handMadeRun(home, 101, { session: true, owner: "owner-b", state: "idle" });
+  const s3 = handMadeRun(home, 102, { session: true, owner: "owner-a", state: "dormant" });
+  const s4 = handMadeRun(home, 103, { session: true, state: "idle" });
+  handMadeRun(home, 104, { label: "a newer plain run" });
+  const ids = async (...args) => (await runCli(["status", "--sessions", ...args], { env })).json.runs.map((run) => run.runId);
+
+  assert.deepEqual(await ids("--all"), [s4, s3, s2, s1]);
+  assert.deepEqual(await ids(), [s4, s3, s2, s1], "no owner filter: everyone's");
+  assert.deepEqual(await ids("--owner", "owner-a"), [s3, s1]);
+  const mine = await runCli(["status", "--sessions", "--mine"], { env });
+  assert.deepEqual([mine.json.runs.map((run) => run.runId), mine.json.owner, mine.json.sessions], [[s3, s1], "owner-a", true]);
+  const capped = await runCli(["status", "--sessions", "--all", "--limit", "1"], { env });
+  assert.deepEqual([capped.json.runs.map((run) => run.runId), capped.json.truncated], [[s4], 3]);
+  assert.equal((await runCli(["status", "--sessions", "--all", "--limit", "4"], { env })).json.truncated, undefined, "nothing left out: no count");
+  assert.equal(capped.json.runs[0].session, true);
+
+  const nobody = await runCli(["status", "--sessions", "--mine"], { env: { ...env, ULTRACODEX_OWNER: "" } });
+  assert.deepEqual([nobody.code, nobody.json.error.kind], [1, "no_owner"]);
+  for (const args of [["--owner", "not valid"], ["--mine", "--owner", "owner-a"], ["--limit", "0"], ["--limit", "many"]]) {
+    assert.equal((await runCli(["status", "--sessions", ...args], { env })).code, 2, args.join(" "));
+  }
 });

@@ -2585,7 +2585,9 @@ const EXEC_STEP_ITEMS = new Set(["command_execution", "file_change", "mcp_tool_c
 // attempt's `--json` stream (the file Codex writes it to) as it grows, for the thread id and the steps in
 // flight, and every accountCheckMs compares the managed account with the one the attempt started on.
 // poll() is true when the attempt should be stopped now: the account changed, the run can be resumed on
-// the new one, and no step is in flight. Whether a switch is followed is decided once, when it is seen.
+// the new one, and no step is in flight — judged on everything the stream holds (never while a line is
+// still unread) and once more, on fresh facts, at the boundary itself: a budget or a deadline that no
+// longer allows a continuation by then means the attempt finishes on the old account.
 export class AttemptSwitchWatch {
   constructor({ file, account, followable, log }) {
     this.file = file;
@@ -2597,18 +2599,30 @@ export class AttemptSwitchWatch {
     this.inFlight = new Set();
     this.pending = false;
     this.skipped = false;
+    this.unread = false; // bytes of the stream (a line still being written) that have not been read
     this.nextCheckAt = 0;
   }
 
+  // Every complete line that is there: one readNewEvents call reads at most 4 MiB, and an unread
+  // item.started must never make the boundary look free.
   read() {
-    const batch = readNewEvents(this.file, this.offset);
-    this.offset = batch.offset;
-    for (const { event } of batch.events) {
-      if (event.type === "thread.started" && typeof event.thread_id === "string") this.threadId = event.thread_id;
-      const item = event.item;
-      if (!isPlainObject(item) || typeof item.id !== "string") continue;
-      if (event.type === "item.started" && EXEC_STEP_ITEMS.has(item.type)) this.inFlight.add(item.id);
-      else if (event.type === "item.completed") this.inFlight.delete(item.id);
+    for (;;) {
+      const batch = readNewEvents(this.file, this.offset);
+      const progressed = batch.offset > this.offset;
+      this.offset = batch.offset;
+      for (const { event } of batch.events) {
+        if (event.type === "thread.started" && typeof event.thread_id === "string") this.threadId = event.thread_id;
+        const item = event.item;
+        if (!isPlainObject(item) || typeof item.id !== "string") continue;
+        if (event.type === "item.started" && EXEC_STEP_ITEMS.has(item.type)) this.inFlight.add(item.id);
+        else if (event.type === "item.completed") this.inFlight.delete(item.id);
+      }
+      if (!progressed) break;
+    }
+    try {
+      this.unread = fs.statSync(this.file).size > this.offset;
+    } catch {
+      this.unread = false; // no stream yet
     }
   }
 
@@ -2635,7 +2649,23 @@ export class AttemptSwitchWatch {
         this.log("the managed account changed; stopping this attempt at the next step boundary to continue its thread on the new account");
       }
     }
-    return this.pending && this.inFlight.size === 0;
+    if (!this.pending || this.inFlight.size || this.unread) return false;
+    // the boundary: judged again, on fresh facts (the account may be back, the budget or the work time gone)
+    const current = managedAccountIdentity();
+    if (current === this.account) {
+      this.pending = false;
+      this.log("the managed account is back to the one this attempt started on; nothing to follow");
+      return false;
+    }
+    if (!current) return false; // unreadable just now: not a switch to follow, not an undo either
+    const why = this.thread() ?? this.followable();
+    if (why) {
+      this.skipped = true;
+      this.pending = false;
+      this.log(`the managed account changed, but this attempt is not followed (${why}); it finishes on the old account`);
+      return false;
+    }
+    return true;
   }
 
   thread() {
@@ -4109,7 +4139,46 @@ function describeRun(runId) {
   };
 }
 
-export function cmdStatus(runId, { all = false, mine = false, pretty = false } = {}) {
+// `status --sessions [--mine | --owner ID | --all] [--limit N]`: only the session runs, newest first, at most
+// N (default 50) of them — for a caller that cannot read the whole history (the MCP server's codex_sessions).
+// `truncated` counts the matching sessions that were left out.
+function statusSessions({ all, mine, owner, limit, pretty }) {
+  if (mine && owner !== null) throw new UsageError("status takes --mine or --owner, not both");
+  if (owner !== null && !OWNER_RE.test(owner)) throw new UsageError("--owner must be a session id (letters, digits, _ . : -; at most 128 characters)");
+  let wanted = owner;
+  if (mine) {
+    const current = currentOwner();
+    if (!current) {
+      print(rejection("no_owner", "--mine needs to know which Claude session this is: run it from a Claude Code Bash command (ULTRACODEX_OWNER / CLAUDE_CODE_SESSION_ID); `status --sessions --all` lists everyone's"), pretty);
+      return 1;
+    }
+    wanted = current.id;
+  }
+  const cap = Math.min(limit ?? 50, 1000);
+  const matching = [];
+  for (const id of listRunIds()) {
+    const state = readJsonSafe(runPaths(id).state);
+    if (state?.session === true && (wanted === null || state.owner === wanted)) matching.push(id);
+  }
+  const runs = matching.slice(0, cap).map(describeRun);
+  print(
+    {
+      ultracodex: 1,
+      runnerVersion: RUNNER_VERSION,
+      ok: true,
+      home: ucxHome(),
+      sessions: true,
+      ...(wanted !== null ? { owner: wanted } : {}),
+      runs,
+      ...(matching.length > cap ? { truncated: matching.length - cap } : {}),
+    },
+    pretty
+  );
+  return 0;
+}
+
+export function cmdStatus(runId, { all = false, mine = false, sessions = false, owner = null, limit = null, pretty = false } = {}) {
+  if (!runId && sessions) return statusSessions({ all, mine, owner, limit, pretty });
   if (runId) {
     if (!RUN_ID_RE.test(runId)) throw new UsageError("status takes an optional run id");
     if (!isDirSync(runPaths(runId).dir)) {
@@ -4407,6 +4476,7 @@ function helpText() {
     "  node codex-node.mjs notify [--owner ID | --all] [--max-wait SEC | --forever] [--from now|cursor]",
     "                                                                   one JSON line per actionable event of your sessions (for Monitor)",
     "  node codex-node.mjs status --mine                                only the runs this Claude session started",
+    "  node codex-node.mjs status --sessions [--mine | --owner ID | --all] [--limit N]   only session runs, newest first (default 50)",
     "  node codex-node.mjs result RUN_ID [--turn N]                     the latest (or turn N's) envelope of a session",
     "",
     "Exit codes: 0 done, 1 failed/rejected, 2 usage error, 3 still running.",
@@ -4441,6 +4511,8 @@ function parseCli(argv) {
     forever: false,
     owner: null,
     from: null,
+    sessions: false,
+    limit: null,
   };
   const valued = {
     "--request": "request",
@@ -4457,6 +4529,7 @@ function parseCli(argv) {
     "--turn": "turn",
     "--owner": "owner",
     "--from": "from",
+    "--limit": "limit",
   };
   for (let index = 0; index < rest.length; index += 1) {
     const token = rest[index];
@@ -4469,6 +4542,7 @@ function parseCli(argv) {
     else if (token === "--archive") options.archive = true;
     else if (token === "--mine") options.mine = true;
     else if (token === "--forever") options.forever = true;
+    else if (token === "--sessions") options.sessions = true;
     else if (valued[token]) {
       const value = rest[index + 1];
       if (value === undefined) throw new UsageError(`${token} requires a value`);
@@ -4484,7 +4558,7 @@ function parseCli(argv) {
       options[name] = value;
     }
   }
-  for (const [name, flag, lowest] of [["since", "--since", 0], ["turn", "--turn", 1]]) {
+  for (const [name, flag, lowest] of [["since", "--since", 0], ["turn", "--turn", 1], ["limit", "--limit", 1]]) {
     if (options[name] !== null) {
       const value = Number(options[name]);
       if (!Number.isInteger(value) || value < lowest) throw new UsageError(`${flag} must be an integer of at least ${lowest}`);

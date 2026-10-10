@@ -330,7 +330,7 @@ exists: the supervisor writes `result.json` first and acknowledges after it, so 
 or idle work looks at the managed account, default 2000), `ULTRACODEX_TEST_ACCOUNT_IDENTITY_FILE` (**test only**: when set and the file holds text,
 that text, trimmed, is the managed account (an empty or unreadable file falls back to the real login), so the follow-the-switch mechanics can be
 checked live — "switching" is writing other text into it — without ever touching the real `auth.json`; Codex itself keeps using its real login),
-`ULTRACODEX_TEST_FAULT=unclean-teardown` (tests only: an account-switch stop reports an unverifiable teardown).
+`ULTRACODEX_TEST_FAULT=unclean-teardown` (tests only: an account-switch stop reports an unverifiable teardown), `ULTRACODEX_MCP_OUTPUT_CAP` (the MCP server's collection cap for one runner call, default 360000 characters; a test lowers it).
 
 ## Model catalog (codex debug models)
 

@@ -14,7 +14,9 @@ the one-shot behaviour and the Workflow path are unchanged.
   `mcp__plugin_ultracodex_ultracodex__<tool>`. A refusal is an answer; only a bad argument or a dead runner is a
   tool error. It asks for MCP revision 2025-06-18 whatever the client prefers (a channel server that negotiates
   2026-07-28 cannot deliver channel messages). The relay, key and reader agents keep their Bash/Read/Grep/Glob
-  `tools:` list and never get these tools (tested).
+  `tools:` list and never get these tools (tested). The runner's output is decoded as UTF-8 across chunk boundaries, and
+  `codex_sessions` asks the runner for sessions only (`status --sessions [--mine | --owner ID | --all] [--limit N]`: session runs, newest
+  first, default 50, `truncated` counts the rest) instead of reading the whole history; output that was cut off is an error, never parsed.
 - **Ownership.** Each run records the Claude session that started it (`owner`, `ownerSource` in `state.json`; shown
   by `status`; `status --mine` filters by it): `ULTRACODEX_OWNER` — exported into the session's Bash commands by the
   new `SessionStart` hook (`scripts/session-start.mjs`, from the `session_id` and `CLAUDE_ENV_FILE` Claude Code gives
@@ -25,7 +27,8 @@ the one-shot behaviour and the Workflow path are unchanged.
   `question`, `turn_done` (with a ≤ 400-character summary), `limit_wait` (once per wait: with the reset time when a probe knows it, else `null` after ~10 s), `resumed` (limit reset / account change),
   `error`, `ended` (cancelled, or a session that failed) — and nothing for messages, commands, file changes, steers,
   idle and the like. A per-owner cursor (`~/.ultracodex/notify/<hash>.json`) lets a re-armed watcher continue without
-  missing or repeating anything; a question still waiting is printed again at startup. Default `--max-wait` 1740 s
+  missing or repeating anything (also not the same usage-limit wait: the cursor remembers which event reported it); a question still
+  waiting is printed again at startup. Default `--max-wait` 1740 s
   (fits the Monitor tool's 30-minute cap); `--forever` takes a per-owner singleton lock; no owner and no `--all` →
   `{"codex":"notify_unavailable",…}`, exit 1. It writes no heartbeat. `gc` prunes cursor and lock files older than a week.
 - **Plugin monitors** (`experimental.monitors` in `plugin.json`): `notify --forever` starts when `codex-implement`,
@@ -50,7 +53,10 @@ the one-shot behaviour and the Workflow path are unchanged.
   default true, `ULTRACODEX_FOLLOW_ACCOUNT_SWITCH=0` flips the default), an ephemeral run, no thread id yet, a review run (resuming an
   `exec review` thread is not supported), the budget used up, too little work time left; a stop whose teardown cannot be verified is not
   resumed and ends with an `account_switch` failure that says so. A missing or unreadable login and a token refresh on the same account are
-  not switches. New session event `account_switch {status: pending | interrupting | not_followed}`; `notify` prints nothing for the
+  not switches. The decision is judged when the switch is seen and again at the boundary itself (the step may have used up the work time; a
+  pending handoff whose account is back, A -> B -> A, is cancelled), the stream of a one-shot attempt is read completely before a boundary is
+  declared (never with a line unread), and a session turn's pending handoff keeps watching the account. New session event
+  `account_switch {status: pending | cancelled | interrupting | not_followed}`; `notify` prints nothing for the
   handed-over part. Test-only: `ULTRACODEX_TEST_ACCOUNT_IDENTITY_FILE` makes the text of a file the managed account, so the mechanics can be
   checked live without touching the real `auth.json`.
 - **Safety: an idle session sleeps as soon as the account changes.** An idle session kept its `codex app-server` for `idleTtlSec` (20 min) and never

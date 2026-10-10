@@ -456,3 +456,62 @@ test("a usage-limit wait is one line: the first event that knows when usage is b
   addEvents(run, [["limit_wait", { resumesAt: null, t: "2026-01-01T00:00:00.000Z" }]]);
   assert.deepEqual(lines(), [{ codex: "limit_wait", ...base, resumesAt: null }]);
 });
+
+// ── review findings ──
+
+test("a re-armed watcher does not report the same usage-limit wait again; the next wait is reported", async (t) => {
+  const home = makeHome(t);
+  useHome(t, home);
+  const run = fakeRun(home);
+  const file = cursorFile(home, "owner-a");
+  const now = () => new Date().toISOString();
+  // an earlier watcher delivers whatever its tick finds, the way watchLoop does
+  const deliver = (watcher) => {
+    const items = watcher.tick();
+    for (const item of items) watcher.commit(item);
+    return items.map((item) => [item.out.codex, item.out.resumesAt ?? item.out.reason ?? null]);
+  };
+  const first = new Watcher({ owner: "owner-a", cursorFile: file });
+  first.init();
+  addEvents(run, [["limit_wait", { resumesAt: null, t: now() }], ["limit_wait", { resumesAt: "2026-10-10T13:00:00.000Z", t: now() }]]);
+  assert.deepEqual(deliver(first), [["limit_wait", "2026-10-10T13:00:00.000Z"]]);
+  assert.equal(readJson(file).limit[run.runId], 2, "the cursor remembers which event reported the wait");
+
+  // the Monitor watcher ended and is armed again: the probe's revised estimate is the same wait
+  const second = new Watcher({ owner: "owner-a", cursorFile: file });
+  assert.deepEqual(second.init(), []);
+  addEvents(run, [["limit_wait", { resumesAt: "2026-10-10T13:05:00.000Z", t: now() }]]);
+  assert.deepEqual(deliver(second), [], "still the same wait");
+  addEvents(run, [["resumed", { reason: "limit_reset" }]]);
+  assert.deepEqual(deliver(second), [["resumed", "limit_reset"]]);
+
+  // armed again after that wait ended (the cursor covers its end): a new wait is news
+  const third = new Watcher({ owner: "owner-a", cursorFile: file });
+  assert.deepEqual(third.init(), []);
+  addEvents(run, [["turn_started", { reason: "continuation" }], ["limit_wait", { resumesAt: "2026-10-11T00:00:00.000Z", t: now() }]]);
+  assert.deepEqual(deliver(third), [["limit_wait", "2026-10-11T00:00:00.000Z"]]);
+  addEvents(run, [["limit_wait", { resumesAt: "2026-10-11T00:05:00.000Z", t: now() }]]);
+  const fourth = new Watcher({ owner: "owner-a", cursorFile: file });
+  fourth.init();
+  assert.deepEqual(deliver(fourth), [], "and that one is the same wait too, for whoever comes next");
+});
+
+test("a wait that was reported with no time stays reported across a re-armed watcher", async (t) => {
+  const home = makeHome(t);
+  useHome(t, home);
+  const run = fakeRun(home);
+  const file = cursorFile(home, "owner-a");
+  const deliver = (watcher) => {
+    const items = watcher.tick();
+    for (const item of items) watcher.commit(item);
+    return items.map((item) => [item.out.codex, item.out.resumesAt ?? null]);
+  };
+  const first = new Watcher({ owner: "owner-a", cursorFile: file, limitNullMs: 400 });
+  first.init();
+  addEvents(run, [["limit_wait", { resumesAt: null, t: "2026-01-01T00:00:00.000Z" }]]);
+  assert.deepEqual(deliver(first), [["limit_wait", null]], "a wait that has gone on without a time is reported once");
+  const second = new Watcher({ owner: "owner-a", cursorFile: file });
+  second.init();
+  addEvents(run, [["limit_wait", { resumesAt: "2026-10-10T13:00:00.000Z", t: new Date().toISOString() }]]);
+  assert.deepEqual(deliver(second), [], "its time turning up later is not a second report");
+});

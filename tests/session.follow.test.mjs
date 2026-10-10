@@ -228,3 +228,54 @@ test("notify tells of the handoff once: one resumed line, no turn_done or ended 
     [["resumed", null, "account_change", null], ["turn_done", 2, null, true]]
   );
 });
+
+// ── review findings ──
+
+test("a switch that waits behind a command until too little work time is left is not followed: the turn finishes on the old account", async (t) => {
+  const { home, env, calls, switchTo } = followHome(t, { ULTRACODEX_MIN_TIMEOUT_SEC: "60" });
+  const runId = await startSession(env, home, { task: "run\nFAKE_COMMAND_MS=3000\nFAKE_TURN_MS=1500\nFAKE_ANSWER=old", tier: "light", timeoutSec: 62 });
+  assert.ok(await untilEvent(home, runId, (event) => event.type === "command_started" && event.command === "held fake command"));
+  switchTo("account-b");
+  const final = await wait(env, runId, 60);
+  assert.deepEqual([final.json.ok, final.json.text, final.json.session.turn], [true, "old", 1], final.stdout);
+  assert.deepEqual(switches(home, runId), ["pending", "not_followed"], "accepted when seen, judged again at the boundary");
+  const refused = sessionEvents(home, runId).find((event) => event.status === "not_followed");
+  assert.match(refused.reason, /too little work time is left/);
+  assert.equal(requests(calls(), "turn/interrupt").length, 0, "not interrupted");
+  assert.equal(serverSpawns(calls()).length, 1);
+});
+
+test("a pending handoff keeps watching the account: A, B, A before the boundary cancels it", async (t) => {
+  const { home, env, calls, switchTo } = followHome(t);
+  const runId = await startSession(env, home, { task: "run\nFAKE_COMMAND_MS=3000\nFAKE_ANSWER=old", tier: "light" });
+  assert.ok(await untilEvent(home, runId, (event) => event.type === "command_started" && event.command === "held fake command"));
+  switchTo("account-b");
+  assert.ok(await untilEvent(home, runId, (event) => event.type === "account_switch" && event.status === "pending"));
+  switchTo("account-a");
+  assert.ok(await untilEvent(home, runId, (event) => event.type === "account_switch" && event.status === "cancelled"), "the way back is noticed while the command still runs");
+  assert.equal(requests(calls(), "turn/interrupt").length, 0);
+
+  const final = await wait(env, runId, 60);
+  assert.deepEqual([final.json.ok, final.json.text, final.json.session.turn], [true, "old", 1], final.stdout);
+  assert.deepEqual(switches(home, runId), ["pending", "cancelled"], "no interrupt, no restart on the account it is already on");
+  assert.equal(requests(calls(), "turn/interrupt").length, 0);
+  assert.equal(serverSpawns(calls()).length, 1);
+  assert.deepEqual(resumes(home, runId), []);
+  await pause(500);
+  assert.equal(readState(home, runId).state, "idle", "and the account is the one it started on: nothing puts it to sleep either");
+});
+
+test("a switch that is real again after a cancelled one is followed", async (t) => {
+  const { home, env, switchTo } = followHome(t);
+  const runId = await startSession(env, home, { task: "run\nFAKE_COMMAND_MS=2500\nFAKE_TURN_MS=30000", tier: "light" });
+  assert.ok(await untilEvent(home, runId, (event) => event.type === "command_started" && event.command === "held fake command"));
+  switchTo("account-b");
+  assert.ok(await untilEvent(home, runId, (event) => event.type === "account_switch" && event.status === "pending"));
+  switchTo("account-a");
+  assert.ok(await untilEvent(home, runId, (event) => event.type === "account_switch" && event.status === "cancelled"));
+  switchTo("account-c");
+  const final = await wait(env, runId, 60);
+  assert.deepEqual([final.json.ok, final.json.session.turn], [true, 2], final.stdout);
+  assert.deepEqual(switches(home, runId), ["pending", "cancelled", "pending", "interrupting"]);
+  assert.deepEqual(resumes(home, runId), ["account_change"]);
+});

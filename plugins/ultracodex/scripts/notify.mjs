@@ -9,8 +9,9 @@
 // changes, steers, idle ...) is never reported.
 //
 // Nothing is missed between two watchers and nothing repeats: a per-owner cursor file
-// (<home>/notify/<hash>.json, {runId: lastSeq, ended: {runId: true}}) is advanced after each line is
-// delivered. A run the cursor does not know starts at its current end (history is not replayed), except
+// (<home>/notify/<hash>.json, {runId: lastSeq, ended: {runId: true}, limit: {runId: seq}}) is advanced after
+// each line is delivered (`limit`: the event whose limit_wait line was delivered, so a re-armed watcher does
+// not report the same usage-limit wait again). A run the cursor does not know starts at its current end (history is not replayed), except
 // for a question that is still pending, which is always reported once at startup.
 //
 // This module imports the runner back (codex-node.mjs imports it too): every name taken from it is
@@ -62,13 +63,16 @@ export const lockPath = (owner) => path.join(notifyDir(), `${ownerHash(owner)}.l
 
 function loadCursor(file) {
   const raw = file ? readJsonSafe(file) : null;
-  const cursor = { runs: {}, ended: {} };
+  const cursor = { runs: {}, ended: {}, limit: {} };
   if (!isPlainObject(raw)) return cursor;
   for (const [key, value] of Object.entries(raw)) {
     if (RUN_ID_RE.test(key) && Number.isInteger(value) && value >= 0) cursor.runs[key] = value;
   }
   if (isPlainObject(raw.ended)) {
     for (const key of Object.keys(raw.ended)) if (RUN_ID_RE.test(key) && raw.ended[key] === true) cursor.ended[key] = true;
+  }
+  if (isPlainObject(raw.limit)) {
+    for (const [key, value] of Object.entries(raw.limit)) if (RUN_ID_RE.test(key) && Number.isInteger(value) && value >= 0) cursor.limit[key] = value;
   }
   return cursor;
 }
@@ -80,12 +84,15 @@ function saveCursor(file, cursor) {
     const disk = loadCursor(file); // another watcher of the same owner may have moved on
     for (const [runId, seq] of Object.entries(disk.runs)) cursor.runs[runId] = Math.max(cursor.runs[runId] ?? 0, seq);
     Object.assign(cursor.ended, disk.ended);
+    for (const [runId, seq] of Object.entries(disk.limit)) cursor.limit[runId] = Math.max(cursor.limit[runId] ?? 0, seq);
     const out = {};
     for (const runId of Object.keys(cursor.runs).sort()) {
       if (fs.existsSync(runPaths(runId).dir)) out[runId] = cursor.runs[runId]; // a gc'ed run drops out
     }
     const ended = Object.keys(cursor.ended).filter((runId) => out[runId] !== undefined);
     if (ended.length) out.ended = Object.fromEntries(ended.sort().map((runId) => [runId, true]));
+    const limit = Object.keys(cursor.limit).filter((runId) => out[runId] !== undefined);
+    if (limit.length) out.limit = Object.fromEntries(limit.sort().map((runId) => [runId, cursor.limit[runId]]));
     fs.mkdirSync(path.dirname(file), { recursive: true });
     writeJsonAtomic(file, out);
   } catch {
@@ -190,7 +197,7 @@ export class Watcher {
     this.owner = owner;
     this.cursorFile = cursorFile;
     this.from = from;
-    this.cursor = { runs: {}, ended: {} };
+    this.cursor = { runs: {}, ended: {}, limit: {} };
     this.tracked = new Map(); // runId -> { run: {runId, label, paths}, offset, seq, endedDone }
     this.known = new Set(); // runs looked at and not ours (or tracked): never read again
     this.printedQuestions = new Set();
@@ -242,7 +249,10 @@ export class Watcher {
     const result = readJsonSafe(paths.result);
     const finished = result !== null;
     const known = Object.hasOwn(this.cursor.runs, runId);
-    const track = { run, offset: 0, seq: this.cursor.runs[runId] ?? 0, endedDone: Boolean(this.cursor.ended[runId]), limit: { pending: null, printed: false } };
+    // limitReported: the event whose limit_wait line an earlier watcher delivered; that wait stays reported
+    // until an event that ends a wait (tick looks for one in what the cursor already covers, too)
+    const limitReported = this.cursor.limit[runId] ?? null;
+    const track = { run, offset: 0, seq: this.cursor.runs[runId] ?? 0, endedDone: Boolean(this.cursor.ended[runId]), limit: { pending: null, printed: limitReported !== null }, limitReported };
     // an ended session the cursor has fully caught up with has nothing left to say
     if (known && finished && lastEventSeq(paths.events) <= track.seq && (track.endedDone || result.state !== "failed")) return false;
     if (!known && !this.started) {
@@ -282,11 +292,23 @@ export class Watcher {
       }
       const batch = readAll(run.paths.events, track.offset);
       track.offset = batch.offset;
+      if (track.limitReported !== null) {
+        // what the cursor already covers may hold the end of the wait that was reported
+        for (const event of batch.events) {
+          if (Number.isInteger(event.seq) && event.seq <= track.seq && event.seq > track.limitReported && WAIT_ENDS.has(event.type)) {
+            track.limit = { pending: null, printed: false };
+            track.limitReported = null;
+          }
+        }
+      }
       const fresh = batch.events.filter((event) => Number.isInteger(event.seq) && event.seq > track.seq);
       const answered = new Set(fresh.filter((event) => event.type === "answer").map((event) => String(event.id)));
       for (const event of fresh) {
         track.seq = Math.max(track.seq, event.seq);
-        if (WAIT_ENDS.has(event.type)) track.limit = { pending: null, printed: false };
+        if (WAIT_ENDS.has(event.type)) {
+          track.limit = { pending: null, printed: false };
+          track.limitReported = null;
+        }
         if (event.type === "limit_wait") {
           const line = this.limitWait(track, event);
           if (line) items.push(line);
@@ -350,6 +372,7 @@ export class Watcher {
   commit(item) {
     if (item.seq !== null) this.cursor.runs[item.runId] = Math.max(this.cursor.runs[item.runId] ?? 0, item.seq);
     if (item.ended) this.cursor.ended[item.runId] = true;
+    if (item.out?.codex === "limit_wait" && item.seq !== null) this.cursor.limit[item.runId] = Math.max(this.cursor.limit[item.runId] ?? 0, item.seq);
     saveCursor(this.cursorFile, this.cursor);
   }
 }

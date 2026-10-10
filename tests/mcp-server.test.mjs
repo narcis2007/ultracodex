@@ -9,6 +9,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { newRunId } from "../plugins/ultracodex/scripts/codex-node.mjs";
+import { runRunner } from "../plugins/ultracodex/scripts/mcp-server.mjs";
 import { ROOT, eventually, fastEnv, makeHome, runCli } from "./helpers.mjs";
 import { requests, sessionEvents, sessionHome, startSession, untilEvent } from "./helpers-session.mjs";
 
@@ -470,4 +471,50 @@ test("the channel reports a usage-limit wait once, not once per event", async (t
   await sleep(1500);
   assert.deepEqual(server.channel().map((message) => message.meta.event), ["limit_wait", "resumed", "limit_wait"]);
   assert.ok(!/usage should be back/.test(server.channel()[2].content));
+});
+
+// ── review findings ──
+
+test("the runner's output is decoded as UTF-8 across chunk boundaries (diacritics split by the pipe)", async () => {
+  const text = "Ștefan și Țepeș merg la Iași: ăâîșț ĂÂÎȘȚ — gata";
+  const out = await runRunner([text], { owner: { id: "o" }, timeoutMs: 30_000, file: path.join(ROOT, "tests", "fixtures", "chunked-output.mjs") });
+  assert.equal(out.code, 0);
+  assert.equal(out.stdout, text, "no character lost to a split");
+  assert.equal(out.stderr, text.replace(/\s+$/, ""));
+  assert.ok(!out.stdout.includes("\uFFFD") && !out.stderr.includes("\uFFFD"), "no replacement character");
+  assert.equal(out.truncated, false);
+});
+
+test("codex_sessions asks the runner for sessions only: hundreds of runs never have to fit the output cap", async (t) => {
+  const home = makeHome(t);
+  const env = fastEnv(home, { ULTRACODEX_OWNER: "owner-mcp" });
+  for (let at = 0; at < 1500; at += 1) {
+    const runId = newRunId(new Date(Date.UTC(2025, 0, 1, 0, 0, at)));
+    fs.mkdirSync(path.join(home, "runs", runId), { recursive: true });
+    fs.writeFileSync(path.join(home, "runs", runId, "state.json"), JSON.stringify({ runId, state: "done", label: "an old one-shot run", kind: "ask", cwd: home }));
+  }
+  const mine = fakeRun(home, 0, { owner: "owner-mcp" });
+  const theirs = fakeRun(home, 0, { owner: "someone-else" });
+  const status = await runCli(["status", "--all"], { env });
+  assert.ok(status.stdout.length > 400_000, `the whole history is more than the tool collects (${status.stdout.length})`);
+
+  const server = startServer(t, env);
+  await server.initialize();
+  const listed = await server.call("codex_sessions");
+  assert.equal(listed.isError, false, listed.text);
+  assert.deepEqual(listed.json.sessions.map((entry) => [entry.runId, entry.owner]), [[mine.runId, "mine"]]);
+  const everyone = await server.call("codex_sessions", { all: true });
+  assert.deepEqual(everyone.json.sessions.map((entry) => entry.runId).sort(), [mine.runId, theirs.runId].sort());
+});
+
+test("codex_sessions never parses output that was cut off: it says so", async (t) => {
+  const home = makeHome(t);
+  const env = fastEnv(home, { ULTRACODEX_OWNER: "owner-mcp", ULTRACODEX_MCP_OUTPUT_CAP: "1500" });
+  for (let index = 0; index < 20; index += 1) fakeRun(home, 0, { owner: "owner-mcp" });
+  const server = startServer(t, env);
+  await server.initialize();
+  const out = await server.call("codex_sessions");
+  assert.equal(out.isError, true);
+  assert.match(out.text, /longer than this tool reads/);
+  assert.match(out.text, /nothing was parsed/);
 });

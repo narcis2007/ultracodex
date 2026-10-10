@@ -1134,9 +1134,13 @@ test("the rate-limit probe asks an app-server for the limits, sends nothing else
   assert.equal((await probeRateLimits({ launcher })).allowed, null);
   assert.deepEqual(await probeRateLimits({ launcher }), { ok: false, reason: "rpc_error" });
   assert.deepEqual(await probeRateLimits({ launcher }), { ok: false, reason: "exited" });
-  assert.deepEqual(await probeRateLimits({ launcher, timeoutMs: 400 }), { ok: false, reason: "timeout" });
-  assert.deepEqual(await probeRateLimits({ launcher, timeoutMs: 400 }), { ok: false, reason: "timeout" }, "a server that ignores the close is killed");
-  const seen = fs.readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);
+  // the two servers that never answer: the timeout must outlast a loaded machine's start-up of the fake
+  // app-server, or its read is never logged (6 of 7) and the count below proves nothing
+  assert.deepEqual(await probeRateLimits({ launcher, timeoutMs: 3000 }), { ok: false, reason: "timeout" });
+  assert.deepEqual(await probeRateLimits({ launcher, timeoutMs: 3000 }), { ok: false, reason: "timeout" }, "a server that ignores the close is killed");
+  const logged = () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").map(JSON.parse) : []);
+  for (let attempt = 0; attempt < 100 && logged().filter((entry) => entry.method === "account/rateLimits/read").length < 7; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+  const seen = logged();
   assert.deepEqual([...new Set(seen.map((entry) => entry.method))], ["initialize", "initialized", "account/rateLimits/read"], "read-only: nothing else is ever sent");
   assert.equal(seen.filter((entry) => entry.method === "account/rateLimits/read").length, 7);
   for (const pid of new Set(seen.map((entry) => entry.pid))) assert.ok(await waitUntilGone(pid), `probe process ${pid} is gone`);

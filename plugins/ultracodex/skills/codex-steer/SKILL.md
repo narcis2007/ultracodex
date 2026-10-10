@@ -130,6 +130,7 @@ node "<runner>" events RUN_ID [--since SEQ] [--follow] [--max-wait SEC]
 node "<runner>" close RUN_ID [--force] [--archive]
 node "<runner>" notify [--owner ID | --all] [--max-wait SEC | --forever] [--from now|cursor]
 node "<runner>" status [RUN_ID] [--mine]  # every run, sessions included; --mine = this Claude session's
+node "<runner>" status --sessions [--mine | --owner ID | --all] [--limit N]   # only session runs, newest first (default 50)
 ```
 
 Each prints one JSON line (`events` prints the events themselves, one JSON object per line, and

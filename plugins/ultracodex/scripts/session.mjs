@@ -1606,28 +1606,45 @@ class SessionDriver {
   // The managed ChatGPT account changed while this turn runs (followAccountSwitch): the turn is handed
   // over at the next step boundary (no tool call in flight, no question waiting) by interrupting it;
   // it then ends as an "account_switch" failure and continuation() resumes the thread on a new
-  // app-server with the new login. A running command is never interrupted. Whether to follow is
-  // decided when the switch is seen: not without a saved thread, not past the handoff budget, not
-  // with too little time left; then the turn finishes on the old account.
+  // app-server with the new login. A running command is never interrupted. Whether to follow is judged
+  // when the switch is seen — not without a saved thread, not past the handoff budget, not with too
+  // little time left — and again at the boundary itself (the step may have taken the time or the
+  // account may be back): then the turn finishes on the old account. A pending handoff keeps watching
+  // the account: A -> B -> A before the boundary cancels it.
   async followSwitch(turn, server) {
     if (this.request.followAccountSwitch === false || turn.finished || turn.switchSkipped || turn.interruptReason) return;
-    if (!turn.switchPending) {
-      if (Date.now() < this.nextTurnAccountCheckAt) return;
+    const notFollowed = (why) => {
+      turn.switchSkipped = true;
+      turn.switchPending = false;
+      this.log(`turn ${turn.n}: the managed account changed, but the turn is not followed (${why}); it finishes on the old account`);
+      this.events.append("account_switch", { status: "not_followed", reason: why });
+    };
+    const cancelled = () => {
+      turn.switchPending = false;
+      this.log(`turn ${turn.n}: the managed account is back to the one this turn runs on; nothing to hand over`);
+      this.events.append("account_switch", { status: "cancelled" });
+    };
+    if (Date.now() >= this.nextTurnAccountCheckAt) {
       this.nextTurnAccountCheckAt = Date.now() + TIMING.accountCheckMs;
       const current = managedAccountIdentity();
-      if (!(current && server.account && current !== server.account)) return;
-      const why = this.switchNotFollowedBecause(turn);
-      if (why) {
-        turn.switchSkipped = true;
-        this.log(`turn ${turn.n}: the managed account changed, but the turn is not followed (${why}); it finishes on the old account`);
-        this.events.append("account_switch", { status: "not_followed", reason: why });
-        return;
+      if (turn.switchPending) {
+        if (current === server.account) return cancelled();
+      } else {
+        if (!(current && server.account && current !== server.account)) return;
+        const why = this.switchNotFollowedBecause(turn);
+        if (why) return notFollowed(why);
+        turn.switchPending = true;
+        this.log(`turn ${turn.n}: the managed account changed; handing the turn over at the next step boundary`);
+        this.events.append("account_switch", { status: "pending" });
       }
-      turn.switchPending = true;
-      this.log(`turn ${turn.n}: the managed account changed; handing the turn over at the next step boundary`);
-      this.events.append("account_switch", { status: "pending" });
     }
-    if (turn.inFlight.size || this.questions.length) return;
+    if (!turn.switchPending || turn.inFlight.size || this.questions.length) return;
+    // the boundary: judged again, on fresh facts
+    const current = managedAccountIdentity();
+    if (current === server.account) return cancelled();
+    if (!current) return; // unreadable just now: not a switch to follow, not an undo either
+    const why = this.switchNotFollowedBecause(turn);
+    if (why) return notFollowed(why);
     turn.interruptReason = "account_switch";
     turn.killAt = Date.now() + TIMING.killGraceMs; // an app-server that ignores the interrupt is stopped
     this.handoff = true;
