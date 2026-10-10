@@ -182,7 +182,12 @@ test("codexNode: a node that was steered reports its steers; a batch node passes
     for (let round = 0; round < 200; round += 1) {
       const runs = fs.existsSync(path.join(home, "runs")) ? fs.readdirSync(path.join(home, "runs")) : [];
       for (const runId of runs) {
-        const state = readState(home, runId);
+        let state;
+        try {
+          state = readState(home, runId);
+        } catch {
+          continue; // the run directory exists before its state.json: look again next round
+        }
         if (state.singleTurn && state.state === "running" && state.label === "steered node") {
           const out = await runCli(["send", runId, "--message", "check the tests too", "--mode", "steer"], { env });
           if (out.json?.outcome === "steered") return out.json;
