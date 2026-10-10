@@ -36,6 +36,23 @@ the one-shot behaviour and the Workflow path are unchanged.
   own cursor namespace; `ULTRACODEX_CHANNEL=0` turns it off. Registered only when Claude Code is started with
   `--dangerously-load-development-channels plugin:ultracodex@ultracodex`; otherwise the notifications are dropped
   silently and the tools work as before.
+- **PrimerSwitch: running work follows an account switch within seconds** (at the next step boundary; running commands are never stopped;
+  `followAccountSwitch: false` to opt out). Until now a turn or an attempt that was running when the owner switched ChatGPT accounts
+  went on, on the old account, until it finished or failed. Now, while it runs, the supervisor compares the managed account with the
+  one it started on every `ULTRACODEX_ACCOUNT_CHECK_MS` (2 s). On a change it waits for a step boundary — no command, file change, MCP or
+  dynamic tool call or web search in flight (a pending `ask_orchestrator` question counts), never interrupting one — then interrupts
+  the turn (a session: `turn/interrupt`, then a new app-server, `thread/resume`, the hermetic check and the continuation prompt, announced
+  as `resumed {reason: "account_change"}`; the interrupted part is turn n's `turns/<n>.json` with kind `account_switch`, not a result and
+  not a `turn_done` line) or stops the attempt (a one-shot `codex exec`: the normal teardown, then `exec resume` of the same thread with the
+  sandbox restated, no wait). It counts in the 8-handoff budget and the job's deadline, and rejected encrypted reasoning takes the
+  checkpoint fallback. A message sent during a session's handoff is held back and steers the continuation. Not followed (and the run
+  finishes on the old account, with a log line saying why): `followAccountSwitch: false` (request field, allowed in relayed requests;
+  default true, `ULTRACODEX_FOLLOW_ACCOUNT_SWITCH=0` flips the default), an ephemeral run, no thread id yet, a review run (resuming an
+  `exec review` thread is not supported), the budget used up, too little work time left; a stop whose teardown cannot be verified is not
+  resumed and ends with an `account_switch` failure that says so. A missing or unreadable login and a token refresh on the same account are
+  not switches. New session event `account_switch {status: pending | interrupting | not_followed}`; `notify` prints nothing for the
+  handed-over part. Test-only: `ULTRACODEX_TEST_ACCOUNT_IDENTITY_FILE` makes the text of a file the managed account, so the mechanics can be
+  checked live without touching the real `auth.json`.
 - **Safety: an idle session sleeps as soon as the account changes.** An idle session kept its `codex app-server` for `idleTtlSec` (20 min) and never
   looked at the managed account again; a Codex process that refreshes its tokens after the owner switched ChatGPT accounts merges the old
   account's tokens into the new `auth.json` and corrupts the login. Now an idle session (no turn, nothing queued) compares the managed account

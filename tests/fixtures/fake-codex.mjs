@@ -85,6 +85,7 @@ if (argv[0] === "debug" && argv[1] === "models") {
 //      FAKE_QUOTA_WORK=file  appends "applied once" to file (an effect that must not be replayed)
 //      FAKE_CALL_TOOL=name   the turn calls that client-side tool (arguments {question: "q"}) and reports the reply
 //      FAKE_REQUEST=method   the turn sends the client that server request (an approval, say), expecting an error back
+//      FAKE_COMMAND_MS=n     the turn holds a command in flight for n ms ("held fake command": item/started, then item/completed)
 //    Environment: FAKE_CODEX_SESSION_LOG (one JSON line per spawn / request / answer, with params),
 //    FAKE_CODEX_MCP_SERVERS ({"name": tools} or {"name": {"tools": n, "sticky": true}}: a server
 //    reports `tools` tools unless the app-server was started with mcp_servers.<name>.enabled=false;
@@ -92,7 +93,8 @@ if (argv[0] === "debug" && argv[1] === "models") {
 //    account change fails with the encrypted-content rejection), FAKE_CODEX_ACCOUNT_AFTER_FAILURE
 //    (the account written to auth.json when a turn fails with the usage limit), FAKE_CODEX_MCP_ERROR=1
 //    (mcpServerStatus/list fails), FAKE_CODEX_MCP_PAGES=1 (one server per page, with nextCursor),
-//    FAKE_CODEX_RESUME_FAILS=1 (thread/resume fails). Each thread writes a Codex-style rollout file
+//    FAKE_CODEX_RESUME_FAILS=1 (thread/resume fails), FAKE_CODEX_RESUME_MS=n (thread/resume answers after n ms: a wide
+//    window for what happens during an account handoff), FAKE_CODEX_TURN_MS=n (the default length of every turn). Each thread writes a Codex-style rollout file
 //    under $CODEX_HOME/sessions (visible messages and tool output) for the checkpoint fallback.
 if (argv[0] === "app-server") {
   if (argv[1] !== "--listen" || argv[2] !== "stdio://") {
@@ -253,8 +255,12 @@ if (argv[0] === "app-server") {
     const plan = [{ step: "read", status: "completed" }, { step: "write", status: "inProgress" }];
     notify("turn/plan/updated", { ...base, explanation: null, plan });
     notify("turn/plan/updated", { ...base, explanation: null, plan });
-    notify("item/started", { ...base, item: item({ type: "mcpToolCall", server: "docs", tool: "search", status: "inProgress", arguments: {} }) });
-    notify("item/started", { ...base, item: item({ type: "webSearch", query: "fake", action: null }) });
+    const mcpCall = item({ type: "mcpToolCall", server: "docs", tool: "search", status: "inProgress", arguments: {} });
+    notify("item/started", { ...base, item: mcpCall });
+    notify("item/completed", { ...base, item: { ...mcpCall, status: "completed" } });
+    const searchCall = item({ type: "webSearch", query: "fake", action: null });
+    notify("item/started", { ...base, item: searchCall });
+    notify("item/completed", { ...base, item: searchCall });
     thread.usage.input += 120;
     thread.usage.output += 12;
     thread.usage.reasoning += 4;
@@ -290,6 +296,13 @@ if (argv[0] === "app-server") {
       });
       answered = response?.result ?? { error: response?.error };
       notify("item/completed", { ...base, item: { ...call, status: "completed", contentItems: answered.contentItems ?? null, success: answered.success ?? false } });
+    }
+    const heldMs = Number(lineDirective(text, "COMMAND_MS") ?? 0);
+    if (heldMs > 0) {
+      const held = item({ type: "commandExecution", command: "held fake command", cwd: thread.cwd, status: "inProgress", aggregatedOutput: null, exitCode: null, durationMs: null });
+      notify("item/started", { ...base, item: held });
+      await sleepMs(heldMs); // a running command is not interrupted: the interrupt, if any, is acted on after it
+      notify("item/completed", { ...base, item: { ...held, status: "completed", aggregatedOutput: "held", exitCode: 0, durationMs: heldMs } });
     }
     const hang = lineDirective(text, "HANG") === "1";
     const ignoreInterrupt = active.ignoreInterrupt;
@@ -381,6 +394,7 @@ if (argv[0] === "app-server") {
         if (typeof params.threadId !== "string" || !["read-only", "workspace-write"].includes(params.sandbox) || params.approvalPolicy !== "never") return rpcError(id, -32602, "invalid threadId/sandbox/approvalPolicy");
         if (process.env.FAKE_CODEX_RESUME_FAILS === "1") return rpcError(id, -32603, "no rollout found for thread id");
         startThread(params.threadId, params, true);
+        if (Number(process.env.FAKE_CODEX_RESUME_MS ?? 0) > 0) await sleepMs(Number(process.env.FAKE_CODEX_RESUME_MS));
         return reply(id, { result: { thread: { id: thread.id }, sandbox: params.sandbox, approvalPolicy: params.approvalPolicy, model: params.model ?? thread.model } });
       }
       case "turn/start": {
@@ -496,6 +510,9 @@ const apiFailure = (status, error) => {
   process.exit(1);
 };
 
+// FAKE_THREAD_DELAY_MS: Codex takes a while to say which thread this is
+const threadDelayMs = Number(directive("THREAD_DELAY_MS") ?? 0);
+if (threadDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, threadDelayMs));
 emit({ type: "thread.started", thread_id: resumeId ?? `01a0fake-0000-7000-8000-${String(process.pid).padStart(12, "0")}` });
 emit({ type: "turn.started" });
 
@@ -597,6 +614,18 @@ const finish = () => {
   });
   process.exit(exitCode);
 };
+
+// FAKE_STEPS=model:600,command:2000,model:5000 (or FAKE_CODEX_STEPS, for every attempt including a resume,
+// whose prompt carries no directives): a model step is time with nothing in flight; command, file, mcp and
+// search hold such an item in flight (item.started ... item.completed) for the time given.
+const STEP_TYPES = { command: "command_execution", file: "file_change", mcp: "mcp_tool_call", search: "web_search" };
+for (const [index, step] of (directive("STEPS") ?? process.env.FAKE_CODEX_STEPS ?? "").split(",").filter(Boolean).entries()) {
+  const [kind, ms] = step.split(":");
+  const type = STEP_TYPES[kind];
+  if (type) emit({ type: "item.started", item: { id: `step-${index}`, type, status: "in_progress" } });
+  await new Promise((resolve) => setTimeout(resolve, Number(ms)));
+  if (type) emit({ type: "item.completed", item: { id: `step-${index}`, type, status: "completed" } });
+}
 
 const sleepMs = Number(directive("SLEEP_MS") ?? 0);
 if (sleepMs > 0) setTimeout(finish, sleepMs);

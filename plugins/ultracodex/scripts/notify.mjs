@@ -129,6 +129,9 @@ function itemFor(run, event, answered) {
       return item(questionLine(run, event.turn, questionId, event.question));
     }
     case "turn_completed":
+      // the part of a turn that was handed over to a newly selected account is not a result: its
+      // continuation is announced as `resumed` (account_change) and the continuation's end as turn_done
+      if (event.kind === "account_switch") return null;
       return item({
         codex: "turn_done",
         ...base,

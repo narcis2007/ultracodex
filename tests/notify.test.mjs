@@ -233,6 +233,8 @@ test("only actionable events become lines, with the fields the Monitor and the c
     ["resumed", { reason: "limit_reset" }],
     ["resumed", { reason: "revive" }],
     ["resumed", { reason: "account_change" }],
+    ["account_switch", { status: "pending" }],
+    ["turn_completed", { turn: 1, status: "interrupted", ok: false, kind: "account_switch" }], // the part handed over to a new account: no line
     ["error", { kind: "execution", message: "transient", willRetry: true }],
     ["error", { kind: "usage_limit", message: "the limit   was hit", willRetry: false }],
     ["hermetic_violation", { servers: ["github", "slack"] }],

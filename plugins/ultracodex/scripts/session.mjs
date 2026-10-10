@@ -90,6 +90,8 @@ import {
 
 const MAX_LINE_CHARS = 32 * 1024 * 1024; // one JSON-RPC line (a command's whole output can be big)
 export const EVENT_CAP_BYTES = 8 * 1024 * 1024; // past this events.jsonl keeps only the structural events (the env knob is for tests)
+// the items that are a step in flight: Codex is not interrupted between an item/started and its item/completed
+const STEP_ITEMS = new Set(["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"]);
 const CHATTY_EVENTS = new Set(["command_started", "command", "file_change", "plan", "tool"]);
 const MESSAGE_KINDS = new Set(["send", "interrupt", "answer", "close"]);
 
@@ -736,6 +738,8 @@ class SessionDriver {
     this.slot = null;
     this.nextSnapshotAt = 0;
     this.nextAccountCheckAt = 0;
+    this.nextTurnAccountCheckAt = 0;
+    this.handoff = false; // a turn was interrupted for an account switch and its continuation has not started yet
     // read by the Phase 1 limit/account waits through the run's context: how a session's inbox
     // reaches them (close and interrupt must not wait out a 24-hour limit wait)
     context.waitStop = () => this.waitStopHook();
@@ -978,6 +982,8 @@ class SessionDriver {
     // a session that is being closed takes nothing new: a message acknowledged now would be lost
     if (this.closeRequest) return this.finish(message, { outcome: "rejected", reason: "session_closing" });
     const turn = this.active;
+    // a turn being handed over to a new account takes nothing: the message goes into its continuation
+    if (mode !== "queue" && (turn ? turn.interruptReason === "account_switch" : this.handoff)) return "defer";
     if (!turn) {
       if (mode === "steer") return this.finish(message, { outcome: "rejected", reason: "no_active_turn" });
       return this.enqueue(message, { started: !this.chain });
@@ -1033,7 +1039,7 @@ class SessionDriver {
     const turn = this.active;
     if (!turn) return this.finish(message, { outcome: "no_active_turn" });
     if (!turn.id) return "defer";
-    turn.interruptReason ??= "interrupt";
+    if (turn.interruptReason === null || turn.interruptReason === "account_switch") turn.interruptReason = "interrupt"; // a user's interrupt outranks a handoff in progress
     this.events.append("interrupt", {});
     this.failQuestions("The orchestrator interrupted the turn.");
     const interrupted = await this.interruptTurn(turn);
@@ -1075,6 +1081,7 @@ class SessionDriver {
       if (this.closeRequest?.message.id === message.id) continue;
       if (message.kind === "send") {
         const mode = ["auto", "steer", "queue"].includes(message.mode) ? message.mode : "auto";
+        if (this.handoff && mode !== "queue") continue; // held until the continuation of an account switch runs: it takes it as a steer
         if (typeof message.text !== "string" || !message.text.trim()) this.finish(message, { outcome: "rejected", reason: "empty_message" });
         else if (this.closeRequest) this.finish(message, { outcome: "rejected", reason: "session_closing" });
         else if (mode === "steer") this.finish(message, { outcome: "rejected", reason: "no_active_turn" });
@@ -1404,6 +1411,7 @@ class SessionDriver {
 
   onItemStarted(turn, item) {
     if (!isPlainObject(item)) return;
+    if (STEP_ITEMS.has(item.type) && typeof item.id === "string") turn.inFlight.set(item.id, item.type);
     if (item.type === "commandExecution") this.emit(turn, "command_started", { command: clip(item.command, 300) });
     else if (item.type === "mcpToolCall") this.emit(turn, "tool", { name: clip(`${item.server}/${item.tool}`, 200) });
     else if (item.type === "webSearch") this.emit(turn, "tool", { name: "web_search" });
@@ -1412,6 +1420,7 @@ class SessionDriver {
 
   onItemCompleted(turn, item) {
     if (!isPlainObject(item)) return;
+    if (typeof item.id === "string") turn.inFlight.delete(item.id);
     switch (item.type) {
       case "agentMessage": {
         const text = String(item.text ?? "");
@@ -1502,6 +1511,9 @@ class SessionDriver {
         crashed: false,
         interruptReason: null,
         planKey: null,
+        inFlight: new Map(), // item id -> type, of the steps (tool calls) that have started and not completed
+        switchPending: false, // the managed account changed: waiting for a step boundary to hand the turn over
+        switchSkipped: false,
       };
       turn.account = this.server.account;
       this.active = turn;
@@ -1529,6 +1541,7 @@ class SessionDriver {
         this.finishActive(turn);
       } else {
         this.markStarted(turn);
+        this.handoff = false; // the continuation of a switch is running: what was held back can steer it now
         await this.driveTurn(turn, server);
       }
       if (this.control.fenced) return { kind: "stop", reason: "fenced" };
@@ -1572,6 +1585,7 @@ class SessionDriver {
       }
       await this.processInbox();
       this.autoAnswerDue();
+      await this.followSwitch(turn, server);
       if (!turn.timedOut && Date.now() >= turn.deadlineAt) {
         turn.timedOut = true;
         turn.interruptReason = "timeout";
@@ -1587,6 +1601,48 @@ class SessionDriver {
         this.finishActive(turn);
       }
     }
+  }
+
+  // The managed ChatGPT account changed while this turn runs (followAccountSwitch): the turn is handed
+  // over at the next step boundary (no tool call in flight, no question waiting) by interrupting it;
+  // it then ends as an "account_switch" failure and continuation() resumes the thread on a new
+  // app-server with the new login. A running command is never interrupted. Whether to follow is
+  // decided when the switch is seen: not without a saved thread, not past the handoff budget, not
+  // with too little time left; then the turn finishes on the old account.
+  async followSwitch(turn, server) {
+    if (this.request.followAccountSwitch === false || turn.finished || turn.switchSkipped || turn.interruptReason) return;
+    if (!turn.switchPending) {
+      if (Date.now() < this.nextTurnAccountCheckAt) return;
+      this.nextTurnAccountCheckAt = Date.now() + TIMING.accountCheckMs;
+      const current = managedAccountIdentity();
+      if (!(current && server.account && current !== server.account)) return;
+      const why = this.switchNotFollowedBecause(turn);
+      if (why) {
+        turn.switchSkipped = true;
+        this.log(`turn ${turn.n}: the managed account changed, but the turn is not followed (${why}); it finishes on the old account`);
+        this.events.append("account_switch", { status: "not_followed", reason: why });
+        return;
+      }
+      turn.switchPending = true;
+      this.log(`turn ${turn.n}: the managed account changed; handing the turn over at the next step boundary`);
+      this.events.append("account_switch", { status: "pending" });
+    }
+    if (turn.inFlight.size || this.questions.length) return;
+    turn.interruptReason = "account_switch";
+    turn.killAt = Date.now() + TIMING.killGraceMs; // an app-server that ignores the interrupt is stopped
+    this.handoff = true;
+    this.log(`turn ${turn.n}: no step in flight; interrupting it for the account switch`);
+    this.events.append("account_switch", { status: "interrupting" });
+    await this.interruptTurn(turn);
+  }
+
+  switchNotFollowedBecause(turn) {
+    const chain = this.chain;
+    if (this.request.ephemeral) return "an ephemeral session's thread is not saved";
+    if (!(typeof this.threadId === "string" && SESSION_RE.test(this.threadId))) return "the thread cannot be resumed";
+    if (chain && chain.handoffs >= MAX_ACCOUNT_HANDOFFS) return `the budget of ${MAX_ACCOUNT_HANDOFFS} account handoffs is used up`;
+    if (turn.deadlineAt - Date.now() < Math.max(1, TIMING.minTimeoutSec) * 1000) return "too little work time is left";
+    return null;
   }
 
   // A cancel, an abandoned caller or a fence: interrupt the turn, give it killGraceMs to end,
@@ -1626,6 +1682,7 @@ class SessionDriver {
     const reason = turn.interruptReason;
 
     if (turn.startError && !turn.crashed) return fail("failed", classifySessionError({ message: String(turn.startError.message ?? turn.startError) }));
+    if (reason === "account_switch" && (turn.killed || status === "interrupted")) return fail("failed", { kind: "account_switch", retryable: false, message: "the managed account changed; the turn was interrupted at a step boundary and its thread continues on the new account", status: null });
     if (turn.killed) {
       if (reason === "cancelled" || reason === "abandoned") return fail(reason, classifyFailure({ cancelled: reason === "cancelled", abandoned: reason === "abandoned" }));
       if (reason === "closed") return fail("interrupted", { kind: "interrupted", retryable: false, message: "the session was closed while this turn ran; the app-server did not end the turn when interrupted and was stopped", status: null });
@@ -1667,7 +1724,7 @@ class SessionDriver {
     writeJsonAtomic(turnFile(this.paths, turn.n), envelope);
     const kind = envelope.error?.kind;
     this.events.append("turn_completed", {
-      status: envelope.ok ? "completed" : ["interrupted", "timeout", "cancelled", "abandoned"].includes(kind) ? "interrupted" : "failed",
+      status: envelope.ok ? "completed" : ["interrupted", "timeout", "cancelled", "abandoned", "account_switch"].includes(kind) ? "interrupted" : "failed",
       ok: envelope.ok,
       durationMs: envelope.provenance?.durationMs ?? null,
       usage: turn.usage ?? null,
@@ -1708,6 +1765,7 @@ class SessionDriver {
     } finally {
       this.chain = null;
       this.waitAbort = null;
+      this.handoff = false;
     }
     if (this.closeRequest) return this.finishClose();
     if (this.queue.length) return null;
@@ -1744,6 +1802,16 @@ class SessionDriver {
     const thread = this.threadId;
     context.recoveryDeadlineAt = out.turn.deadlineAt;
     const minWork = Math.max(1, TIMING.minTimeoutSec) * 1000;
+    if (kind === "account_switch") {
+      // the account changed and the turn was handed over at a step boundary: no wait, the thread resumes
+      // on a new app-server (ensureServer announces it as resumed {reason: account_change}); the handoff
+      // budget and the deadline are the other continuations'. Rejected encrypted reasoning on the new
+      // account takes the checkpoint branch below on the continuation's own failure.
+      if (!(!request.ephemeral && typeof thread === "string" && SESSION_RE.test(thread) && chain.handoffs < MAX_ACCOUNT_HANDOFFS && context.recoveryDeadlineAt - Date.now() >= minWork)) return null;
+      chain.handoffs += 1;
+      this.log(`continuing the thread on the newly selected account (handoff ${chain.handoffs - chain.limitResumes})`);
+      return { item: null, text: ACCOUNT_CONTINUATION, reason: "continuation", images: [], deadlineAt: context.recoveryDeadlineAt, restart: true };
+    }
     if (kind === "encrypted_history" && chain.handoffs > chain.checkpointHandoff && context.recoveryDeadlineAt - Date.now() >= minWork) {
       // the new account cannot read the saved reasoning: continue from the visible history in a
       // fresh thread, which becomes the session's thread

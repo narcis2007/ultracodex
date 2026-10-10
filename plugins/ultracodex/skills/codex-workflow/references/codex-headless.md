@@ -326,7 +326,11 @@ feed.
 Timing and test knobs: `ULTRACODEX_ACK_WAIT_MS`, `ULTRACODEX_ACK_GRACE_MS` (how long a command keeps looking for its ack once `result.json`
 exists: the supervisor writes `result.json` first and acknowledges after it, so a `close` whose ack is late still reports `closed`),
 `ULTRACODEX_CLOSE_WAIT_MS`, `ULTRACODEX_LOCK_WAIT_MS`, `ULTRACODEX_MIN_ASK_TIMEOUT_SEC`, `ULTRACODEX_EVENT_CAP_BYTES`,
-`ULTRACODEX_TEST_FINAL_ACK_DELAY_MS` (tests only: delays the acks a session ends with).
+`ULTRACODEX_TEST_FINAL_ACK_DELAY_MS` (tests only: delays the acks a session ends with), `ULTRACODEX_ACCOUNT_CHECK_MS` (how often running
+or idle work looks at the managed account, default 2000), `ULTRACODEX_TEST_ACCOUNT_IDENTITY_FILE` (**test only**: when set and the file holds text,
+that text, trimmed, is the managed account (an empty or unreadable file falls back to the real login), so the follow-the-switch mechanics can be
+checked live — "switching" is writing other text into it — without ever touching the real `auth.json`; Codex itself keeps using its real login),
+`ULTRACODEX_TEST_FAULT=unclean-teardown` (tests only: an account-switch stop reports an unverifiable teardown).
 
 ## Model catalog (codex debug models)
 

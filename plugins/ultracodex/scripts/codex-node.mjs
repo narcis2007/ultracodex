@@ -42,6 +42,7 @@ import {
   cmdSend,
   configuredMcpServers,
   endDormantSession,
+  readNewEvents,
   runSession,
   sessionHasWork,
   sessionIsRevive,
@@ -100,6 +101,12 @@ function envInt(name, fallback, env = process.env) {
 // Read at request time (not import time) so a test can set it per process.
 export function defaultLimitWaitSec(env = process.env) {
   return Math.min(MAX_LIMIT_WAIT_SEC, Math.floor(envInt("ULTRACODEX_LIMIT_WAIT_SEC", DEFAULT_LIMIT_WAIT_SEC, env)));
+}
+
+// Whether running work follows a switch of the managed ChatGPT account (a request's followAccountSwitch
+// decides; this is its default). ULTRACODEX_FOLLOW_ACCOUNT_SWITCH=0 turns the default off.
+export function defaultFollowAccountSwitch(env = process.env) {
+  return env.ULTRACODEX_FOLLOW_ACCOUNT_SWITCH !== "0";
 }
 
 // Timing knobs; the env overrides exist so the offline tests run in seconds.
@@ -648,6 +655,7 @@ const REQUEST_FIELDS = new Set([
   "orphanAfterSec",
   "onOrphan",
   "limitWaitSec",
+  "followAccountSwitch",
   "ephemeral",
   "label",
   "serviceTier",
@@ -964,6 +972,9 @@ export function validateRequest(raw, { catalog = null, requestDigest: signedDige
     // How long a usage-limited job may wait for the limit to reset (0 = only the short
     // account-change wait). The waiting time is not counted against the deadline.
     limitWaitSec: expectInteger(raw, "limitWaitSec", 0, MAX_LIMIT_WAIT_SEC, defaultLimitWaitSec()),
+    // Running work moves to a newly selected account at the next step boundary (a turn / attempt is
+    // interrupted between tool calls and its thread resumed); false finishes it on the old account.
+    followAccountSwitch: expectBoolean(raw, "followAccountSwitch", defaultFollowAccountSwitch()),
     // Durable threads let an exhausted job continue on a newly selected account.
     // An explicit ephemeral request still opts out of saving/recovery.
     ephemeral: expectBoolean(raw, "ephemeral", false),
@@ -1315,6 +1326,18 @@ export function readUserWindowsSandbox(env = process.env) {
 // account changes. Nothing from auth.json is logged, returned to Claude or copied;
 // Codex remains responsible for loading, validating and refreshing its own login.
 export function managedAccountIdentity(env = process.env) {
+  // TEST ONLY: a live check of the account-switch logic must never touch the real auth.json. With
+  // this file set and holding text, that text (trimmed) IS the identity; "switching" is writing
+  // other text into it. Codex itself still uses its real login, so a "switch" resumes on the same
+  // real account, which is enough to prove the mechanics. Empty or unreadable: the real login below.
+  if (env.ULTRACODEX_TEST_ACCOUNT_IDENTITY_FILE) {
+    try {
+      const text = fs.readFileSync(env.ULTRACODEX_TEST_ACCOUNT_IDENTITY_FILE, "utf8").trim();
+      if (text) return createHash("sha256").update(`test:${text}`).digest("hex");
+    } catch {
+      // see above
+    }
+  }
   const overrides = ["CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY",
     "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE", "OPENAI_WORKLOAD_IDENTITY_CONTEXT"];
   if (overrides.some((name) => Object.hasOwn(env, name))) return null;
@@ -1463,11 +1486,12 @@ export function parseApiError(message) {
 // when the run itself is fine; never classify a run by those lines.
 const STDERR_NOISE = [/codex_rmcp_client/i, /failed to refresh OAuth tokens/i];
 
-export function classifyFailure({ summary = null, stderr = "", exitCode = null, timedOut, cancelled, abandoned, spawnError, emptyOutput } = {}) {
+export function classifyFailure({ summary = null, stderr = "", exitCode = null, timedOut, cancelled, abandoned, accountSwitch, spawnError, emptyOutput } = {}) {
   const result = (kind, retryable, message, status = null) => ({ kind, retryable, message: compact(message), status });
   if (cancelled) return result("cancelled", false, "cancelled on request; the Codex process tree was stopped");
   if (abandoned) return result("abandoned", false, "the caller stopped polling; the Codex process tree was stopped");
   if (timedOut) return result("timeout", false, "deadline reached; the Codex process tree was stopped");
+  if (accountSwitch) return result("account_switch", false, "the managed account changed; the attempt was stopped at a step boundary to continue its thread on the new account; the Codex process tree was stopped");
   if (spawnError) return result("spawn", false, String(spawnError));
   const failure = summary?.turnFailed?.message ?? summary?.errors?.at(-1) ?? null;
   const stderrText = String(stderr ?? "")
@@ -2553,6 +2577,72 @@ function extractJsonObject(text) {
   }
 }
 
+// The exec items that are a step in flight: from `item.started` to `item.completed`, a command, a file
+// change, an MCP tool call or a web search is never interrupted (a step boundary is a moment with none).
+const EXEC_STEP_ITEMS = new Set(["command_execution", "file_change", "mcp_tool_call", "web_search"]);
+
+// Follows the managed account while one `codex exec` attempt runs (see followAccountSwitch). It reads the
+// attempt's `--json` stream (the file Codex writes it to) as it grows, for the thread id and the steps in
+// flight, and every accountCheckMs compares the managed account with the one the attempt started on.
+// poll() is true when the attempt should be stopped now: the account changed, the run can be resumed on
+// the new one, and no step is in flight. Whether a switch is followed is decided once, when it is seen.
+export class AttemptSwitchWatch {
+  constructor({ file, account, followable, log }) {
+    this.file = file;
+    this.account = account; // the managed account the attempt started on (null: none to follow from)
+    this.followable = followable; // () => the reason a switch cannot be followed now, or null
+    this.log = log;
+    this.offset = 0;
+    this.threadId = null;
+    this.inFlight = new Set();
+    this.pending = false;
+    this.skipped = false;
+    this.nextCheckAt = 0;
+  }
+
+  read() {
+    const batch = readNewEvents(this.file, this.offset);
+    this.offset = batch.offset;
+    for (const { event } of batch.events) {
+      if (event.type === "thread.started" && typeof event.thread_id === "string") this.threadId = event.thread_id;
+      const item = event.item;
+      if (!isPlainObject(item) || typeof item.id !== "string") continue;
+      if (event.type === "item.started" && EXEC_STEP_ITEMS.has(item.type)) this.inFlight.add(item.id);
+      else if (event.type === "item.completed") this.inFlight.delete(item.id);
+    }
+  }
+
+  poll() {
+    if (this.skipped) return false;
+    this.read();
+    if (Date.now() >= this.nextCheckAt) {
+      this.nextCheckAt = Date.now() + TIMING.accountCheckMs;
+      const current = managedAccountIdentity();
+      const switched = Boolean(current && this.account && current !== this.account);
+      if (!switched) {
+        if (this.pending) this.log("the managed account is back to the one this attempt started on; nothing to follow");
+        this.pending = false;
+        return false;
+      }
+      if (!this.pending) {
+        const why = this.thread() ?? this.followable();
+        if (why) {
+          this.skipped = true;
+          this.log(`the managed account changed, but this attempt is not followed (${why}); it finishes on the old account`);
+          return false;
+        }
+        this.pending = true;
+        this.log("the managed account changed; stopping this attempt at the next step boundary to continue its thread on the new account");
+      }
+    }
+    return this.pending && this.inFlight.size === 0;
+  }
+
+  thread() {
+    return this.threadId ? null : "its thread id is not known yet";
+  }
+}
+
 async function runAttempt(request, paths, attempt, context) {
   const attemptDir = path.join(paths.dir, `attempt-${attempt}`);
   fs.mkdirSync(attemptDir, { recursive: true });
@@ -2577,6 +2667,16 @@ async function runAttempt(request, paths, attempt, context) {
   const stderrFd = fs.openSync(files.stderr, "w");
   const startedAt = Date.now();
   context.attemptAccount = request.ephemeral ? null : managedAccountIdentity();
+  const follow = request.followAccountSwitch !== false && context.attemptAccount
+    ? new AttemptSwitchWatch({
+        file: files.events,
+        account: context.attemptAccount,
+        followable: () => (request.mode === "review"
+          ? "review runs are not followed: resuming an `exec review` thread is not supported"
+          : context.followable?.() ?? null),
+        log: (line) => appendLine(paths.log, `${nowIso()} attempt ${attempt}: ${line}`),
+      })
+    : null;
   let child;
   let spawnError = null;
   try {
@@ -2653,13 +2753,18 @@ async function runAttempt(request, paths, attempt, context) {
         }
         if (Date.now() >= deadlineAt) timedOut = true;
         else stop = stopReason(paths, request, context.clock);
+        if (!timedOut && !stop && follow?.poll()) stop = "account_switch";
         if (timedOut || stop) {
           appendLine(paths.log, `${nowIso()} stopping codex pid ${child.pid}: ${timedOut ? "deadline" : stop}`);
           teardown = await stopOwnedTree(child, { tracked: context.tracked, job: context.job });
           await withTimeout(exitedPromise, 10_000); // a tree that survives the stop is reported, not awaited forever
+          // TEST ONLY: a teardown whose stop cannot be verified, whatever platform the test runs on
+          if (process.env.ULTRACODEX_TEST_FAULT === "unclean-teardown" && teardown) teardown = { ...teardown, unverified: true };
           break;
         }
       }
+      // the attempt ended by itself with a clean exit just as the switch was acted on: it is done
+      if (stop === "account_switch" && exitCode === 0) stop = null;
       if (!timedOut && !stop) teardown = await reapLeftovers(child, context.tracked, { job: context.job });
       if (teardown?.survivors?.length) appendLine(paths.log, `${nowIso()} still running after teardown: ${teardown.survivors.join(", ")}`);
       if (teardown?.possibleLeftovers?.length) {
@@ -2747,10 +2852,11 @@ async function runAttempt(request, paths, attempt, context) {
     timedOut: outcome.timedOut,
     cancelled: outcome.stop === "cancelled",
     abandoned: outcome.stop === "abandoned",
+    accountSwitch: outcome.stop === "account_switch",
     spawnError,
     emptyOutput: !lastMessage,
   });
-  const state = outcome.timedOut ? "timeout" : outcome.stop ?? "failed";
+  const state = outcome.timedOut ? "timeout" : outcome.stop === "account_switch" ? "failed" : outcome.stop ?? "failed";
   provenance.stderrTail = compact(stderr.split(/\r?\n/).filter((line) => line.trim()).slice(-8).join("\n"), 1200);
   if (outcome.teardown) provenance.teardown = outcome.teardown;
   if (outcome.teardown?.survivors?.length) {
@@ -3254,6 +3360,13 @@ async function superviseBody(runId, paths, stored, lock) {
         let checkpointHandoff = 0;
         let retries = 1;
         context.recoveryDeadlineAt = legacy?.deadlineAt ?? Date.now() + request.timeoutSec * 1000;
+        // what the attempt's account watch asks before it stops an attempt for a switch: the same limits
+        // as every other continuation (the budget of handoffs, work time left)
+        context.followable = () => {
+          if (handoffs >= MAX_ACCOUNT_HANDOFFS) return `the budget of ${MAX_ACCOUNT_HANDOFFS} account handoffs is used up`;
+          if (context.recoveryDeadlineAt - Date.now() < Math.max(1, TIMING.minTimeoutSec) * 1000) return "too little work time is left";
+          return null;
+        };
         for (let attempt = (legacy?.attempts ?? 0) + 1; ; attempt += 1) {
           if (legacy && Date.now() >= context.recoveryDeadlineAt) {
             envelope = failureEnvelope(request, runId, "timeout", classifyFailure({ timedOut: true }));
@@ -3285,6 +3398,23 @@ async function superviseBody(runId, paths, stored, lock) {
               log("account-bound reasoning was rejected; continuing from the visible checkpoint in a fresh thread");
               continue;
             }
+          }
+          // The attempt was stopped at a step boundary because the managed account changed: the change is
+          // already detected, so its thread resumes at once on the new account (no wait), under the same
+          // conditions as every continuation. Anything else ends the run with the failure, which says why.
+          if (kind === "account_switch") {
+            if (clean && !request.ephemeral && typeof thread === "string" && SESSION_RE.test(thread) && handoffs < MAX_ACCOUNT_HANDOFFS
+                && context.recoveryDeadlineAt - Date.now() >= Math.max(1, TIMING.minTimeoutSec) * 1000 && !stopReason(paths, request, context.clock)) {
+              handoffs += 1;
+              activeRequest = { ...request, mode: "resume", resume: { sessionId: thread }, images: [],
+                task: ACCOUNT_CONTINUATION, accountContinuation: true,
+                timeoutSec: Math.max(1, Math.floor((context.recoveryDeadlineAt - Date.now()) / 1000)) };
+              retries = 1;
+              log(`resuming the saved thread on the newly selected account (handoff ${handoffs - limitResumes}), ${Math.round((context.recoveryDeadlineAt - Date.now()) / 1000)} s of work time left`);
+              continue;
+            }
+            log(`attempt ${attempt} was stopped for an account switch but cannot be resumed (${clean ? "no thread, budget or work time left" : "its process tree was not stopped cleanly"}); the run ends`);
+            break;
           }
           // A continuation needs work time left: the waits below do not use any up.
           if (!request.ephemeral && context.attemptAccount && handoffs < MAX_ACCOUNT_HANDOFFS

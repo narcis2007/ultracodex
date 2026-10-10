@@ -58,6 +58,12 @@ below — it does the same. The relay, key and reader agents never get them.
 | `dormant` | no process at all, the thread is on disk; **the next `send` revives it** (also after a reboot). An idle session goes dormant at once when the managed account changes (`dormant {reason: "account_change"}`): an app-server holding the old login must not outlive a switch; the revive resumes the thread on the new account |
 | `closed` / `cancelled` / `failed` | ended for good — only now does `result.json` exist |
 
+**An account switch** (the owner switched ChatGPT accounts with PrimerSwitch) is followed within seconds, also while a turn runs: at the next step
+boundary (no command or tool call in flight, no question waiting; a running command is never stopped) the turn is interrupted and its thread
+continues on a new app-server with the new login — `account_switch {status}` events, then `resumed {reason: "account_change"}`; turn n's
+envelope has `error.kind: "account_switch"` (it is not a result and not a user interrupt) and the continuation is turn n+1. A message you send
+during that handoff is held back and steers the continuation. `followAccountSwitch: false` in the request opts a session out.
+
 `wait` (`codex_wait`) returns as soon as there is something to act on: a **question** (exit 3,
 `waitingForAnswer: true`, `question: {id, question}`), or — idle or dormant with nothing pending —
 the **latest turn's envelope** (`ok`, `result` / `text`, `provenance`, `session: {turn, state, idleUntil}`;
@@ -179,7 +185,7 @@ Event types: `session_started`, `turn_started {turnId, reason: task|followup|con
 `message {phase, text}`, `command_started`, `command {exitCode, status, outputTail}`,
 `file_change {changes: [{path, kind}]}` (relative paths, never diffs), `plan`, `tool`,
 `question {id, question}`, `answer {id, auto}`, `steer`, `followup`, `interrupt`, `error {kind, message,
-willRetry}`, `turn_completed {status, ok, usage}`, `limit_wait`, `resumed {reason}`, `idle`, `dormant`,
+willRetry}`, `turn_completed {status, ok, usage}`, `limit_wait`, `resumed {reason}`, `account_switch {status}`, `idle`, `dormant {reason?}`,
 `closed`, `cancelled`, `hermetic_violation`. Each has `seq` (strictly increasing, kept across
 revives), `t`, `turn`. Reasoning, auth data and account ids are never in the feed. Past 8 MB only
 the structural events are kept.

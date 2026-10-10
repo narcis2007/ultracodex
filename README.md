@@ -85,12 +85,30 @@ While waiting, `status` and `wait` show `backoff` with `waitingForLimit: true`,
 `resumesAt` (best estimate) and `limitWaitUntil`; the result's provenance counts
 `accountHandoffs` and `limitResumes` (together at most 8 per job).
 
-The supervisor lets active commands finish. Native `codex exec` does not support
-live account reload, so an already-running request may use the old account until
-it finishes or fails; continuation handles the terminal quota error. Cancellation
-still works while waiting.
+Cancellation still works while waiting.
+
+**Running work follows an account switch.** Native `codex exec` and the app-server do not reload the
+login of a running process, so the supervisor does it: while a turn (session) or an attempt (one-shot
+run) runs, it compares the managed account with the one it started on every ~2 s
+(`ULTRACODEX_ACCOUNT_CHECK_MS`). On a change it waits for the next **step boundary** — no command, file
+change, MCP or dynamic tool call or web search in flight, and no `ask_orchestrator` question waiting;
+a running command is never stopped — and then hands the work over: a session's turn is interrupted
+(`turn/interrupt`), its app-server is replaced by one with the new login, the thread is resumed and the
+continuation prompt runs as the next turn (`resumed {reason: "account_change"}`; the interrupted part keeps
+its `turns/<n>.json` with kind `account_switch`, it is not a result for the caller); a one-shot attempt
+is stopped with the usual teardown and `exec resume`d on the same thread, sandbox restated, with no
+wait. Each handoff counts in the 8-handoff budget and the job's deadline; rejected encrypted reasoning
+takes the checkpoint fallback below. A message sent to a session during its handoff is held back and
+steers the continuation. `"followAccountSwitch": false` (a request field, also allowed in relayed
+requests; `ULTRACODEX_FOLLOW_ACCOUNT_SWITCH=0` changes the default) keeps the old behaviour: the work
+finishes on the old account. It is not followed either — the work finishes on the old account, with a
+log line saying why — for an ephemeral run, a run whose thread id is not known yet, a review run
+(resuming an `exec review` thread is not supported), a used-up budget or too little time left. A stop
+whose process teardown cannot be verified is never resumed: the run ends with an `account_switch`
+failure that says so. A missing or unreadable login, and a token refresh on the same account, are not
+switches. An idle session sleeps (`dormant {reason: "account_change"}`) as soon as the account changes.
 Explicit `ephemeral: true`, external API-key authentication, a missing saved
-thread or an unverified process teardown prevent continuation. An already-polled
+thread or an unverified process teardown prevent continuation (of a limit failure and of a followed switch alike). An already-polled
 durable job from the installed 0.3.6 runner can be adopted once after a quota
 failure; completed or abandoned jobs are left alone.
 
@@ -163,7 +181,7 @@ their own commands, so none of `send`, `answer`, `interrupt`, `events`, `close` 
 
 **Event feed** (`events.jsonl`, one compact object per line, `seq` strictly increasing for the session's life):
 `session_started`, `turn_started`, `message`, `command_started`, `command`, `file_change` (relative paths, no diffs),
-`plan`, `tool`, `question`, `answer`, `steer`, `followup`, `interrupt`, `error`, `turn_completed`, `limit_wait`, `resumed`,
+`plan`, `tool`, `question`, `answer`, `steer`, `followup`, `interrupt`, `error`, `turn_completed`, `limit_wait`, `resumed`, `account_switch`,
 `idle`, `dormant`, `closed`, `cancelled`, `hermetic_violation`. Reasoning, auth data and account ids are never
 written. Past 8 MB the file keeps only the structural events (no command / file / plan / tool / commentary events).
 The skill `codex-steer` is the command reference; `codex-node.mjs help` lists the syntax.

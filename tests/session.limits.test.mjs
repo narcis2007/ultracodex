@@ -271,10 +271,10 @@ test("a token refresh on the same account, or a login that cannot be read, is no
   assert.ok(await untilState(home, runId, "dormant", 15_000));
 });
 
-test("a switch during a turn does not stop it; the session sleeps when the turn is done instead of idling", async (t) => {
+test("with followAccountSwitch false a switch during a turn does not stop it; the session sleeps when the turn is done instead of idling", async (t) => {
   const { home, env, calls } = sessionHome(t, { ULTRACODEX_ACCOUNT_CHECK_MS: "100" });
   saveAccount(home, "account-a");
-  const runId = await startSession(env, home, { task: "long\nFAKE_TURN_MS=2500\nFAKE_ANSWER=done", tier: "light" });
+  const runId = await startSession(env, home, { task: "long\nFAKE_TURN_MS=2500\nFAKE_ANSWER=done", tier: "light", followAccountSwitch: false });
   assert.ok(await untilEvent(home, runId, (event) => event.type === "command"));
   const server = serverSpawns(calls())[0].pid;
   saveAccount(home, "account-b");

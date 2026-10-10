@@ -445,17 +445,18 @@ test("ULTRACODEX_CHANNEL=0 turns the push off; the tools still work", async (t) 
 
 test("the channel reports a usage-limit wait once, not once per event", async (t) => {
   const home = makeHome(t);
-  const env = fastEnv(home, { ULTRACODEX_OWNER: "owner-ch", ULTRACODEX_NOTIFY_LIMIT_NULL_MS: "600" });
+  const env = fastEnv(home, { ULTRACODEX_OWNER: "owner-ch", ULTRACODEX_NOTIFY_LIMIT_NULL_MS: "3000" }); // far longer than the gap below, however loaded the machine
   const run = fakeRun(home, 0, { owner: "owner-ch" });
   const server = startServer(t, env);
   await server.initialize();
-  await sleep(700); // the watcher is up and has this run at its end
+  // the watcher is up (its cursor file exists) and has this run at its end
+  assert.ok(await eventually(() => fs.existsSync(path.join(home, "notify", `channel-${hash("owner-ch")}.json`)), { timeoutMs: 15_000 }));
   const events = path.join(run.dir, "events.jsonl");
   let seq = 0;
   const add = (type, fields = {}) => fs.appendFileSync(events, `${JSON.stringify({ seq: (seq += 1), t: new Date().toISOString(), turn: 1, type, ...fields })}\n`);
   // announced at once with no time, then with one: a single message
   add("limit_wait", { resumesAt: null });
-  await sleep(500);
+  await sleep(200);
   add("limit_wait", { resumesAt: "2026-10-10T13:00:00.000Z" });
   assert.ok(await eventually(() => server.channel().length >= 1, { timeoutMs: 15_000 }));
   add("limit_wait", { resumesAt: "2026-10-10T13:05:00.000Z" });

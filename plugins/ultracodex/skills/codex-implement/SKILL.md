@@ -105,6 +105,10 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" wait <runId> --max-wait 9000
   session sleeps by itself after `idleTtlSec` (default 20 min) and the next `send` revives it, also
   after a reboot.
 
+If the owner switches ChatGPT accounts (PrimerSwitch) while Codex works, the run follows within seconds — at the next step boundary, never in the
+middle of a command: the turn (or a one-shot attempt) is interrupted and its thread resumed on the new account, so a long implementation does not
+keep the old login (`"followAccountSwitch": false` opts out; the `codex-steer` skill has the details).
+
 `attached: false` lets the run continue while you do other work. Implementation turns are **never
 retried automatically** (a replay could apply its changes twice): after a transient failure, inspect the
 worktree and send a follow-up deliberately. Keep at most one or two implementation sessions at once on this
