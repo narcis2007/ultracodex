@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.1 — 2026-10-19 (plumbing agents skip CLAUDE.md)
+
+- `codex-relay` and `codex-key` set `omitClaudeMd: true`. They only carry a runner job or a key; the owner's
+  global `~/.claude/CLAUDE.md` and a repo's CLAUDE.md are not loaded into them any more (fewer tokens, nothing that
+  could compete with "reply with the runner's JSON verbatim"). `codex-reader` keeps CLAUDE.md: it judges findings and
+  needs the repo's own conventions.
+
 ## 0.6.0 — 2026-10-10 (steerable workflow nodes, verified isolation)
 
 Workflow nodes (`codexNode`, relayed by `codex-relay`, signed with the machine key) can now be steered while they run:

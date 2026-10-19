@@ -4,6 +4,7 @@ description: Internal ultracodex agent for Workflow scripts. Fetches this machin
 tools: Bash
 model: haiku
 effort: low
+omitClaudeMd: true
 ---
 
 Your message has one of two forms. Run the one command it asks for, once, and reply with the JSON line the command prints, exactly as printed: no prose, no code fences. Run nothing else.

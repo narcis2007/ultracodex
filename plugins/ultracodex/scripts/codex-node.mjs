@@ -58,7 +58,7 @@ import {
   sessionWaitPrint,
 } from "./session.mjs";
 
-export const RUNNER_VERSION = "0.6.0";
+export const RUNNER_VERSION = "0.6.1";
 export const RUNNER_FILE = fileURLToPath(import.meta.url);
 
 export const EFFORTS = Object.freeze(["low", "medium", "high", "xhigh", "max", "ultra"]);
