@@ -821,7 +821,7 @@ test("cross-review: an ambiguous batch answer is unverified and a dead finder ma
   assert.deepEqual(result.failedDimensions.map((x) => x.dimension), ["security"]);
 });
 
-test("codex-review defaults only the security lens to Astra and reports each model", async () => {
+test("codex-review defaults every lens including security to Sol and reports each model", async () => {
   const requests = [];
   let reportPrompt = null;
   const agent = async (prompt, opts) => {
@@ -836,21 +836,58 @@ test("codex-review defaults only the security lens to Astra and reports each mod
     }
     return null;
   };
-  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "security"], fast: true } });
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "domain", "security"], fast: true } });
   assert.equal(result.status, "complete");
+  assert.equal(result.tier, "daily");
   assert.deepEqual(requests.map(r => [r.label, r.model, r.effort, r.serviceTier]).sort(), [
     ["codex:code", "gpt-6.1-sol", "xhigh", null],
-    ["codex:security", "gpt-6-astra", "max", "priority"],
+    ["codex:domain", "gpt-6.1-sol", "xhigh", null],
+    ["codex:security", "gpt-6.1-sol", "xhigh", null],
   ]);
   assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [
     ["code", "daily", "gpt-6.1-sol"],
-    ["security", "final", "gpt-6-astra"],
+    ["domain", "daily", "gpt-6.1-sol"],
+    ["security", "daily", "gpt-6.1-sol"],
   ]);
-  assert.match(reportPrompt, /"lens":"security","tier":"final","model":"gpt-6-astra"/);
+  for (const lens of ["code", "domain", "security"]) {
+    assert.ok(reportPrompt.includes(JSON.stringify({ lens, tier: "daily", model: "gpt-6.1-sol" }).slice(0, -1)));
+  }
 });
 
-test("codex-review respects explicit daily, light and final tiers for every lens", async () => {
-  for (const [tier, model] of [["daily", "gpt-6.1-sol"], ["light", "gpt-6-luna"], ["final", "gpt-6-astra"]]) {
+test("codex-review securityTier changes only security, with fast applying only to Astra", async () => {
+  for (const [securityTier, model, effort] of [["light", "gpt-6-luna", "max"], ["daily", "gpt-6.1-sol", "xhigh"], ["final", "gpt-6-astra", "max"]]) {
+    for (const fast of [false, true]) {
+      const requests = [];
+      let reportPrompt = null;
+      const agent = async (prompt, opts) => {
+        if (opts.agentType === RELAY) {
+          const { request } = receive(prompt);
+          requests.push(request);
+          return okEnvelope(request, { verdict: "approve", summary: "clean", findings: [] });
+        }
+        if (opts.label === "report") { reportPrompt = prompt; return "FINAL"; }
+        return null;
+      };
+      const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "domain", "security"], securityTier, fast } });
+      assert.equal(result.status, "complete");
+      assert.equal(result.tier, "daily", "securityTier does not change the base tier");
+      assert.deepEqual(requests.map(r => [r.label, r.model, r.effort, r.serviceTier]).sort(), [
+        ["codex:code", "gpt-6.1-sol", "xhigh", null],
+        ["codex:domain", "gpt-6.1-sol", "xhigh", null],
+        ["codex:security", model, effort, fast && securityTier === "final" ? "priority" : null],
+      ]);
+      assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [
+        ["code", "daily", "gpt-6.1-sol"],
+        ["domain", "daily", "gpt-6.1-sol"],
+        ["security", securityTier, model],
+      ]);
+      assert.ok(reportPrompt.includes(JSON.stringify({ lens: "security", tier: securityTier, model }).slice(0, -1)));
+    }
+  }
+});
+
+test("codex-review ignores invalid securityTier values", async () => {
+  for (const securityTier of ["astra", "FINAL", "", null, false, 1, {}, ["final"]]) {
     const requests = [];
     const agent = async (prompt, opts) => {
       if (opts.agentType === RELAY) {
@@ -860,16 +897,36 @@ test("codex-review respects explicit daily, light and final tiers for every lens
       }
       return opts.label === "report" ? "FINAL" : null;
     };
-    const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "security"], tier, triage: false } });
+    const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "security"], securityTier, fast: true } });
     assert.equal(result.status, "complete");
     assert.equal(requests.length, 2);
-    assert.deepEqual(requests.map(r => r.model), [model, model], tier + " overrides security routing");
-    assert.deepEqual(requests.map(r => r.effort), Array(2).fill(tier === "daily" ? "xhigh" : "max"));
-    assert.deepEqual(result.lenses.map(l => [l.tier, l.model]), [[tier, model], [tier, model]]);
+    assert.deepEqual(requests.map(r => [r.model, r.effort, r.serviceTier]), Array(2).fill(["gpt-6.1-sol", "xhigh", null]));
+    assert.deepEqual(result.lenses.map(l => [l.tier, l.model]), Array(2).fill(["daily", "gpt-6.1-sol"]));
   }
 });
 
-test("a mixed Codex review escalates only non-Astra findings", async () => {
+test("codex-review explicit daily, light and final tiers override securityTier for every lens", async () => {
+  for (const [tier, model] of [["daily", "gpt-6.1-sol"], ["light", "gpt-6-luna"], ["final", "gpt-6-astra"]]) {
+    for (const securityTier of ["light", "daily", "final"]) {
+      const requests = [];
+      const agent = async (prompt, opts) => {
+        if (opts.agentType === RELAY) {
+          const { request } = receive(prompt);
+          requests.push(request);
+          return okEnvelope(request, { verdict: "approve", summary: "clean", findings: [] });
+        }
+        return opts.label === "report" ? "FINAL" : null;
+      };
+      const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "domain", "security"], tier, securityTier, triage: false, fast: true } });
+      assert.equal(result.status, "complete");
+      assert.equal(requests.length, 3);
+      assert.deepEqual(requests.map(r => [r.model, r.effort, r.serviceTier]), Array(3).fill([model, tier === "daily" ? "xhigh" : "max", tier === "final" ? "priority" : null]));
+      assert.deepEqual(result.lenses.map(l => [l.tier, l.model]), Array(3).fill([tier, model]));
+    }
+  }
+});
+
+for (const securityTier of [undefined, "final"]) test(`codex-review escalates only non-Astra findings (securityTier: ${securityTier ?? "default"})`, async () => {
   const requests = [];
   let escalated = null;
   const agent = async (prompt, opts) => {
@@ -878,23 +935,30 @@ test("a mixed Codex review escalates only non-Astra findings", async () => {
       requests.push(request);
       if (request.label === "codex:escalate") {
         escalated = JSON.parse(request.task.slice(request.task.indexOf("INPUT ITEMS (JSON):") + "INPUT ITEMS (JSON):".length));
-        return okEnvelope(request, { results: [{ id: "code:1", refuted: false, confidence: 0.9, reasoning: "reachable" }] });
+        return okEnvelope(request, { results: escalated.map(f => ({ id: f.id, refuted: false, confidence: 0.9, reasoning: "reachable" })) });
       }
-      const finding = { id: "a", severity: "high", category: "c", title: "defect", file: "a.ts", line: 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.8 };
+      const finding = { id: "a", severity: request.label === "codex:security" ? "critical" : "high", category: "c", title: "defect", file: "a.ts", line: 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.8 };
       return okEnvelope(request, { verdict: "request_changes", summary: "sum", findings: [finding] });
     }
     if (opts.label?.startsWith("triage:")) return { verdict: "refuted", reasoning: "guarded" };
     return opts.label === "report" ? "FINAL" : null;
   };
-  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "security"] } });
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "security"], securityTier } });
   assert.equal(result.status, "complete");
   assert.equal(requests.length, 3, "two reviews and one narrow tiebreak");
-  assert.deepEqual(escalated.map(f => f.id), ["code:1"], "the security lens was already reviewed by Astra");
-  assert.deepEqual(result.disputed.map(f => f.id), ["code:1"]);
-  assert.deepEqual(result.refuted.map(f => f.id), ["security:1"]);
+  assert.deepEqual(requests.map(r => [r.label, r.model]).sort(), [
+    ["codex:code", "gpt-6.1-sol"],
+    ["codex:escalate", "gpt-6-astra"],
+    ["codex:security", securityTier === "final" ? "gpt-6-astra" : "gpt-6.1-sol"],
+  ]);
+  const expected = securityTier === "final" ? ["code:1"] : ["code:1", "security:1"];
+  assert.deepEqual(escalated.map(f => f.id), expected, "Sol security findings escalate; Astra security findings are excluded");
+  assert.deepEqual(result.disputed.map(f => f.id), expected);
+  assert.deepEqual(result.refuted.map(f => f.id), securityTier === "final" ? ["security:1"] : []);
+  assert.deepEqual(result.escalation, { ran: true, checked: expected.length, upheld: expected.length, settled: 0, failed: 0 });
 });
 
-test("a failed default security lens keeps its Astra routing and reports incomplete", async () => {
+test("a failed default security lens keeps its Sol routing and reports incomplete", async () => {
   const requests = [];
   const agent = async (prompt, opts) => {
     if (opts.agentType === RELAY) {
@@ -906,9 +970,9 @@ test("a failed default security lens keeps its Astra routing and reports incompl
   };
   const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["security"] } });
   assert.equal(result.status, "incomplete");
-  assert.deepEqual(requests.map(r => r.model), ["gpt-6-astra"]);
-  assert.deepEqual(result.lenses, [{ lens: "security", tier: "final", model: "gpt-6-astra", verdict: null, error: "timeout" }]);
-  assert.equal(result.escalation, null, "no second Astra run for an Astra lens");
+  assert.deepEqual(requests.map(r => [r.model, r.effort]), [["gpt-6.1-sol", "xhigh"]]);
+  assert.deepEqual(result.lenses, [{ lens: "security", tier: "daily", model: "gpt-6.1-sol", verdict: null, error: "timeout" }]);
+  assert.deepEqual(result.escalation, { ran: false, checked: 0, upheld: 0, settled: 0, failed: 0 }, "no findings to escalate from a failed lens");
 });
 
 test("codex-review triages on Haiku at high effort by default, and the owner can change it", async () => {

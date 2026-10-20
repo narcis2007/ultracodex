@@ -47,11 +47,14 @@ an echo check with no independent angle, not for open-ended ideation with nothin
 | --- | --- | --- |
 | `light` | gpt-6-luna @ max | light work: triage, dedupe, wide fan-outs of small checks, summaries |
 | `daily` | gpt-6.1-sol @ xhigh (every kind) | implementation including complex code, debugging, design, verification, jurors, routine review lenses |
-| `final` | gpt-6-astra @ max | security review, final critical gates, load-bearing verdicts, unresolved issues escalated from Sol |
+| `final` | gpt-6-astra @ max | critical security work, data migrations, irreversible production steps, production release gates, high/critical issues escalated from Sol |
 
 Cascade with astra last; never fan astra out wide; `ultra` only by explicit request, once.
 Sol stays at `xhigh`, including long or complex tasks. Use `effort: 'max'` only for an
 exceptional unresolved problem after an `xhigh` attempt or an owner request, with a reason.
+Astra is for critical work only: security-sensitive code (auth, keys, crypto, payments,
+personal data), data migrations, irreversible production steps and the last gate before a
+production release. Routine reviews and asks use Sol, including the security lens.
 
 ## Pick the mode — the cheapest one that does the job
 
@@ -70,7 +73,7 @@ Cost levers, in order of effect:
    sends only high/critical Claude-vs-Codex disagreements to astra (`escalate`). Both report
    an astra disagreement as **disputed** for the owner, never as silently dropped.
 3. **luna@max** for triage, dedupe and quick sanity passes; **Sol 6.1@xhigh** for coding including
-   complex implementation; **astra** for security lenses and final critical review.
+   complex implementation and routine security lenses; **astra** for critical work only.
    `ultra` and `serviceTier: 'priority'` only on explicit request.
 4. **Read `codexUsage`** in every shipped workflow's result (runs and tokens per model, failed
    runs included) and mention it when reporting.
@@ -87,9 +90,11 @@ Run by name with `args` (JSON values, not strings):
   `tests`, `performance`) → Claude checks every finding in the code (Haiku 5.5 @high by default;
   `triageModel` / `triageEffort` override it, `'inherit'` = Claude Code's default for workflow agents: the session's model, or `CLAUDE_CODE_SUBAGENT_MODEL` when set) → high/critical findings
   from non-Astra lenses that Claude refuted or could not settle go to astra in one run → report.
-  Omit `tier` for Sol 6.1 on ordinary lenses and Astra on `security`; an explicit tier applies
-  to every lens. `lenses[].tier` and `lenses[].model` report actual routing.
-  `args: { cwd, base | commit | uncommitted, lenses, tier: 'light'|'daily'|'final', escalate, context, lessons, triage, triageModel, triageEffort }`
+  Omit `tier` for Sol 6.1 at `xhigh` on every lens, including `security`. For critical work,
+  `securityTier: 'final'` selects Astra for security only, or `tier: 'final'` for every lens.
+  `securityTier` accepts `light`, `daily` or `final`; invalid values are ignored. An explicit
+  `tier` overrides it. `lenses[].tier` and `lenses[].model` report actual routing.
+  `args: { cwd, base | commit | uncommitted, lenses, tier: 'light'|'daily'|'final', securityTier: 'light'|'daily'|'final', escalate, context, lessons, triage, triageModel, triageEffort }`
 - **`ultracodex:crosscheck`** — one Codex attempt (astra@max) to refute one claim.
   `args: { claim, evidence, cwd, tier }`
 - **`ultracodex:judge-panel`** — Claude angles + a Codex candidate, Claude+Codex jury,

@@ -6,8 +6,8 @@ description: >-
   every finding then verified by Claude in the code before it is reported. Use when the user
   asks for a Codex review, a second-model / cross-model / adversarial review, "have codex
   review this", "review with astra / sol / luna", a final review gate before merge or deploy,
-  or a specific review lens. Routine reviews run on gpt-6.1-sol@xhigh, security and final
-  critical reviews on gpt-6-astra@max, a quick sanity pass on gpt-6-luna@max.
+  or a specific review lens. Routine reviews, including security lenses, run on
+  gpt-6.1-sol@xhigh. Astra at max is for critical work only; quick sanity passes use gpt-6-luna@max.
 ---
 
 # Codex adversarial review
@@ -25,19 +25,20 @@ Settle before starting: the repo (absolute path), the scope (`base` branch, one 
 `uncommitted`), the lenses (default `code` + `domain`), and the tier:
 
 - `daily` → gpt-6.1-sol@xhigh — the normal review of a change;
-- `final` → gpt-6-astra@max — "at the end": the last gate before merge/deploy, and any change
-  touching security, money, concurrency, data migrations or irreversible external effects;
+- `final` → gpt-6-astra@max — critical work only: security-sensitive code (auth, keys, crypto,
+  payments, personal data), data migrations, irreversible production steps, or the last gate
+  before a production release;
 - `light` → gpt-6-luna@max — a quick pass on a small or mechanical change.
 
 When the owner named no tier, pick it from the change itself — measure it first with
 `git -C "<repo>" diff --shortstat <scope>` (and `--name-only`):
 
-- **`final`** if it touches security, auth, money, concurrency, data migrations or
-  irreversible external effects, or it is the last gate before a merge/deploy — whatever its size;
+- **`final`** for the critical categories above — whatever the change's size. Use
+  `securityTier: 'final'` when only the security lens needs Astra, or `tier: 'final'` for every lens;
 - else **`light`** if no security lens was requested and the change is either small (about
   50 changed lines or fewer, in at most 3 files) or mechanical (docs, comments, renames,
   formatting, config values, test scaffolding only);
-- else **omit `tier`**: the workflow uses `daily` on ordinary lenses and `final` on `security`.
+- else **omit `tier`**: the workflow uses `daily` on every lens, including `security`.
 
 An explicit owner-selected tier applies to every lens, including security. For a critical
 final gate, pass `tier: 'final'` so Astra reviews every requested lens.
@@ -61,9 +62,11 @@ Workflow({ name: 'ultracodex:codex-review', args: {
   context: '<what the change is for>', lessons: '<abs path or omit>' } })
 ```
 
-Add `tier` when selected above or explicitly requested by the owner. With no tier, ordinary
-lenses use Sol 6.1 and the security lens uses Astra; `lenses[].tier` and `lenses[].model` record
-the model used, including failed lenses.
+Add `tier` when selected above or explicitly requested by the owner. With no tier, every lens
+uses Sol 6.1 at `xhigh`. Optional `securityTier: 'light'|'daily'|'final'` changes only the security
+lens; use `securityTier: 'final'` for critical security work. Invalid values are ignored.
+An explicit `tier` overrides `securityTier` for every lens. `lenses[].tier` and `lenses[].model`
+record the model used, including failed lenses.
 
 It runs one Codex review per lens (hermetic, read-only, astra ≤2 at a time), has Claude check
 every finding in the code (confirmed / refuted / needs-info) and rate its severity itself —
@@ -93,9 +96,9 @@ backslashes break Bash commands on Windows):
 
 The brief = the lens text from `references/lenses.md` + the scope sentence ("Review the changes
 on the current branch against main: `git diff main...HEAD`, plus uncommitted changes") + context
-+ lessons. Set the request's tier per lens: `final` for security, `daily` for routine lenses,
-or `light` when selected above. An explicit owner-selected tier or final critical gate
-overrides that choice. Then:
++ lessons. Use `daily` for every routine lens, including security, or `light` when selected
+above. For critical work, use `final` on the security lens or on every lens for a final critical
+gate. An explicit owner-selected tier overrides that choice. Then:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" start --request "<request.json>"

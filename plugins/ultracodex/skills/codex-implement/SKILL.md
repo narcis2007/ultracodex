@@ -32,9 +32,11 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" preflight
   or when a concrete unresolved issue justifies escalation after a Sol attempt;
 - `light` → gpt-6-luna@max: mechanical work (renames, boilerplate, docs, test scaffolding).
 
-Complexity alone does not switch the implementer to Astra. For security, money, concurrency,
-data migrations or irreversible effects, use Sol to implement and Astra for the final critical
-review of the resulting diff, unless the owner chose another model.
+Complexity alone does not switch the implementer to Astra. Use Sol to implement and review
+routine changes. Use Astra for the final review only for critical work: security-sensitive code
+(auth, keys, crypto, payments, personal data), data migrations, irreversible production steps,
+or the last gate before a production release, unless the owner chose another model. In
+`codex-review`, use `securityTier: 'final'` for security only or `tier: 'final'` for every lens.
 
 Keep Sol at `xhigh`, including long implementations. Set `"effort": "max"` only for an
 exceptional unresolved problem after an `xhigh` attempt or when the owner requests it;
@@ -139,9 +141,10 @@ a follow-up is then a new run with `"resume": { "sessionId": "<provenance.thread
   (the runner restates the sandbox on every resume — `codex exec resume` alone runs read-only — so a follow-up that
   must write says `"sandbox": "workspace-write"`).
 - **Adversarial review of the result**: the `codex-review` skill (or the
-  `ultracodex:codex-review` workflow) on the worktree branch — typically on a *different* tier
-  than the implementer (sol implements → astra reviews at the end), or
-  `ultracodex:cross-review` so Claude finds and Codex verifies.
+  `ultracodex:codex-review` workflow) on the worktree branch. Sol implements → Sol reviews
+  routine changes, including security lenses. For the critical categories in section 1,
+  use `securityTier: 'final'` for an Astra security review or `tier: 'final'` for every lens.
+  Or use `ultracodex:cross-review` so Claude finds and Codex verifies.
 - Fix confirmed findings (yourself or via a resume brief), then re-verify.
 
 ## 7. Close and hand over

@@ -1,7 +1,7 @@
 export const meta = {
   name: 'codex-review',
-  description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude (Haiku 5.5 @high by default); high/critical disagreements go to astra@max. Defaults to 6.1-sol@xhigh, security lens to astra@max; an explicit tier overrides every lens. Fails closed.',
-  whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: light|daily|final, context, lessons, triage, triageModel: haiku|sonnet|opus|inherit, triageEffort, escalate, fast }',
+  description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude (Haiku 5.5 @high by default); high/critical disagreements go to astra@max. Every lens defaults to 6.1-sol@xhigh, including security. For critical work, securityTier: final selects astra@max for security only; an explicit tier overrides every lens. Fails closed.',
+  whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: light|daily|final, securityTier: light|daily|final, context, lessons, triage, triageModel: haiku|sonnet|opus|inherit, triageEffort, escalate, fast }',
   phases: [
     { title: 'Review', detail: 'one Codex review per lens (read-only, hermetic)' },
     { title: 'Triage', detail: 'Claude (Haiku 5.5 @high unless triageModel says otherwise) checks each Codex finding against the code' },
@@ -16,6 +16,7 @@ const A = args || {}
 const CWD = A.cwd || null
 const EXPLICIT_TIER = ['light', 'daily', 'final'].includes(A.tier)
 const TIER = A.tier === 'final' ? 'final' : A.tier === 'light' ? 'light' : 'daily'
+const SECURITY_TIER = ['light', 'daily', 'final'].includes(A.securityTier) ? A.securityTier : TIER
 const TRIAGE = A.triage !== false
 // Triage runs on Haiku 5.5 at high effort unless the owner names another model. Measured on
 // 249 recorded triage cases replayed at their reviewed commits, disagreements judged blind by
@@ -48,8 +49,8 @@ const LENSES = {
 }
 const lensKeys = (Array.isArray(A.lenses) && A.lenses.length ? A.lenses : ['code', 'domain']).filter(k => LENSES[k])
 if (!lensKeys.length) throw new Error('codex-review: no known lens in args.lenses (use code, domain, security, tests, performance)')
-// Reserve Astra for the security lens by default; the owner's explicit tier always wins.
-const lensTier = key => !EXPLICIT_TIER && key === 'security' ? 'final' : TIER
+// Every lens defaults to daily; security can opt into another tier unless tier is explicit.
+const lensTier = key => !EXPLICIT_TIER && key === 'security' ? SECURITY_TIER : TIER
 // Only findings from non-Astra lenses can need an Astra tiebreak.
 const ESCALATE = TRIAGE && A.escalate !== false && lensKeys.some(key => lensTier(key) !== 'final')
 

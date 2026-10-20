@@ -38,16 +38,20 @@ see [CHANGELOG.md](CHANGELOG.md) for what changed.
 | --- | --- | --- | --- |
 | `light` | gpt-6-luna | light work: triage, dedupe, mechanical edits, wide fan-outs of small checks | always `max` |
 | `daily` | gpt-6.1-sol | implementation including complex code, debugging, architecture analysis, verification, jurors, routine review | `xhigh` for every workload |
-| `final` | gpt-6-astra | security review, final critical review gates, load-bearing verdicts, unresolved issues escalated from Sol | `max` |
+| `final` | gpt-6-astra | critical security work, data migrations, irreversible production steps, production release gates, high/critical issues escalated from Sol | `max` |
 
-Sol 6.1 is the default implementer, including complex modules. Astra reviews security and
-critical changes at the end. In `codex-review`, omitting `tier` uses Sol on ordinary lenses
-and Astra on `security`; an explicit tier applies to every lens. Actual models are reported
-in `lenses[].model`, and Astra findings are not sent to Astra again for a tiebreak.
+Sol 6.1 is the default for implementation, including complex modules, and routine reviews and
+asks. Astra is for critical work only: security-sensitive code (auth, keys, crypto, payments,
+personal data), data migrations, irreversible production steps and the last gate before a
+production release. In `codex-review`, omitting `tier` uses Sol at `xhigh` on every lens,
+including `security`. For critical work, pass `securityTier: 'final'` for Astra on security only,
+or `tier: 'final'` for every lens. `securityTier` accepts `light`, `daily` or `final`; invalid
+values are ignored. An explicit `tier` overrides it. Actual routing is reported in
+`lenses[].tier` and `lenses[].model`, and Astra findings are not sent to Astra again for a tiebreak.
 
 Prefer Sol 6.1 at `xhigh`, including complex and long tasks. Use Sol at `max` only with an
 explicit effort override for an exceptional unresolved problem or at the owner's request;
-state the reason. Astra at `max` remains reserved for security and critical gates, and
+state the reason. Astra at `max` remains reserved for critical work, and
 Luna stays at `max` for light work. `ultra` only on explicit request, once per run. Details:
 [model-policy.md](plugins/ultracodex/skills/codex-workflow/references/model-policy.md).
 

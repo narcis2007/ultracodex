@@ -10,17 +10,21 @@ an effort and a deadline. Pin `model`/`effort` only to override, with a reason.
 | --- | --- | --- | --- |
 | `light` | `gpt-6-luna` — "fast and affordable, for easier tasks" | light work: triage and dedupe of findings, wide fan-outs of small self-contained checks, mechanical edits (renames, boilerplate, docs, test scaffolding), summaries, smoke tests | **always `max`** |
 | `daily` | `gpt-6.1-sol` — "latest workhorse for coding and everyday work" | implementation including complex modules, debugging, architecture analysis, verification of findings, jurors, second opinions and routine review lenses | **`xhigh` for every kind** |
-| `final` | `gpt-6-astra` — "frontier intelligence for the most demanding work" | security review, the final critical gate before merge/deploy, a load-bearing verdict about money / concurrency / data migrations / irreversible effects, or a concrete unresolved issue escalated from Sol | `max` |
+| `final` | `gpt-6-astra` — "frontier intelligence for the most demanding work" | critical security work, data migrations, irreversible production steps, the last gate before a production release, or high/critical issues escalated from Sol | `max` |
 
 Routing rationale (2026-09-30): OpenAI reports that Sol 6.1 matches Astra on DeepSWE v1.1
 at roughly one fifth of the API cost per task ([release](https://openai.com/index/introducing-gpt-6-1-sol/)).
 Astra leads on SEC-Bench Pro (85.4% vs 78.8%) and ExploitGym (42.4% vs 35.1%)
 ([system card](https://deploymentsafety.openai.com/gpt-6-1-sol)). Use Sol for general coding,
-including complex implementation, and reserve Astra for security and critical review;
+including complex implementation, and reserve Astra for critical security work and critical review;
 these benchmark results do not establish a universal winner for every coding task.
 
 Rules of thumb:
 
+- **Astra is for critical work only.** The owner's rule (2026-10-20): security-sensitive code
+  (auth, keys, crypto, payments, personal data), data migrations, irreversible production steps
+  and the last gate before a production release. Routine reviews and asks use Sol at `xhigh`,
+  including the security lens.
 - **Prefer `xhigh` on Sol 6.1.** Verification, analysis, review and implementation all use
   `xhigh`, including complex modules and long tasks. This is the owner's cost/quality
   preference (2026-10-01); an exact cost ratio is workload-dependent.
@@ -30,15 +34,19 @@ Rules of thumb:
   node; size, duration and complexity alone do not justify `max`. Critical security or
   final gates still use Astra at `max`; Luna stays at `max` for light work.
 - **Cascade, astra last.** luna triages/filters → sol verifies/implements → astra judges what
-  survived, or reviews the whole diff once at the end. Never put astra on a wide fan-out.
+  survived at high/critical severity, or reviews a critical change once at the end. Routine
+  end-of-task reviews use Sol. Never put astra on a wide fan-out.
 - **Complexity alone stays on Sol.** Risk determines the final reviewer, not automatically
   the implementer. An explicit owner-selected model or tier always overrides these defaults.
-- **Security lens defaults to Astra.** In `codex-review`, omit `tier` for Sol on ordinary
-  lenses and Astra on `security`; an explicit `tier` applies to every lens. The result's
-  top-level `tier` is the base tier; `lenses[].tier` and `lenses[].model` show actual routing.
-  Findings already reviewed by Astra do not get another Astra tiebreak.
-- **Escalate disagreements.** When Claude and sol disagree on a finding that matters, send that
-  one item to astra (`tier: 'final'`) instead of re-running sol.
+- **Every review lens defaults to Sol.** In `codex-review`, omit `tier` for `daily` on every
+  lens, including `security`. Optional `securityTier: 'light'|'daily'|'final'` changes only the
+  security lens; invalid values are ignored. Use `securityTier: 'final'` for critical security
+  work, or `tier: 'final'` for a critical gate across every lens. An explicit `tier` overrides
+  `securityTier`. The result's top-level `tier` is the base tier; `lenses[].tier` and
+  `lenses[].model` show actual routing. Findings already reviewed by Astra do not get another
+  Astra tiebreak.
+- **Escalate high/critical disagreements.** When Claude and sol disagree on such a finding,
+  send it to astra (`tier: 'final'`) instead of re-running sol.
 - **`ultra` is opt-in, once.** `effort: 'ultra'` (astra/sol only — luna has none; the runner
   refuses it) adds automatic sub-agent delegation and runs long. Use it for at most one decisive
   node per run.
@@ -55,8 +63,9 @@ Rules of thumb:
 | findings that would block a merge | the batch above, then **one** astra@max batch over the confirmed high/critical ones (`cross-review` `finalGate`) |
 | Codex found it, Claude doubts it (high/critical) | one astra batch over just those (`codex-review` `escalate`) |
 | a quick look at a small or mechanical change | `codex-review` with `tier: 'light'` (luna@max) |
-| a routine review with a security lens | omit `tier`: Sol on ordinary lenses, Astra only on `security` |
-| the last gate before merge/deploy of risky code | `codex-review` `tier: 'final'` (astra per lens, ≤2 at a time) |
+| a routine review with a security lens | omit `tier`: Sol at `xhigh` on every lens, including `security` |
+| critical security work needing Astra on security only | `codex-review` `securityTier: 'final'`, omit `tier` |
+| a critical change or the last gate before a production release | `codex-review` `tier: 'final'` (astra per lens, ≤2 at a time) |
 
 When astra disagrees with sol or Claude, the item is **disputed**: report both reasonings and
 let the owner decide — do not re-run until the answer you want appears. Every shipped workflow

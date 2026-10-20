@@ -29,11 +29,15 @@ Codex (GPT-6 via `codex exec`) inside Claude Code.
 Tier policy: `light` → gpt-6-luna@max · `daily` → gpt-6.1-sol@xhigh (all workloads) ·
 `final` → gpt-6-astra@max. See `skills/codex-workflow/references/model-policy.md`.
 
-Sol 6.1 implements complex code by default; Astra handles security and final critical review.
+Sol 6.1 implements complex code and handles routine reviews and asks by default. Astra is for
+critical work only: security-sensitive code (auth, keys, crypto, payments, personal data), data
+migrations, irreversible production steps and the last gate before a production release.
 Use Sol at `max` only as an explicit override for an exceptional unresolved problem or
 an owner request, with a stated reason. Task complexity or duration alone does not justify it.
-`codex-review` without `tier` routes ordinary lenses to Sol and `security` to Astra.
-An explicit tier overrides every lens; results name each lens's actual tier and model.
+`codex-review` without `tier` routes every lens, including `security`, to Sol at `xhigh`.
+For critical work, use `securityTier: 'final'` for Astra on security only, or `tier: 'final'`
+for every lens. `securityTier` accepts `light`, `daily` or `final`; invalid values are ignored.
+An explicit tier overrides it; results name each lens's actual tier and model.
 
 Requires the Codex CLI (logged in) and Node.js 18+. Check with
 `node scripts/codex-node.mjs preflight --pretty`.

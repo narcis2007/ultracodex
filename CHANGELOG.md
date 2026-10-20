@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.2 — 2026-10-20 (Astra opt-in for routine reviews)
+
+- `codex-review` now defaults every lens, including `security`, to `daily` (gpt-6.1-sol@xhigh).
+  The owner's 20.10 usage rule reserves Astra for critical work: security-sensitive code (auth,
+  keys, crypto, payments, personal data), data migrations, irreversible production steps and
+  the last gate before a production release. Routine reviews and asks stay on Sol.
+- This follows the owner's run measurements: Astra used about 52% of all Codex credits over
+  the last 14 days. The 54 `codex:security` runs at astra@max accounted for about 45% of Astra
+  credits. Astra's share rose from 9% in the week of 05.10 to 44% in the week of 12.10 and 68%
+  from 19.10.
+- For a critical change, pass `securityTier: 'final'` to use Astra only on the security lens,
+  or `tier: 'final'` for every lens. `securityTier` accepts `light`, `daily` or `final`; invalid
+  values are ignored. An explicit `tier` wins over `securityTier`. Per-lens routing is reported
+  as before. High/critical escalation, cross-review's final gate and crosscheck defaults stay
+  the same; `fast` still applies only to Astra nodes. Rebuild workflows and align skill guidance.
+
 ## 0.6.1 — 2026-10-19 (plumbing agents skip CLAUDE.md)
 
 - `codex-relay` and `codex-key` set `omitClaudeMd: true`. They only carry a runner job or a key; the owner's
