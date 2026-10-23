@@ -145,7 +145,8 @@ a follow-up is then a new run with `"resume": { "sessionId": "<provenance.thread
   routine changes, including security lenses. For the critical categories in section 1,
   use `securityTier: 'final'` for an Astra security review or `tier: 'final'` for every lens.
   Or use `ultracodex:cross-review` so Claude finds and Codex verifies.
-- Fix confirmed findings (yourself or via a resume brief), then re-verify.
+- Fix findings and re-verify, then follow the `codex-review` skill's fixes and re-review policy:
+  no new pass after low-only findings; otherwise review only the fix delta; at most 3 passes.
 
 ## 7. Close and hand over
 

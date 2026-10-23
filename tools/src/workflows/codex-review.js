@@ -1,7 +1,7 @@
 export const meta = {
   name: 'codex-review',
   description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude (Haiku 5.5 @high by default); high/critical disagreements go to astra@max. Every lens defaults to 6.1-sol@xhigh, including security. For critical work, securityTier: final selects astra@max for security only; an explicit tier overrides every lens. Fails closed.',
-  whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: light|daily|final, securityTier: light|daily|final, context, lessons, triage, triageModel: haiku|sonnet|opus|inherit, triageEffort, escalate, fast }',
+  whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: light|daily|final, securityTier: light|daily|final, context, lessons, triage, triageModel: haiku|sonnet|opus|inherit, triageEffort, escalate, fast, pass: positive integer (default 2 with priorFindings, else 1), priorFindings: previous findings and fixes (string, array or object), ownerApproved: true to allow pass > 3 }. Pass > 1 reviews only the fix delta and prior findings.',
   phases: [
     { title: 'Review', detail: 'one Codex review per lens (read-only, hermetic)' },
     { title: 'Triage', detail: 'Claude (Haiku 5.5 @high unless triageModel says otherwise) checks each Codex finding against the code' },
@@ -13,6 +13,9 @@ export const meta = {
 /*@@ULTRACODEX_HELPER@@*/
 
 const A = args || {}
+const PRIOR_FINDINGS = A.priorFindings == null ? null : typeof A.priorFindings === 'string' ? A.priorFindings : JSON.stringify(A.priorFindings)
+const PASS = Number.isInteger(A.pass) && A.pass > 0 ? A.pass : PRIOR_FINDINGS !== null ? 2 : 1
+if (PASS > 3 && A.ownerApproved !== true) throw new Error('codex-review: pass ' + PASS + " exceeds the cap of 3 review passes per change; a further pass needs the owner's OK (args.ownerApproved: true)")
 const CWD = A.cwd || null
 const EXPLICIT_TIER = ['light', 'daily', 'final'].includes(A.tier)
 const TIER = A.tier === 'final' ? 'final' : A.tier === 'light' ? 'light' : 'daily'
@@ -39,6 +42,11 @@ const SCOPE = A.commit
   : A.uncommitted
     ? 'the uncommitted changes (git status, git diff, git diff --cached, and untracked files)'
     : 'the changes on the current branch against ' + (A.base || 'main') + ' (git diff ' + (A.base || 'main') + '...HEAD), plus any uncommitted changes'
+const REREVIEW_TASK = PASS > 1 ? `
+
+This is review pass ${PASS} of this change. The scope above is the fix delta after the previous pass.
+${PRIOR_FINDINGS !== null ? "(1) Check that each prior finding below is really fixed. Report a prior finding that is still open as a new finding whose title starts with 'Not fixed:'.\n" : ''}(2) Look for defects that the fix introduced, in the changed lines and in the code that calls them.
+(3) Do not report defects in code that the delta does not touch, unless they are high or critical.${PRIOR_FINDINGS !== null ? '\nPRIOR FINDINGS:\n' + PRIOR_FINDINGS : ''}` : ''
 
 const LENSES = {
   code: 'CODE lens — correctness, edge cases, error handling, resource and lifecycle handling, concurrency and ordering, API/contract mismatches between caller and callee (headers, bodies, query params), and tests that cannot fail or silently skip.',
@@ -57,7 +65,7 @@ const ESCALATE = TRIAGE && A.escalate !== false && lensKeys.some(key => lensTier
 const lensTask = key => `You are reviewing ${SCOPE} in your working directory. Be adversarial and concrete.
 ${LENSES[key]}
 Read the diff, then the surrounding code of every changed hunk. Report only real defects, each with file, line, evidence from the code, a reachable failure scenario and a recommendation.
-Do not report style nits unless they hide a defect. Give each finding a short unique id. Use verdict "blocked" only for defects that must not ship.${CONTEXT}${LESSONS}`
+Do not report style nits unless they hide a defect. Give each finding a short unique id. Use verdict "blocked" only for defects that must not ship.${CONTEXT}${LESSONS}${REREVIEW_TASK}`
 
 // Claude also rates each finding's severity itself: Codex tends to rate findings above their
 // real impact, and the report ranks and decides by Claude's rating (every change is shown).
@@ -163,6 +171,34 @@ const confirmedRated = confirmed.map(rated).sort((a, b) => (RANK[a.severity] ?? 
 const severityChanges = confirmedRated.filter(f => f.severity !== f.codexSeverity)
   .map(f => ({ id: f.id, title: f.title, codex: f.codexSeverity, claude: f.severity, why: f.severityReason }))
 
+// Unresolved findings count at the worse of Codex's and Claude's ratings; refuted ones do not count.
+const activeSeverities = [
+  ...confirmedRated.map(f => f.severity),
+  ...[...disputed, ...needsInfo].flatMap(f => [f.severity, f.triage && f.triage.severity]),
+  ...untriaged.map(f => f.severity),
+]
+const worst = SEVERITIES.find(severity => activeSeverities.includes(severity)) || 'none'
+const rereview = { pass: PASS, worst, recommendation: 'none', tier: null, nextPass: null, rerunLenses: failedLenses.map(l => l.lens), reason: '' }
+if (worst === 'low' || worst === 'none') {
+  rereview.reason = 'No re-review; fix only low findings that take a few lines and are obviously correct; list the rest as follow-ups.'
+} else if (worst === 'medium' && PASS >= 3) {
+  rereview.reason = 'The cap of 3 review passes is reached; fix and verify without another pass, or document the findings as known limits.'
+} else if (PASS >= 3) {
+  rereview.recommendation = 'owner'
+  rereview.reason = 'The cap of 3 review passes is reached with a high or critical finding open; do not ship. The owner decides about another pass with ownerApproved: true.'
+} else {
+  rereview.recommendation = 'delta'
+  rereview.tier = worst === 'medium' ? (TIER === 'final' ? 'daily' : 'light') : TIER === 'final' ? 'final' : 'daily'
+  rereview.nextPass = PASS + 1
+  rereview.reason = worst === 'medium'
+    ? 'Fix and verify, then review only the fix delta (base = the commit this pass reviewed) at tier ' + rereview.tier + ' with priorFindings.' + (rereview.tier === 'light' ? ' Use daily instead of light when the delta is more than about 50 changed lines or more than 3 files.' : '')
+    : 'Fix and verify, then review only the fix delta at tier ' + rereview.tier + ' with priorFindings; a full re-review only when the fix was large or changed the design.'
+}
+if (rereview.rerunLenses.length) rereview.reason = 'Re-run only these lenses on the same scope with the same pass number first — that is not a new pass. Failed lenses: ' + rereview.rerunLenses.join(', ') + '. ' + rereview.reason
+const rereviewLine = 'Re-review: ' + (rereview.recommendation === 'delta'
+  ? 'delta (pass ' + rereview.nextPass + ', tier ' + rereview.tier + ', base = the commit this pass reviewed)'
+  : rereview.recommendation === 'owner' ? 'owner decides' : 'none') + ' — ' + rereview.reason
+
 phase('Report')
 const report = await agent(`Write the final review report for ${SCOPE}${CWD ? ' in ' + CWD : ''}.${ucxWhere(CWD)}
 ${failedLenses.length ? 'At the very top, state that these lenses FAILED and were not reviewed: ' + JSON.stringify(failedLenses.map(l => ({ lens: l.lens, error: l.error.kind, message: l.error.message }))) : ''}
@@ -172,7 +208,11 @@ ${disputed.length ? 'DISPUTED findings (Claude doubted them, the gpt-6-astra esc
 ${untriaged.length ? 'UNTRIAGED Codex findings (triage was off — present them as unverified claims, not as confirmed defects): ' + JSON.stringify(untriaged) : ''}
 NEEDS-INFO findings (say what must be checked; those with an "escalation.error" are high/critical findings Claude doubted whose gpt-6-astra tiebreak FAILED — say so plainly, they are unresolved): ${JSON.stringify(needsInfo)}
 REFUTED findings (one line each, with the reason): ${JSON.stringify(refuted.map(f => ({ id: f.id, title: f.title, why: whyRefuted(f) })))}
-End with a one-line overall verdict that follows these ratings: "do not ship" when a confirmed or disputed finding is critical/high, or a critical/high one is still unresolved (needs-info); "ship after fixes" when the worst is medium; "ship" when only low ones remain.`, { label: 'report', phase: 'Report', agentType: UCX_READER })
+Merge findings that describe the same defect (same root cause, often reported by more than one lens) into one item and list all their ids.
+Present low findings as optional: fix now only those that take a few lines and are obviously correct; list the rest as follow-ups.
+Give a one-line overall verdict that follows these ratings: "do not ship" when a confirmed or disputed finding is critical/high, or a critical/high one is still unresolved (needs-info); "ship after fixes" when the worst is medium; "ship" when only low ones remain.
+Then add this as the very last line of the report. Copy it verbatim:
+${rereviewLine}`, { label: 'report', phase: 'Report', agentType: UCX_READER })
 
 if (failedTriages.length) log('⚠ ' + failedTriages.length + ' findings could not be triaged — kept as needs-info')
 
@@ -181,6 +221,7 @@ return {
   status: failedLenses.length || failedTriages.length || escalation.failed ? 'incomplete' : 'complete',
   tier: TIER,
   report,
+  rereview,
   lenses: lenses.map(l => ({ lens: l.lens, tier: l.tier, model: UCX_TIER_MODEL[l.tier], verdict: l.verdict || null, error: l.error ? l.error.kind : null })),
   triage: TRIAGE ? { model: TRIAGE_MODEL, effort: TRIAGE_EFFORT } : null,
   confirmed: confirmedRated, severityChanges, disputed, needsInfo, untriaged,

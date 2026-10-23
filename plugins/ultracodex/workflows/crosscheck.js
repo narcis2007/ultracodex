@@ -27,7 +27,7 @@ export const meta = {
 // for every kind · 'final' → gpt-6-astra@max for exceptional critical work. Pin
 // model/effort only to override with a reason. Concurrency is capped intrinsically: 4 Codex jobs
 // per workflow, an astra job counting as 2 — do not wrap calls in another gate.
-const UCX_VERSION = '0.6.2'
+const UCX_VERSION = '0.6.3'
 const UCX_RELAY = 'ultracodex:codex-relay'
 const UCX_TIER_MODEL = { light: 'gpt-6-luna', daily: 'gpt-6.1-sol', final: 'gpt-6-astra' }
 const UCX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']

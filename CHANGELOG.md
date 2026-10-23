@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.3 — 2026-10-23 (re-review policy)
+
+- `codex-review` returns a deterministic `rereview` policy and ends the report with its
+  `Re-review:` line. Low-only or clean reviews stop; medium/high findings get fixes, verification
+  and a review of only the fix delta with the prior findings. Medium deltas use `daily` after
+  a `final` pass, otherwise `light` (or `daily` above about 50 changed lines or 3 files).
+  High/critical deltas use `daily`, or keep `final` when selected. Full re-reviews are only
+  for large or design-changing fixes.
+- This follows the owner's last 30 days: 219 reviews on 104 changes used about 47% of all
+  Codex credits (implementation: 44%); passes 2+ used about half the review credits. After a
+  complete low-only or clean pass, later passes found medium-or-worse defects in 0 of 12 cases;
+  low findings kept appearing without converging. After medium findings, the next pass found
+  a high in 5 of 52 cases (about 10%). Claude lowered severity in 77% of confirmed findings;
+  about 23% were duplicates from two lenses reporting the same defect at the same file:line.
+- Add `pass`, `priorFindings` and `ownerApproved`. Later passes check that prior findings are
+  fixed and look only at the fix delta and its callers, except for high/critical defects.
+  Cap reviews at 3 passes; a further pass needs the owner's OK. Failed lenses re-run on the
+  same scope and pass number. Reports merge duplicate defects and make low findings optional.
+  Align the review and implementation skills, add offline policy tests and rebuild workflows.
+
 ## 0.6.2 — 2026-10-20 (Astra opt-in for routine reviews)
 
 - `codex-review` now defaults every lens, including `security`, to `daily` (gpt-6.1-sol@xhigh).

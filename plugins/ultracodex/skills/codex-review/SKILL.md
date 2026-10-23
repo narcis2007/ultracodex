@@ -8,6 +8,7 @@ description: >-
   review this", "review with astra / sol / luna", a final review gate before merge or deploy,
   or a specific review lens. Routine reviews, including security lenses, run on
   gpt-6.1-sol@xhigh. Astra at max is for critical work only; quick sanity passes use gpt-6-luna@max.
+  It also says whether a re-review is worth it and how narrow it should be.
 ---
 
 # Codex adversarial review
@@ -29,6 +30,10 @@ Settle before starting: the repo (absolute path), the scope (`base` branch, one 
   payments, personal data), data migrations, irreversible production steps, or the last gate
   before a production release;
 - `light` → gpt-6-luna@max — a quick pass on a small or mechanical change.
+
+Say which pass this is: `1` is the first review of the change. When possible, commit the work
+under review first. Record `git -C "<repo>" rev-parse HEAD` as the reviewed commit before each
+pass — it is the base of a later fix delta.
 
 When the owner named no tier, pick it from the change itself — measure it first with
 `git -C "<repo>" diff --shortstat <scope>` (and `--name-only`):
@@ -58,7 +63,7 @@ keep. If the project keeps a recurring-defects checklist (e.g. `REVIEW_LESSONS.m
 
 ```
 Workflow({ name: 'ultracodex:codex-review', args: {
-  cwd: '<abs repo path>', base: 'main', lenses: ['code', 'domain'],
+  cwd: '<abs repo path>', base: 'main', lenses: ['code', 'domain'], pass: 1,
   context: '<what the change is for>', lessons: '<abs path or omit>' } })
 ```
 
@@ -67,6 +72,12 @@ uses Sol 6.1 at `xhigh`. Optional `securityTier: 'light'|'daily'|'final'` change
 lens; use `securityTier: 'final'` for critical security work. Invalid values are ignored.
 An explicit `tier` overrides `securityTier` for every lens. `lenses[].tier` and `lenses[].model`
 record the model used, including failed lenses.
+
+`pass` is a positive integer. Missing or invalid values default to `2` when `priorFindings`
+is given, otherwise `1`. `priorFindings` holds the previous findings and how each was fixed;
+pass a string, or an array/object (serialized as JSON). For `pass > 1`, each lens checks those
+findings and only the fix delta. `ownerApproved` is a boolean; a pass above `3` is refused
+unless the owner gave OK and you pass `ownerApproved: true`.
 
 It runs one Codex review per lens (hermetic, read-only, astra ≤2 at a time), has Claude check
 every finding in the code (confirmed / refuted / needs-info) and rate its severity itself —
@@ -129,6 +140,28 @@ per-lens verdicts and models used; an overall line that follows your ratings: do
 confirmed critical/high (or one still unresolved), ship after fixes when the worst is medium,
 ship when only low ones remain. If any lens failed, the review is **incomplete** —
 say so first. Do not merge anything on the strength of the review alone; the owner decides.
+Merge duplicate findings about the same root cause into one item and list all their ids.
+Keep the overall verdict, then end with the workflow's `Re-review:` line verbatim.
+
+## 6. After the review — fixes and re-review
+
+Follow `rereview` in the workflow result, also shown in the report's last `Re-review:` line.
+If lenses failed, re-run only `rereview.rerunLenses` first, on the same scope and with the same
+pass number. That is not a new pass.
+
+- **`none`** → no new pass. Low findings are optional: fix now only those that take a few
+  lines and are obviously correct. Put the rest in the PR as follow-ups or known limits.
+  At the cap with medium findings, fix and verify without another pass, or document known limits.
+- **`delta`** → fix, verify (build, tests, diff), and commit. Run the workflow with
+  `base: '<reviewed commit>'`, `pass: N + 1`, and `tier: rereview.tier`.
+  Pass `priorFindings: '<one line per confirmed/disputed finding: id, title, file:line, how it was fixed>'`.
+  Medium deltas use `daily` after a `final` pass, otherwise `light`.
+  When the tier is `light`, use `daily` instead if the delta is more than about 50 changed lines
+  or more than 3 files. A full re-review (`base: 'main'`) is only for a large or design-changing fix.
+- **`owner`** → stop and report; do not ship with a high or critical finding open. At most
+  3 passes per change. A fourth pass needs the owner's OK (`ownerApproved: true`).
+
+New feature work added later, rather than fixes, is a new change. Review its own delta as pass 1.
 
 ## Rules
 

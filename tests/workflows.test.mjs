@@ -1161,6 +1161,188 @@ test("codex-review ranks by Claude's own severity, keeps Codex's beside it, and 
   assert.deepEqual(escalated.map((item) => item.id), ["code:3"], "a critical finding Claude refuted still gets its astra tiebreak, whatever Claude rated it");
 });
 
+for (const c of [
+  { name: "no findings", findings: [], worst: "none", recommendation: "none", tier: null, nextPass: null },
+  { name: "low-only uses Claude's rating", findings: [["high", "confirmed", "low"], ["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
+  { name: "medium uses Claude's rating", findings: [["high", "confirmed", "medium"]], worst: "medium", recommendation: "delta", tier: "light", nextPass: 2 },
+  { name: "high raised by Claude", findings: [["low", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "daily", nextPass: 2 },
+  { name: "critical", findings: [["critical", "confirmed", "critical"]], worst: "critical", recommendation: "delta", tier: "daily", nextPass: 2 },
+  { name: "high keeps final", args: { tier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "final", nextPass: 2 },
+  { name: "high raises light to daily", args: { tier: "light" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "daily", nextPass: 2 },
+  { name: "medium uses daily for final work", args: { tier: "final" }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "delta", tier: "daily", nextPass: 2 },
+  { name: "disputed high cannot be lowered", args: { escalate: true }, findings: [["high", "refuted", "low"]], worst: "high", recommendation: "delta", tier: "daily", nextPass: 2 },
+  { name: "disputed uses a higher triage rating", args: { escalate: true }, findings: [["high", "refuted", "critical"]], worst: "critical", recommendation: "delta", tier: "daily", nextPass: 2 },
+  { name: "needs-info Codex high and triage low", findings: [["high", "needs_info", "low"]], worst: "high", recommendation: "delta", tier: "daily", nextPass: 2 },
+  { name: "needs-info uses a higher triage rating", findings: [["low", "needs_info", "critical"]], worst: "critical", recommendation: "delta", tier: "daily", nextPass: 2 },
+  { name: "refuted critical does not count", findings: [["critical", "refuted", "critical"]], worst: "none", recommendation: "none", tier: null, nextPass: null },
+  { name: "settled escalation does not count", args: { escalate: true }, settled: true, findings: [["high", "refuted", "high"]], worst: "none", recommendation: "none", tier: null, nextPass: null },
+  { name: "worst across mixed buckets", findings: [["critical", "refuted", "critical"], ["low", "confirmed", "low"], ["high", "confirmed", "medium"], ["low", "needs_info", "medium"]], worst: "medium", recommendation: "delta", tier: "light", nextPass: 2 },
+  { name: "untriaged low", args: { triage: false }, findings: [["low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
+  { name: "untriaged medium", args: { triage: false }, findings: [["medium"]], worst: "medium", recommendation: "delta", tier: "light", nextPass: 2 },
+  { name: "untriaged highest severity", args: { triage: false }, findings: [["low"], ["high"], ["medium"]], worst: "high", recommendation: "delta", tier: "daily", nextPass: 2 },
+  { name: "pass 2 medium", args: { pass: 2 }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "delta", tier: "light", nextPass: 3 },
+  { name: "pass 3 low", args: { pass: 3 }, findings: [["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
+  { name: "pass 3 medium stops", args: { pass: 3 }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "none", tier: null, nextPass: null },
+  { name: "pass 3 high needs owner", args: { pass: 3 }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "owner", tier: null, nextPass: null },
+  { name: "pass 3 critical needs owner", args: { pass: 3 }, findings: [["critical", "confirmed", "critical"]], worst: "critical", recommendation: "owner", tier: null, nextPass: null },
+  { name: "approved pass 4 low stops", args: { pass: 4, ownerApproved: true }, findings: [["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
+  { name: "approved pass 4 medium stops", args: { pass: 4, ownerApproved: true }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "none", tier: null, nextPass: null },
+  { name: "approved pass 4 high still needs owner", args: { pass: 4, ownerApproved: true }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "owner", tier: null, nextPass: null },
+]) test(`codex-review re-review: ${c.name}`, async () => {
+  let reportPrompt = null;
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      if (request.label === "codex:escalate") {
+        const items = JSON.parse(request.task.slice(request.task.indexOf("INPUT ITEMS (JSON):") + "INPUT ITEMS (JSON):".length));
+        return okEnvelope(request, { results: items.map(f => ({ id: f.id, refuted: c.settled === true, confidence: 0.9, reasoning: "checked the caller" })) });
+      }
+      const findings = c.findings.map(([severity], i) => ({ id: "f" + i, severity, category: "c", title: "defect " + i, file: "x.rs", line: i + 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.7 }));
+      return okEnvelope(request, { verdict: findings.length ? "request_changes" : "approve", summary: "sum", findings });
+    }
+    if (opts.label?.startsWith("triage:")) {
+      const [, verdict, severity] = c.findings[Number(opts.label.split(":").at(-1)) - 1];
+      return { verdict, severity, severityReason: "realistic impact", reasoning: "checked the code" };
+    }
+    if (opts.label === "report") {
+      reportPrompt = prompt;
+      return prompt.split("\n").at(-1);
+    }
+    return null;
+  };
+  const args = { lenses: ["code"], escalate: false, ...c.args };
+  const { result } = await runWorkflow("codex-review", { agent, args });
+  const { reason, ...policy } = result.rereview;
+  assert.equal(result.status, "complete");
+  assert.deepEqual(policy, { pass: args.pass || 1, worst: c.worst, recommendation: c.recommendation, tier: c.tier, nextPass: c.nextPass, rerunLenses: [] });
+  if (c.worst === "low" || c.worst === "none") {
+    assert.match(reason, /No re-review; fix only low findings that take a few lines and are obviously correct; list the rest as follow-ups/);
+  } else if (c.recommendation === "none") {
+    assert.match(reason, /cap of 3.*fix and verify without another pass.*known limits/);
+  } else if (c.recommendation === "owner") {
+    assert.match(reason, /cap of 3.*do not ship.*owner.*ownerApproved: true/);
+  } else if (c.worst === "medium") {
+    assert.match(reason, /Fix and verify.*only the fix delta.*base = the commit this pass reviewed.*priorFindings/);
+    assert.ok(reason.includes("at tier " + c.tier + " with priorFindings"));
+    if (c.tier === "light") assert.match(reason, /daily instead of light.*50 changed lines.*3 files/);
+    else assert.doesNotMatch(reason, /instead of light|50 changed lines|3 files/);
+  } else {
+    assert.ok(reason.includes("fix delta at tier " + c.tier + " with priorFindings"));
+    assert.match(reason, /full re-review only when the fix was large or changed the design/);
+  }
+  const advice = c.recommendation === "delta"
+    ? `delta (pass ${c.nextPass}, tier ${c.tier}, base = the commit this pass reviewed)`
+    : c.recommendation === "owner" ? "owner decides" : "none";
+  const line = `Re-review: ${advice} — ${reason}`;
+  assert.ok(reportPrompt.endsWith(line), "the report agent gets the exact code-built last line");
+  assert.match(reportPrompt, /very last line of the report\. Copy it verbatim/);
+  assert.match(reportPrompt, /Merge findings that describe the same defect.*same root cause.*list all their ids/);
+  assert.match(reportPrompt, /low findings as optional.*few lines.*obviously correct.*follow-ups/);
+  assert.equal(result.report, line);
+  if (c.name.startsWith("disputed")) assert.equal(result.disputed.length, 1);
+});
+
+test("codex-review refuses a pass above 3 without the owner's boolean approval before any agent call", async () => {
+  const body = workflowSource("codex-review").replace(/^export const meta =/m, "const meta =");
+  const fn = new AsyncFunction("agent", "args", body);
+  let calls = 0;
+  const agent = async () => { calls++; return null; };
+  for (const pass of [4, 5]) {
+    for (const ownerApproved of [undefined, false, "true", 1, {}]) {
+      await assert.rejects(fn(agent, { pass, ownerApproved }), {
+        message: `codex-review: pass ${pass} exceeds the cap of 3 review passes per change; a further pass needs the owner's OK (args.ownerApproved: true)`,
+      });
+    }
+  }
+  assert.equal(calls, 0, "even the key agent must not run");
+});
+
+test("codex-review defaults missing and invalid passes according to priorFindings", async () => {
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      return okEnvelope(request, { verdict: "approve", summary: "clean", findings: [] });
+    }
+    return opts.label === "report" ? "FINAL" : null;
+  };
+  for (const pass of [undefined, 0, -1, "x", 2.5, "2", null, true, Infinity]) {
+    for (const priorFindings of [undefined, null, "code:1 fixed by checking the caller", [], {}, ""]) {
+      const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"], pass, priorFindings } });
+      assert.equal(result.rereview.pass, priorFindings == null ? 1 : 2);
+    }
+  }
+});
+
+test("codex-review re-runs only failed lenses on the same scope and pass before the next pass", async () => {
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      if (request.label !== "codex:code") return JSON.stringify({ ultracodex: 1, ok: false, state: "timeout", runId: RUN_ID, error: { kind: "timeout", message: "deadline" } });
+      const finding = { id: "f", severity: "medium", category: "c", title: "defect", file: "x.rs", line: 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.7 };
+      return okEnvelope(request, { verdict: "request_changes", summary: "sum", findings: [finding] });
+    }
+    if (opts.label?.startsWith("triage:")) return { verdict: "confirmed", severity: "medium", severityReason: "", reasoning: "seen" };
+    return opts.label === "report" ? "FINAL" : null;
+  };
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "domain", "security"], pass: 2, base: "reviewed-commit" } });
+  assert.equal(result.status, "incomplete");
+  assert.deepEqual(result.rereview.rerunLenses, ["domain", "security"]);
+  assert.equal(result.rereview.pass, 2);
+  assert.equal(result.rereview.nextPass, 3);
+  assert.equal(result.rereview.recommendation, "delta");
+  assert.ok(result.rereview.reason.startsWith("Re-run only these lenses on the same scope with the same pass number first — that is not a new pass."));
+  assert.match(result.rereview.reason, /Failed lenses: domain, security/);
+});
+
+test("codex-review adds delta instructions and prior findings to every later lens, keeping pass 1 text exact", async () => {
+  const lenses = {
+    code: "CODE lens — correctness, edge cases, error handling, resource and lifecycle handling, concurrency and ordering, API/contract mismatches between caller and callee (headers, bodies, query params), and tests that cannot fail or silently skip.",
+    domain: "DOMAIN lens — business rules and invariants, data integrity across writes, idempotency and retries of external effects, time zones and clocks, money/quantities, what the user sees versus what is true, and irreversible actions guarded only by assumptions.",
+    security: "SECURITY lens — authentication/authorization gaps, injection, path traversal, secrets, unsafe deserialization, SSRF, tenant isolation, and trust in third-party input.",
+    tests: "TESTS lens — missing coverage of the risky paths, assertions that pass for the wrong reason, tests that depend on shared global state or neighbours, and behaviour changes with no test.",
+    performance: "PERFORMANCE lens — unbounded work or memory, N+1 queries, missing indexes, hot-path allocations, blocking calls in async code, and timeouts/pool settings.",
+  };
+  const prior = "code:1, missing guard, x.rs:1, fixed by validating the caller";
+  for (const args of [{ pass: 1 }, { pass: 1, priorFindings: prior }, { pass: 2 }, { pass: 2, priorFindings: prior }, { pass: 2, priorFindings: [prior] }, { pass: 2, priorFindings: { id: "code:1", fix: "validate caller" } }]) {
+    const tasks = [];
+    const agent = async (prompt, opts) => {
+      if (opts.agentType === RELAY) {
+        const { request } = receive(prompt);
+        tasks.push([request.label.slice("codex:".length), request.task]);
+        return okEnvelope(request, { verdict: "approve", summary: "clean", findings: [] });
+      }
+      return opts.label === "report" ? "FINAL" : null;
+    };
+    await runWorkflow("codex-review", { agent, args: { lenses: Object.keys(lenses), base: "reviewed-commit", context: "Keep writes idempotent.", lessons: "REVIEW_LESSONS.md", ...args } });
+    assert.equal(tasks.length, 5);
+    for (const [key, task] of tasks) {
+      const original = `You are reviewing the changes on the current branch against reviewed-commit (git diff reviewed-commit...HEAD), plus any uncommitted changes in your working directory. Be adversarial and concrete.
+${lenses[key]}
+Read the diff, then the surrounding code of every changed hunk. Report only real defects, each with file, line, evidence from the code, a reachable failure scenario and a recommendation.
+Do not report style nits unless they hide a defect. Give each finding a short unique id. Use verdict "blocked" only for defects that must not ship.
+WHAT THE CHANGE IS FOR / DOMAIN RULES (from the owner):
+Keep writes idempotent.
+Before reviewing, read REVIEW_LESSONS.md — a checklist of defect classes this project keeps producing — and check the change against every item.`;
+      if (args.pass === 1) {
+        assert.equal(task, original);
+        assert.doesNotMatch(task, /This is review pass|PRIOR FINDINGS:|Not fixed:/);
+      } else {
+        assert.ok(task.startsWith(original + "\n\nThis is review pass 2 of this change."));
+        assert.match(task, /The scope above is the fix delta after the previous pass/);
+        assert.match(task, /\(2\) Look for defects that the fix introduced, in the changed lines and in the code that calls them/);
+        assert.match(task, /\(3\) Do not report defects in code that the delta does not touch, unless they are high or critical/);
+        if (args.priorFindings !== undefined) {
+          assert.match(task, /\(1\) Check that each prior finding below is really fixed.*title starts with 'Not fixed:'/);
+          const text = typeof args.priorFindings === "string" ? args.priorFindings : JSON.stringify(args.priorFindings);
+          assert.ok(task.endsWith("PRIOR FINDINGS:\n" + text));
+        } else {
+          assert.doesNotMatch(task, /\(1\)|PRIOR FINDINGS:|Not fixed:/);
+        }
+      }
+    }
+  }
+});
+
 test("judge-panel reports a failed Codex generation instead of hiding it", async () => {
   const agent = async (prompt, opts) => {
     if (opts.agentType === RELAY) {
