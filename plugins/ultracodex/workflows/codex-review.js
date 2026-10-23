@@ -606,7 +606,7 @@ const SCOPE = A.commit
 const REREVIEW_TASK = PASS > 1 ? `
 
 This is review pass ${PASS} of this change. The scope above is the fix delta after the previous pass.
-${PRIOR_FINDINGS !== null ? "(1) Check that each prior finding below is really fixed. Report a prior finding that is still open as a new finding whose title starts with 'Not fixed:'.\n" : ''}(2) Look for defects that the fix introduced, in the changed lines and in the code that calls them.
+${PRIOR_FINDINGS !== null ? '(1) Check that each prior finding marked fixed is really fixed. Check again each prior finding that is still open or unresolved (needs-info), also outside the delta. Do not report again a prior finding marked as a follow-up or known limit.\n' : ''}(2) Look for defects that the fix introduced, in the changed lines and in the code that calls them.
 (3) Do not report defects in code that the delta does not touch, unless they are high or critical.${PRIOR_FINDINGS !== null ? '\nPRIOR FINDINGS:\n' + PRIOR_FINDINGS : ''}` : ''
 
 const LENSES = {
@@ -733,13 +733,21 @@ const severityChanges = confirmedRated.filter(f => f.severity !== f.codexSeverit
   .map(f => ({ id: f.id, title: f.title, codex: f.codexSeverity, claude: f.severity, why: f.severityReason }))
 
 // Unresolved findings count at the worse of Codex's and Claude's ratings; refuted ones do not count.
-const activeSeverities = [
-  ...confirmedRated.map(f => f.severity),
-  ...[...disputed, ...needsInfo].flatMap(f => [f.severity, f.triage && f.triage.severity]),
-  ...untriaged.map(f => f.severity),
+const carryFinding = (f, status) => ({
+  id: f.id, status,
+  severity: ['disputed', 'needs_info'].includes(status)
+    ? SEVERITIES.find(severity => [f.severity, f.triage && f.triage.severity].includes(severity)) : f.severity,
+  title: f.title, file: f.file, line: f.line,
+})
+// Confirmed findings stay in report order, then disputed, needs-info and untriaged in lens order.
+const carry = [
+  ...confirmedRated.map(f => carryFinding(f, 'confirmed')),
+  ...disputed.map(f => carryFinding(f, 'disputed')),
+  ...needsInfo.map(f => carryFinding(f, 'needs_info')),
+  ...untriaged.map(f => carryFinding(f, 'untriaged')),
 ]
-const worst = SEVERITIES.find(severity => activeSeverities.includes(severity)) || 'none'
-const rereview = { pass: PASS, worst, recommendation: 'none', tier: null, nextPass: null, rerunLenses: failedLenses.map(l => l.lens), reason: '' }
+const worst = SEVERITIES.find(severity => carry.some(f => f.severity === severity)) || 'none'
+const rereview = { pass: PASS, worst, recommendation: 'none', tier: null, nextPass: null, rerunLenses: failedLenses.map(l => l.lens), carry, reason: '' }
 if (worst === 'low' || worst === 'none') {
   rereview.reason = 'No re-review; fix only low findings that take a few lines and are obviously correct; list the rest as follow-ups.'
 } else if (worst === 'medium' && PASS >= 3) {
@@ -755,13 +763,13 @@ if (worst === 'low' || worst === 'none') {
     ? 'Fix and verify, then review only the fix delta (base = the commit this pass reviewed) at tier ' + rereview.tier + ' with priorFindings.' + (rereview.tier === 'light' ? ' Use daily instead of light when the delta is more than about 50 changed lines or more than 3 files.' : '')
     : 'Fix and verify, then review only the fix delta at tier ' + rereview.tier + ' with priorFindings; a full re-review only when the fix was large or changed the design.'
 }
-if (rereview.rerunLenses.length) rereview.reason = 'Re-run only these lenses on the same scope with the same pass number first — that is not a new pass. Failed lenses: ' + rereview.rerunLenses.join(', ') + '. ' + rereview.reason
+if (rereview.rerunLenses.length) rereview.reason = 'Re-run only these lenses on the same scope with the same pass number first — that is not a new pass. Failed lenses: ' + rereview.rerunLenses.join(', ') + '. This decision covers only the lenses that ran. Keep the first result; after the re-run, combine the findings of both runs and follow the stricter of the two rereview objects: worse worst, recommendation owner > delta > none, tier final > daily > light. ' + rereview.reason
 const rereviewLine = 'Re-review: ' + (rereview.recommendation === 'delta'
   ? 'delta (pass ' + rereview.nextPass + ', tier ' + rereview.tier + ', base = the commit this pass reviewed)'
   : rereview.recommendation === 'owner' ? 'owner decides' : 'none') + ' — ' + rereview.reason
 
 phase('Report')
-const report = await agent(`Write the final review report for ${SCOPE}${CWD ? ' in ' + CWD : ''}.${ucxWhere(CWD)}
+let report = await agent(`Write the final review report for ${SCOPE}${CWD ? ' in ' + CWD : ''}.${ucxWhere(CWD)}
 ${failedLenses.length ? 'At the very top, state that these lenses FAILED and were not reviewed: ' + JSON.stringify(failedLenses.map(l => ({ lens: l.lens, error: l.error.kind, message: l.error.message }))) : ''}
 Per-lens Codex verdicts (include the model used for each lens): ${JSON.stringify(lenses.filter(l => !l.error).map(l => ({ lens: l.lens, tier: l.tier, model: UCX_TIER_MODEL[l.tier], verdict: l.verdict, summary: l.summary })))}
 CONFIRMED findings, ranked by "severity" — Claude's own rating after checking the code; "codexSeverity" is what Codex said. Where they differ, show "Codex: <codexSeverity> → <severity>" with the severityReason. For each: file:line, failure scenario, fix: ${JSON.stringify(confirmedRated)}
@@ -772,8 +780,13 @@ REFUTED findings (one line each, with the reason): ${JSON.stringify(refuted.map(
 Merge findings that describe the same defect (same root cause, often reported by more than one lens) into one item and list all their ids.
 Present low findings as optional: fix now only those that take a few lines and are obviously correct; list the rest as follow-ups.
 Give a one-line overall verdict that follows these ratings: "do not ship" when a confirmed or disputed finding is critical/high, or a critical/high one is still unresolved (needs-info); "ship after fixes" when the worst is medium; "ship" when only low ones remain.
-Then add this as the very last line of the report. Copy it verbatim:
-${rereviewLine}`, { label: 'report', phase: 'Report', agentType: UCX_READER })
+Do not write a Re-review: line; the workflow adds it.`, { label: 'report', phase: 'Report', agentType: UCX_READER })
+
+if (typeof report === 'string' && report.trim()) {
+  const lines = report.split(/\r?\n/)
+  while (lines.length && (!lines[lines.length - 1].trim() || lines[lines.length - 1].startsWith('Re-review:'))) lines.pop()
+  report = (lines.length ? lines.join('\n') + '\n\n' : '') + rereviewLine
+}
 
 if (failedTriages.length) log('⚠ ' + failedTriages.length + ' findings could not be triaged — kept as needs-info')
 

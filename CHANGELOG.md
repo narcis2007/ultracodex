@@ -19,6 +19,7 @@
   Cap reviews at 3 passes; a further pass needs the owner's OK. Failed lenses re-run on the
   same scope and pass number. Reports merge duplicate defects and make low findings optional.
   Align the review and implementation skills, add offline policy tests and rebuild workflows.
+- Return active findings as `rereview.carry` for later briefs and append the `Re-review:` footer in code.
 
 ## 0.6.2 — 2026-10-20 (Astra opt-in for routine reviews)
 

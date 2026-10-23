@@ -74,7 +74,7 @@ An explicit `tier` overrides `securityTier` for every lens. `lenses[].tier` and 
 record the model used, including failed lenses.
 
 `pass` is a positive integer. Missing or invalid values default to `2` when `priorFindings`
-is given, otherwise `1`. `priorFindings` holds the previous findings and how each was fixed;
+is given, otherwise `1`. `priorFindings` holds the previous findings and what was done about each;
 pass a string, or an array/object (serialized as JSON). For `pass > 1`, each lens checks those
 findings and only the fix delta. `ownerApproved` is a boolean; a pass above `3` is refused
 unless the owner gave OK and you pass `ownerApproved: true`.
@@ -148,13 +148,17 @@ Keep the overall verdict, then end with the workflow's `Re-review:` line verbati
 Follow `rereview` in the workflow result, also shown in the report's last `Re-review:` line.
 If lenses failed, re-run only `rereview.rerunLenses` first, on the same scope and with the same
 pass number. That is not a new pass.
+Each result covers only its lenses: keep the first result and merge both runs' findings and
+`rereview.carry` after the retry. Follow the stricter `rereview`: worse `worst`, recommendation
+`owner > delta > none`, tier `final > daily > light`.
 
 - **`none`** → no new pass. Low findings are optional: fix now only those that take a few
   lines and are obviously correct. Put the rest in the PR as follow-ups or known limits.
   At the cap with medium findings, fix and verify without another pass, or document known limits.
 - **`delta`** → fix, verify (build, tests, diff), and commit. Run the workflow with
   `base: '<reviewed commit>'`, `pass: N + 1`, and `tier: rereview.tier`.
-  Pass `priorFindings: '<one line per confirmed/disputed finding: id, title, file:line, how it was fixed>'`.
+  Build `priorFindings` from `rereview.carry` (id, status, severity, title, file:line).
+  For each, add what was done: fixed (how), still open (why), or left as a follow-up / known limit.
   Medium deltas use `daily` after a `final` pass, otherwise `light`.
   When the tier is `light`, use `daily` instead if the delta is more than about 50 changed lines
   or more than 3 files. A full re-review (`base: 'main'`) is only for a large or design-changing fix.

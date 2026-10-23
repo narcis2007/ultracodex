@@ -1206,15 +1206,17 @@ for (const c of [
     }
     if (opts.label === "report") {
       reportPrompt = prompt;
-      return prompt.split("\n").at(-1);
+      return "FINAL";
     }
     return null;
   };
   const args = { lenses: ["code"], escalate: false, ...c.args };
   const { result } = await runWorkflow("codex-review", { agent, args });
-  const { reason, ...policy } = result.rereview;
+  const { reason, carry, ...policy } = result.rereview;
   assert.equal(result.status, "complete");
   assert.deepEqual(policy, { pass: args.pass || 1, worst: c.worst, recommendation: c.recommendation, tier: c.tier, nextPass: c.nextPass, rerunLenses: [] });
+  assert.ok(Array.isArray(carry));
+  if (c.worst === "none") assert.deepEqual(carry, []);
   if (c.worst === "low" || c.worst === "none") {
     assert.match(reason, /No re-review; fix only low findings that take a few lines and are obviously correct; list the rest as follow-ups/);
   } else if (c.recommendation === "none") {
@@ -1234,12 +1236,100 @@ for (const c of [
     ? `delta (pass ${c.nextPass}, tier ${c.tier}, base = the commit this pass reviewed)`
     : c.recommendation === "owner" ? "owner decides" : "none";
   const line = `Re-review: ${advice} — ${reason}`;
-  assert.ok(reportPrompt.endsWith(line), "the report agent gets the exact code-built last line");
-  assert.match(reportPrompt, /very last line of the report\. Copy it verbatim/);
+  assert.match(reportPrompt, /Do not write a Re-review: line; the workflow adds it/);
+  assert.doesNotMatch(reportPrompt, /^Re-review:/m);
   assert.match(reportPrompt, /Merge findings that describe the same defect.*same root cause.*list all their ids/);
   assert.match(reportPrompt, /low findings as optional.*few lines.*obviously correct.*follow-ups/);
-  assert.equal(result.report, line);
+  assert.equal(result.report, "FINAL\n\n" + line);
   if (c.name.startsWith("disputed")) assert.equal(result.disputed.length, 1);
+});
+
+test("codex-review carries confirmed, disputed and needs-info findings in stable order, excluding refuted ones", async () => {
+  const findings = [
+    ["a", "high", "confirmed", "low"],
+    ["b", "high", "refuted", "low"],
+    ["c", "medium", "needs_info", "critical"],
+    ["d", "low", "refuted", "critical"],
+    ["e", "low", "confirmed", "high"],
+    ["f", "high", "refuted", "medium"],
+  ];
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      if (request.label === "codex:escalate") return okEnvelope(request, { results: [
+        { id: "code:2", refuted: false, confidence: 0.9, reasoning: "reachable" },
+        { id: "code:6", refuted: true, confidence: 0.9, reasoning: "guarded" },
+      ] });
+      return okEnvelope(request, { verdict: "request_changes", summary: "sum", findings: findings.map(([id, severity], i) => ({ id, severity, category: "c", title: "finding " + id, file: "a.ts", line: i + 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.7 })) });
+    }
+    if (opts.label?.startsWith("triage:")) {
+      const [, , verdict, severity] = findings[Number(opts.label.split(":").at(-1)) - 1];
+      return { verdict, severity, severityReason: "realistic impact", reasoning: "checked the code" };
+    }
+    return opts.label === "report" ? "FINAL" : null;
+  };
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"] } });
+  assert.deepEqual(result.rereview.carry, [
+    { id: "code:5", status: "confirmed", severity: "high", title: "finding e", file: "a.ts", line: 5 },
+    { id: "code:1", status: "confirmed", severity: "low", title: "finding a", file: "a.ts", line: 1 },
+    { id: "code:2", status: "disputed", severity: "high", title: "finding b", file: "a.ts", line: 2 },
+    { id: "code:3", status: "needs_info", severity: "critical", title: "finding c", file: "a.ts", line: 3 },
+  ]);
+  assert.deepEqual(result.refuted.map(f => f.id), ["code:4", "code:6"]);
+  assert.equal(result.rereview.worst, "critical");
+});
+
+test("codex-review carries untriaged findings with Codex's severity in lens order", async () => {
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      const severity = request.label === "codex:domain" ? "low" : "high";
+      const finding = { id: "f", severity, category: "c", title: "defect", file: "x.rs", line: 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.7 };
+      return okEnvelope(request, { verdict: "request_changes", summary: "sum", findings: [finding] });
+    }
+    return opts.label === "report" ? "FINAL" : null;
+  };
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["domain", "code"], triage: false } });
+  assert.deepEqual(result.rereview.carry, [
+    { id: "domain:1", status: "untriaged", severity: "low", title: "defect", file: "x.rs", line: 1 },
+    { id: "code:1", status: "untriaged", severity: "high", title: "defect", file: "x.rs", line: 1 },
+  ]);
+  assert.equal(result.rereview.worst, "high");
+});
+
+test("codex-review appends its footer when missing and replaces trailing stale footer lines", async () => {
+  for (const [report, body] of [
+    ["OVERALL: ship", "OVERALL: ship"],
+    ["OVERALL: ship\n\nRe-review: wrong\n", "OVERALL: ship"],
+    ["OVERALL: ship\r\n\r\nRe-review: wrong\r\n \t\r\nRe-review: stale\r\n\r\n", "OVERALL: ship"],
+    ["Re-review: wrong", ""],
+  ]) {
+    const agent = async (prompt, opts) => {
+      if (opts.agentType === RELAY) {
+        const { request } = receive(prompt);
+        return okEnvelope(request, { verdict: "approve", summary: "clean", findings: [] });
+      }
+      return opts.label === "report" ? report : null;
+    };
+    const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"] } });
+    const line = "Re-review: none — " + result.rereview.reason;
+    assert.equal(result.report, (body ? body + "\n\n" : "") + line);
+    assert.equal(result.report.split("\n").filter(line => line.startsWith("Re-review:")).length, 1);
+  }
+});
+
+test("codex-review preserves empty and non-string reports without crashing", async () => {
+  for (const report of ["", " \n\t ", null, undefined, false, 0, { text: "no string report" }, []]) {
+    const agent = async (prompt, opts) => {
+      if (opts.agentType === RELAY) {
+        const { request } = receive(prompt);
+        return okEnvelope(request, { verdict: "approve", summary: "clean", findings: [] });
+      }
+      return opts.label === "report" ? report : null;
+    };
+    const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"] } });
+    assert.equal(result.report, report);
+  }
 });
 
 test("codex-review refuses a pass above 3 without the owner's boolean approval before any agent call", async () => {
@@ -1292,6 +1382,9 @@ test("codex-review re-runs only failed lenses on the same scope and pass before 
   assert.equal(result.rereview.recommendation, "delta");
   assert.ok(result.rereview.reason.startsWith("Re-run only these lenses on the same scope with the same pass number first — that is not a new pass."));
   assert.match(result.rereview.reason, /Failed lenses: domain, security/);
+  assert.match(result.rereview.reason, /decision covers only the lenses that ran/);
+  assert.match(result.rereview.reason, /Keep the first result.*combine the findings of both runs.*stricter of the two rereview objects/);
+  assert.match(result.rereview.reason, /worse worst, recommendation owner > delta > none, tier final > daily > light/);
 });
 
 test("codex-review adds delta instructions and prior findings to every later lens, keeping pass 1 text exact", async () => {
@@ -1332,7 +1425,9 @@ Before reviewing, read REVIEW_LESSONS.md — a checklist of defect classes this 
         assert.match(task, /\(2\) Look for defects that the fix introduced, in the changed lines and in the code that calls them/);
         assert.match(task, /\(3\) Do not report defects in code that the delta does not touch, unless they are high or critical/);
         if (args.priorFindings !== undefined) {
-          assert.match(task, /\(1\) Check that each prior finding below is really fixed.*title starts with 'Not fixed:'/);
+          assert.match(task, /\(1\) Check that each prior finding marked fixed is really fixed/);
+          assert.match(task, /Check again each prior finding that is still open or unresolved \(needs-info\), also outside the delta/);
+          assert.match(task, /Do not report again a prior finding marked as a follow-up or known limit/);
           const text = typeof args.priorFindings === "string" ? args.priorFindings : JSON.stringify(args.priorFindings);
           assert.ok(task.endsWith("PRIOR FINDINGS:\n" + text));
         } else {
