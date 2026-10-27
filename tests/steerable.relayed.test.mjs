@@ -154,7 +154,7 @@ test("codexNode against the real runner: a steerable node's result passes the he
   const result = await runHelper(realAgent(env, seen), `return codexNode('Is it fine?', { schemaPreset: 'verdict', tier: 'light', kind: 'verify', label: 'lens: code' })`);
   assert.equal(typeof result.refuted, "boolean", JSON.stringify(result));
   const prov = result._codex;
-  assert.deepEqual([prov.backend, prov.steers, prov.attempts, prov.model, prov.tier], ["session", 0, 1, "gpt-6-luna", "light"]);
+  assert.deepEqual([prov.backend, prov.steers, prov.attempts, prov.model, prov.tier], ["session", 0, 1, "gpt-6.1-terra", "light"]);
   assert.match(prov.threadId, /^01a0fake-/);
   assert.ok(prov.usage.output_tokens > 0 && prov.runId);
   // the run is the steerable one: the header the helper signed carried the field

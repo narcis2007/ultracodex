@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.4 — 2026-10-27 (light tier on GPT-6.1 Terra @xhigh)
+
+- The `light` tier moves from `gpt-6-luna@max` to `gpt-6.1-terra@xhigh` for every kind. Luna is no
+  tier model any more; it stays usable as an explicit `model: 'gpt-6-luna', effort: 'max'` for
+  mechanical, high-volume work (named without an effort it still defaults to `max`, and counts as
+  `light` in provenance). `gpt-6.1-terra` takes `ultra`; luna still does not.
+- Benchmark 2026-10-27: 10 past `codex-review` lens jobs replayed at the reviewed commit, 12
+  Claude-confirmed medium-or-worse defects as ground truth, one run per config. Found: luna@max
+  2/12, terra@xhigh 5/12, terra@max 10/12, sol@xhigh (reference) 4/12. API cost per run: luna
+  $0.03, terra@xhigh $0.12, terra@max $0.49, sol@xhigh $0.48. Median time: luna ~275 s,
+  terra@xhigh ~79 s, terra@max ~453 s. terra@xhigh found at least as much as luna on 8/8 cases.
+  Small sample; run-to-run noise is large. Terra at `max` costs as much as Sol, so `light` uses
+  `xhigh`. OpenAI price per MTok: terra $1/$5, sol $2/$10, luna $0.10/$0.50.
+- Deadlines: model factor 1 for terra (luna keeps 0.5); a deadline is a runaway guard. Concurrency
+  weight 1. The re-review policy of 0.6.3 is unchanged (only the model behind `light` changes).
+- Runner `POLICY` gets `explicitModels` (luna → tier `light`, default effort `max`). The helper's
+  relay label shows the real effort. Align skills, references and READMEs; tests pin the new routing.
+
 ## 0.6.3 — 2026-10-23 (re-review policy)
 
 - `codex-review` returns a deterministic `rereview` policy and ends the report with its

@@ -26,8 +26,9 @@ Codex (GPT-6 via `codex exec`) inside Claude Code.
   A `SessionStart` hook (`scripts/session-start.mjs`) exports the session id as `ULTRACODEX_OWNER`, so each run
   records which Claude session started it.
 
-Tier policy: `light` → gpt-6-luna@max · `daily` → gpt-6.1-sol@xhigh (all workloads) ·
-`final` → gpt-6-astra@max. See `skills/codex-workflow/references/model-policy.md`.
+Tier policy: `light` → gpt-6.1-terra@xhigh · `daily` → gpt-6.1-sol@xhigh (all workloads) ·
+`final` → gpt-6-astra@max. `gpt-6-luna` is an explicit `model` override only (default effort `max`).
+See `skills/codex-workflow/references/model-policy.md`.
 
 Sol 6.1 implements complex code and handles routine reviews and asks by default. Astra is for
 critical work only: security-sensitive code (auth, keys, crypto, payments, personal data), data

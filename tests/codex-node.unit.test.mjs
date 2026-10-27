@@ -34,6 +34,7 @@ import {
   evictGeneration,
   fnv1a,
   matchingPrefix,
+  modelSupportsEffort,
   MAX_PART_CHARS,
   reconcilePinnedStop,
   framedToRaw,
@@ -72,6 +73,7 @@ const CATALOG = {
   models: [
     { slug: "gpt-6-astra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { slug: "gpt-6.1-sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { slug: "gpt-6.1-terra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { slug: "gpt-6-luna", efforts: ["low", "medium", "high", "xhigh", "max"] },
   ],
 };
@@ -213,16 +215,19 @@ test("validateValue enforces types, enums, required, extras, items and anyOf", (
 });
 
 test("policy follows the owner's routing rule", () => {
-  assert.equal(POLICY.models.light, "gpt-6-luna");
+  assert.equal(POLICY.models.light, "gpt-6.1-terra");
   assert.equal(POLICY.models.daily, "gpt-6.1-sol");
   assert.equal(POLICY.models.final, "gpt-6-astra");
   for (const row of policyTable()) {
-    if (row.model === "gpt-6-luna") assert.equal(row.effort, "max", "luna is always max");
+    assert.notEqual(row.model, "gpt-6-luna", "no tier selects luna any more");
+    if (row.model === "gpt-6.1-terra") assert.equal(row.effort, "xhigh", "Terra (light) defaults to xhigh for every workload");
     if (row.model === "gpt-6-astra") assert.equal(row.effort, "max");
     if (row.model === "gpt-6.1-sol") assert.equal(row.effort, "xhigh", "Sol defaults to xhigh for every workload");
     assert.notEqual(row.effort, "ultra", "ultra is never implicit");
   }
   assert.equal(resolvePolicy({ model: "gpt-6-luna", kind: "verify" }).effort, "max", "an explicit luna still defaults to max");
+  assert.equal(resolvePolicy({ model: "gpt-6-luna", kind: "verify" }).tier, "light", "an explicit luna still counts as light");
+  assert.equal(resolvePolicy({ tier: "daily", model: "gpt-6-luna", kind: "review", effort: "max" }).effort, "max");
   for (const kind of KINDS) {
     assert.equal(resolvePolicy({ tier: "final", model: "gpt-6.1-sol", kind }).effort, "xhigh", "an explicit Sol uses its own effort defaults");
     assert.equal(resolvePolicy({ tier: "daily", kind, effort: "max" }).effort, "max", "an exceptional explicit max override is preserved");
@@ -230,6 +235,52 @@ test("policy follows the owner's routing rule", () => {
   assert.equal(resolvePolicy({ tier: "final", kind: "review" }).weight, 2);
   assert.equal(computeDeadlineSec("gpt-6-astra", "max", "implement"), 8100);
   assert.equal(computeDeadlineSec("gpt-6-luna", "max", "verify"), 750);
+  assert.equal(computeDeadlineSec("gpt-6.1-terra", "xhigh", "review"), 2700, "Terra has model factor 1");
+});
+
+test("the light tier resolves to gpt-6.1-terra@xhigh for every kind", () => {
+  for (const kind of KINDS) {
+    const light = resolvePolicy({ tier: "light", kind });
+    assert.deepEqual([light.tier, light.model, light.effort, light.weight], ["light", "gpt-6.1-terra", "xhigh", 1], kind);
+    assert.equal(light.timeoutSec, computeDeadlineSec("gpt-6.1-terra", "xhigh", kind), "the deadline follows the Terra model factor");
+    assert.equal(resolvePolicy({ model: "gpt-6.1-terra", kind }).tier, "light", "an explicit Terra is the light tier");
+  }
+  assert.equal(resolvePolicy({ tier: "light", kind: "verify" }).timeoutSec, 1500);
+  assert.equal(resolvePolicy({ tier: "light", kind: "verify", effort: "max" }).effort, "max", "an explicit effort override is kept on Terra");
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-light-"));
+  try {
+    for (const kind of ["verify", "ask", "review"]) {
+      const request = validateRequest({ task: "x", cwd, tier: "light", kind }, { catalog: CATALOG });
+      assert.deepEqual([request.model, request.effort, request.tier], ["gpt-6.1-terra", "xhigh", "light"], kind);
+    }
+    const implement = validateRequest({ task: "x", cwd, tier: "light", sandbox: "workspace-write" }, { catalog: CATALOG });
+    assert.deepEqual([implement.kind, implement.model, implement.effort], ["implement", "gpt-6.1-terra", "xhigh"]);
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("an explicit luna@max override validates; ultra is accepted on Terra and refused on luna", () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-luna-"));
+  try {
+    for (const raw of [{ tier: "light" }, { tier: "daily" }, {}]) {
+      const luna = validateRequest({ task: "x", cwd, kind: "verify", model: "gpt-6-luna", effort: "max", ...raw }, { catalog: CATALOG });
+      assert.deepEqual([luna.model, luna.effort, luna.weight], ["gpt-6-luna", "max", 1]);
+      assert.equal(luna.timeoutSec, 750, "luna keeps its deadline factor 0.5");
+    }
+    const bare = validateRequest({ task: "x", cwd, kind: "verify", model: "gpt-6-luna" }, { catalog: CATALOG });
+    assert.deepEqual([bare.model, bare.effort, bare.tier], ["gpt-6-luna", "max", "light"], "luna named without an effort defaults to max");
+    for (const withCatalog of [{ catalog: CATALOG }, {}]) {
+      assert.equal(validateRequest({ task: "x", cwd, model: "gpt-6.1-terra", effort: "ultra" }, withCatalog).effort, "ultra");
+      assert.throws(() => validateRequest({ task: "x", cwd, model: "gpt-6-luna", effort: "ultra" }, withCatalog), /not supported/);
+    }
+    assert.ok(POLICY.ultraModels.includes("gpt-6.1-terra"));
+    assert.ok(!POLICY.ultraModels.includes("gpt-6-luna"));
+    assert.equal(modelSupportsEffort("gpt-6.1-terra", "ultra", undefined), true);
+    assert.equal(modelSupportsEffort("gpt-6-luna", "ultra", undefined), false);
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("validateRequest applies defaults and rejects what codex would reject later", (t) => {

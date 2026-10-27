@@ -137,7 +137,7 @@ test("a session runs one turn on a private app-server; wait returns the turn's e
   assert.equal(turn.session.state, "idle");
   assert.ok(turn.session.idleUntil, "idleUntil is reported");
   const provenance = turn.provenance;
-  assert.deepEqual([provenance.model, provenance.effort, provenance.tier, provenance.mode, provenance.sandbox], ["gpt-6-luna", "medium", "light", "exec", "read-only"]);
+  assert.deepEqual([provenance.model, provenance.effort, provenance.tier, provenance.mode, provenance.sandbox], ["gpt-6.1-terra", "medium", "light", "exec", "read-only"]);
   assert.match(provenance.threadId, /^01a0fake-/);
   assert.deepEqual(provenance.usage, { input_tokens: 120, cached_input_tokens: 0, output_tokens: 12, reasoning_output_tokens: 4 }, "this turn's usage");
   assert.deepEqual(provenance.usageTotal, provenance.usage);
@@ -157,7 +157,7 @@ test("a session runs one turn on a private app-server; wait returns the turn's e
   assert.equal(init.capabilities.experimentalApi, true);
   assert.equal(init.clientInfo.name, "ultracodex");
   const start = requests(log, "thread/start")[0].params;
-  assert.deepEqual([start.model, start.sandbox, start.approvalPolicy, start.ephemeral], ["gpt-6-luna", "read-only", "never", false]);
+  assert.deepEqual([start.model, start.sandbox, start.approvalPolicy, start.ephemeral], ["gpt-6.1-terra", "read-only", "never", false]);
   assert.equal(start.cwd, process.cwd());
   assert.deepEqual(start.dynamicTools.map((tool) => tool.name), ["ask_orchestrator"]);
   assert.deepEqual(start.dynamicTools[0].inputSchema.required, ["question"]);

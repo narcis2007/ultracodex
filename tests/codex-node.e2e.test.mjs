@@ -194,11 +194,12 @@ test("a structured run returns the parsed result with provenance", async (t) => 
   const env = fastEnv(home);
   const { started, final } = await startAndWait(env, { task: "verify something", schemaPreset: "verdict", tier: "light", kind: "verify", label: "t1", meta: { id: "f1" } }, { home });
   assert.equal(started.code, 3);
-  assert.equal(started.json.model, "gpt-6-luna");
-  assert.equal(started.json.effort, "max");
+  assert.equal(started.json.model, "gpt-6.1-terra");
+  assert.equal(started.json.effort, "xhigh");
   assert.equal(final.ok, true);
   assert.equal(final.state, "done");
   assert.deepEqual(Object.keys(final.result).sort(), ["confidence", "reasoning", "refuted"]);
+  assert.deepEqual([final.provenance.model, final.provenance.effort, final.provenance.tier], ["gpt-6.1-terra", "xhigh", "light"]);
   assert.match(final.provenance.threadId, /^01a0fake-/);
   assert.equal(final.provenance.usage.output_tokens, 12);
   assert.equal(final.provenance.hermetic, true);
@@ -232,6 +233,37 @@ test("an explicit exceptional Sol max override reaches the CLI and provenance", 
   assert.equal(final.provenance.effort, "max");
   const { argv } = JSON.parse(fs.readFileSync(argvLog, "utf8").trim());
   assert.ok(argv.includes('model_reasoning_effort="max"'));
+});
+
+test("an explicit luna@max override runs and reaches the CLI and provenance", async (t) => {
+  const home = makeHome(t);
+  const argvLog = path.join(home, "argv.jsonl");
+  const { started, final } = await startAndWait(fastEnv(home, { FAKE_CODEX_ARGV_LOG: argvLog }),
+    { task: "mechanical check", tier: "daily", kind: "verify", schemaPreset: "verdict", model: "gpt-6-luna", effort: "max" }, { home });
+  assert.equal(started.json.model, "gpt-6-luna");
+  assert.equal(started.json.effort, "max");
+  assert.equal(final.ok, true);
+  assert.deepEqual([final.provenance.model, final.provenance.effort], ["gpt-6-luna", "max"]);
+  const { argv } = JSON.parse(fs.readFileSync(argvLog, "utf8").trim());
+  assert.ok(argv.includes('model_reasoning_effort="max"'));
+  assert.ok(argv.includes("gpt-6-luna"));
+});
+
+test("the light tier runs Terra at xhigh through the CLI and ultra is accepted on Terra only", async (t) => {
+  const home = makeHome(t);
+  const argvLog = path.join(home, "argv.jsonl");
+  const { final } = await startAndWait(fastEnv(home, { FAKE_CODEX_ARGV_LOG: argvLog }), { task: "quick look", tier: "light", kind: "ask" }, { home });
+  assert.equal(final.ok, true);
+  assert.deepEqual([final.provenance.model, final.provenance.effort], ["gpt-6.1-terra", "xhigh"]);
+  const { argv } = JSON.parse(fs.readFileSync(argvLog, "utf8").trim());
+  assert.ok(argv.includes("gpt-6.1-terra"));
+  assert.ok(argv.includes('model_reasoning_effort="xhigh"'));
+  const ultra = await runCli(["dry-run", "--request", writeRequest(home, { task: "x", model: "gpt-6.1-terra", effort: "ultra" })], { env: fastEnv(home) });
+  assert.equal(ultra.code, 0, ultra.stdout);
+  assert.equal(ultra.json.effort, "ultra");
+  const refused = await runCli(["dry-run", "--request", writeRequest(home, { task: "x", model: "gpt-6-luna", effort: "ultra" })], { env: fastEnv(home) });
+  assert.equal(refused.code, 1);
+  assert.equal(refused.json.error.kind, "effort");
 });
 
 test("the prompt Codex receives is the normalized task, via stdin", async (t) => {
@@ -655,7 +687,8 @@ test("preflight --live runs one real round trip through the supervisor", async (
   const result = await runCli(["preflight", "--live"], { env: fastEnv(home, { FAKE_CODEX_OUTPUT: '{"ok":true}' }) });
   assert.equal(result.json.ok, true, result.stdout);
   assert.equal(result.json.live.ok, true);
-  assert.equal(result.json.live.provenance.model, "gpt-6-luna");
+  assert.equal(result.json.live.provenance.model, "gpt-6.1-terra");
+  assert.equal(result.json.live.provenance.effort, "xhigh");
 });
 
 test("dry-run shows the invocation without running codex", async (t) => {

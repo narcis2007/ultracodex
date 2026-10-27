@@ -22,7 +22,7 @@ shell. Every command prints one JSON line tagged `{"ultracodex":1,...}`; exit co
 | `expect DIGEST` | announce one relayed request by its 64-hex digest before it is uploaded — for the key agent only (see "Signed requests and results") |
 | `cancel RUN_ID` | ask that run's supervisor to stop its own process tree |
 | `cancel --orphaned` | the same for every unfinished attached run whose caller stopped polling for its `orphanAfterSec` (the cleanup after stopping a workflow on purpose — it reaches every unpolled run on this machine, other sessions' too, so only when the owner asks); prints one line listing the run ids and labels |
-| `preflight [--live]` | CLI, auth, catalog, policy models, home dir; `--live` = one tiny luna call |
+| `preflight [--live]` | CLI, auth, catalog, policy models, home dir; `--live` = one tiny terra call |
 | `dry-run --request FILE` | show the exact codex argv, model, effort, deadline — no model call |
 | `policy` · `models` · `schema PRESET` · `schema-check --schema FILE` · `gc` | helpers (`gc` also removes dormant sessions older than `--older-than-days`) |
 | `send` · `interrupt` · `answer` · `events` · `close` · `result RUN --turn N` | steerable sessions and steerable Workflow nodes — see "Sessions" and "Steerable nodes" below; never for relays or readers |
@@ -409,7 +409,8 @@ Knobs: `ULTRACODEX_NODE_BACKEND` (`exec` = kill switch), `ULTRACODEX_CONFIG_READ
 | --- | --- | --- |
 | `gpt-6-astra` | low · medium · high · xhigh · max · ultra | frontier; Fast tier 2× |
 | `gpt-6.1-sol` | low · medium · high · xhigh · max · ultra | workhorse |
-| `gpt-6-luna` | low · medium · high · xhigh · max | easier tasks; `ultra` is silently accepted by the CLI — the runner refuses it |
+| `gpt-6.1-terra` | low · medium · high · xhigh · max · ultra | the `light` tier (xhigh); context 500K |
+| `gpt-6-luna` | low · medium · high · xhigh · max | easier tasks; explicit `model` override only (default effort max); `ultra` is silently accepted by the CLI — the runner refuses it |
 | `gpt-5.6-sol/terra/luna` | as above | "older" |
 | `gpt-5.5` | low…xhigh | retires 2026-10-14 |
 

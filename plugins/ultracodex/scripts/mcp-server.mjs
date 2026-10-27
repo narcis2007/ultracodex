@@ -73,7 +73,7 @@ export const TOOLS = [
       "Start a Codex (GPT) session: a Codex thread that works in the background while you do other things. Returns {runId}. Then: codex_wait (returns on a question, at the end of a turn, or at the end), codex_events (what it is doing), " +
       "codex_send (steer it or send a follow-up), codex_answer (when it asks), codex_close (when done). Give exactly one of task / taskFile (an absolute path to a brief you wrote: best for long ones). " +
       "sandbox read-only (default) cannot change files; workspace-write can change files under cwd and addDirs. For implementation work follow the codex-implement skill (isolated git worktree, brief template, verification): this tool only starts the run. " +
-      "tier: light = mechanical, daily (default) = coding and analysis, final = critical review.",
+      "tier: light = cheap checks and mechanical work (gpt-6.1-terra@xhigh), daily (default) = coding and analysis, final = critical review.",
     inputSchema: object(
       {
         task: { type: "string", description: "the instruction for Codex (give this or taskFile)" },

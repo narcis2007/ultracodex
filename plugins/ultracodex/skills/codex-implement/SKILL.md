@@ -8,7 +8,7 @@ description: >-
   migrate something, "give this to codex", "let codex write it", "use codex as the
   implementer or subagent", or any implement-then-review combination. Tiers: gpt-6.1-sol@xhigh by
   default, including complex code; gpt-6-astra@max for an explicit escalation or final critical
-  review, gpt-6-luna@max for mechanical changes.
+  review, gpt-6.1-terra@xhigh for mechanical changes (gpt-6-luna@max only as an explicit override).
 ---
 
 # Delegate implementation to Codex
@@ -30,7 +30,8 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" preflight
   from a clear brief, including complex implementation;
 - `final` → gpt-6-astra@max: implementation only when the owner explicitly requests Astra,
   or when a concrete unresolved issue justifies escalation after a Sol attempt;
-- `light` → gpt-6-luna@max: mechanical work (renames, boilerplate, docs, test scaffolding).
+- `light` → gpt-6.1-terra@xhigh: mechanical work (renames, boilerplate, docs, test scaffolding).
+  For high-volume mechanical edits where cost matters most, name `model: "gpt-6-luna", effort: "max"`.
 
 Complexity alone does not switch the implementer to Astra. Use Sol to implement and review
 routine changes. Use Astra for the final review only for critical work: security-sensitive code

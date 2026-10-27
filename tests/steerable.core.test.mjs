@@ -66,7 +66,7 @@ test("a steerable job's result is a one-shot run's: the same envelope fields, si
     assert.deepEqual(missing, [], `${name}: nothing the exec provenance has is missing`);
     assert.deepEqual(Object.keys(node.provenance).filter((key) => !(key in exec.provenance)), [], "and nothing else: the same fields");
     assert.deepEqual([exec.provenance.backend, node.provenance.backend], ["exec", "session"]);
-    assert.deepEqual([node.provenance.model, node.provenance.effort, node.provenance.tier, node.provenance.mode, node.provenance.sandbox, node.provenance.hermetic, node.provenance.attempts], ["gpt-6-luna", "max", "light", "exec", "read-only", true, 1]);
+    assert.deepEqual([node.provenance.model, node.provenance.effort, node.provenance.tier, node.provenance.mode, node.provenance.sandbox, node.provenance.hermetic, node.provenance.attempts], ["gpt-6.1-terra", "xhigh", "light", "exec", "read-only", true, 1]);
     assert.equal(node.provenance.taskHash, exec.provenance.taskHash);
     assert.match(node.provenance.threadId, /^01a0fake-/);
     assert.ok(node.provenance.usage.output_tokens > 0 && node.provenance.durationMs >= 0 && node.provenance.codexVersion);

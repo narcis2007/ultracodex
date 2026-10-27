@@ -32,11 +32,11 @@ see [CHANGELOG.md](CHANGELOG.md) for what changed.
 | Plugin monitors + hooks | `notify --forever` started by the codex skills (events without polling); a `SessionStart` hook that tells each run which Claude session started it. |
 | Runner `scripts/codex-node.mjs` (+ `session.mjs`, `notify.mjs`) | Validates requests, runs `codex exec` — or, for a steerable session, a private `codex app-server` — under a detached supervisor with deadlines, process-tree teardown, retries, machine-wide slots and a provenance envelope. |
 
-## Model policy — astra, sol, luna
+## Model policy — astra, sol, terra
 
 | Tier | Model | For | Effort |
 | --- | --- | --- | --- |
-| `light` | gpt-6-luna | light work: triage, dedupe, mechanical edits, wide fan-outs of small checks | always `max` |
+| `light` | gpt-6.1-terra | light work: quick review or verification passes, triage, dedupe, wide fan-outs of small checks | `xhigh` for every workload |
 | `daily` | gpt-6.1-sol | implementation including complex code, debugging, architecture analysis, verification, jurors, routine review | `xhigh` for every workload |
 | `final` | gpt-6-astra | critical security work, data migrations, irreversible production steps, production release gates, high/critical issues escalated from Sol | `max` |
 
@@ -51,8 +51,12 @@ values are ignored. An explicit `tier` overrides it. Actual routing is reported 
 
 Prefer Sol 6.1 at `xhigh`, including complex and long tasks. Use Sol at `max` only with an
 explicit effort override for an exceptional unresolved problem or at the owner's request;
-state the reason. Astra at `max` remains reserved for critical work, and
-Luna stays at `max` for light work. `ultra` only on explicit request, once per run. Details:
+state the reason. Astra at `max` remains reserved for critical work.
+The light tier moved from luna@max to terra@xhigh on 2026-10-27: on 10 replayed review jobs with 12
+known medium-or-worse defects, luna@max found 2, terra@xhigh 5 ($0.12 a run, ~80 s), terra@max 10
+($0.49, ~7.5 min, as costly as sol@xhigh, which found 4). Small sample, noisy. Luna stays usable as
+an explicit `model: 'gpt-6-luna', effort: 'max'` for mechanical, high-volume work. `ultra` only on
+explicit request, once per run. Details:
 [model-policy.md](plugins/ultracodex/skills/codex-workflow/references/model-policy.md).
 
 Cost, in short: ask directly (`codex-ask`) when one answer is enough; batch small items into

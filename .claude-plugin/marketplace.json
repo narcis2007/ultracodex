@@ -11,7 +11,7 @@
       "name": "ultracodex",
       "displayName": "Ultracodex",
       "source": "./plugins/ultracodex",
-      "description": "Codex (GPT-6 Astra / GPT-6.1 Sol / GPT-6 Luna) inside Claude Code: cross-model review/verification workflows, delegation and adversarial-review skills, a tested runner with deadlines, teardown and provenance.",
+      "description": "Codex (GPT-6 Astra / GPT-6.1 Sol / GPT-6.1 Terra) inside Claude Code: cross-model review/verification workflows, delegation and adversarial-review skills, a tested runner with deadlines, teardown and provenance.",
       "author": {
         "name": "Narcis Ciobotariu",
         "url": "https://github.com/narcis2007"

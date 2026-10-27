@@ -1,7 +1,7 @@
 export const meta = {
   name: 'crosscheck',
   description: 'One load-bearing claim, one Codex (GPT) attempt to refute it — astra@max by default. An errored cross-check is never a pass.',
-  whenToUse: 'Before acting on a risky conclusion. args: { claim, evidence, cwd, tier: final|daily|light, fast }',
+  whenToUse: 'Before acting on a risky conclusion. args: { claim, evidence, cwd, tier: final (astra@max)|daily (6.1-sol@xhigh)|light (6.1-terra@xhigh), fast }',
   phases: [{ title: 'Cross-check', detail: 'Codex tries to refute the claim' }],
 }
 

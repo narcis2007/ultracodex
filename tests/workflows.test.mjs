@@ -54,6 +54,7 @@ const CATALOG = {
   models: [
     { slug: "gpt-6-astra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { slug: "gpt-6.1-sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { slug: "gpt-6.1-terra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { slug: "gpt-6-luna", efforts: ["low", "medium", "high", "xhigh", "max"] },
   ],
 };
@@ -228,8 +229,8 @@ test("codexNode frames hostile text byte-exactly through parts the runner accept
   assert.equal(Object.keys(result).includes("_codex"), false, "provenance is non-enumerable");
   assert.ok(seen.parts > 2, "a long task travels in several parts");
   assert.equal(seen.request.task, normalizeText(tricky));
-  assert.equal(seen.request.model, "gpt-6-luna");
-  assert.equal(seen.request.effort, "max");
+  assert.equal(seen.request.model, "gpt-6.1-terra");
+  assert.equal(seen.request.effort, "xhigh");
   assert.ok(seen.request.task.includes("C:" + bs + "Users" + bs + "x"), "backslashes survive");
   assert.ok(seen.request.task.includes(String.fromCharCode(0x2028)), "invisible characters survive");
 });
@@ -238,13 +239,15 @@ test("relay labels match runner effort defaults and explicit model/effort overri
   const routes = [
     ...["verify", "ask", "review"].flatMap(kind => [
       [{ tier: "daily", kind }, "gpt-6.1-sol", "xhigh", "6.1-sol"],
-      [{ tier: "light", kind }, "gpt-6-luna", "max", "luna"],
+      [{ tier: "light", kind }, "gpt-6.1-terra", "xhigh", "6.1-terra"],
       [{ tier: "final", kind }, "gpt-6-astra", "max", "astra"],
     ]),
     [{ tier: "daily", kind: "ask", effort: "max" }, "gpt-6.1-sol", "max", "6.1-sol"],
     [{ tier: "final", model: "gpt-6.1-sol", kind: "review" }, "gpt-6.1-sol", "xhigh", "6.1-sol"],
     [{ tier: "daily", model: "gpt-6-astra", kind: "ask" }, "gpt-6-astra", "max", "astra"],
     [{ tier: "daily", model: "gpt-6-luna", kind: "verify" }, "gpt-6-luna", "max", "luna"],
+    [{ tier: "light", model: "gpt-6-luna", effort: "max", kind: "verify" }, "gpt-6-luna", "max", "luna"],
+    [{ tier: "light", model: "gpt-6.1-terra", kind: "ask", effort: "ultra" }, "gpt-6.1-terra", "ultra", "6.1-terra"],
   ];
   for (const [opts, model, effort, displayModel] of routes) {
     const agent = async (prompt, callOpts) => {
@@ -855,7 +858,7 @@ test("codex-review defaults every lens including security to Sol and reports eac
 });
 
 test("codex-review securityTier changes only security, with fast applying only to Astra", async () => {
-  for (const [securityTier, model, effort] of [["light", "gpt-6-luna", "max"], ["daily", "gpt-6.1-sol", "xhigh"], ["final", "gpt-6-astra", "max"]]) {
+  for (const [securityTier, model, effort] of [["light", "gpt-6.1-terra", "xhigh"], ["daily", "gpt-6.1-sol", "xhigh"], ["final", "gpt-6-astra", "max"]]) {
     for (const fast of [false, true]) {
       const requests = [];
       let reportPrompt = null;
@@ -906,7 +909,7 @@ test("codex-review ignores invalid securityTier values", async () => {
 });
 
 test("codex-review explicit daily, light and final tiers override securityTier for every lens", async () => {
-  for (const [tier, model] of [["daily", "gpt-6.1-sol"], ["light", "gpt-6-luna"], ["final", "gpt-6-astra"]]) {
+  for (const [tier, model] of [["daily", "gpt-6.1-sol"], ["light", "gpt-6.1-terra"], ["final", "gpt-6-astra"]]) {
     for (const securityTier of ["light", "daily", "final"]) {
       const requests = [];
       const agent = async (prompt, opts) => {
@@ -920,7 +923,7 @@ test("codex-review explicit daily, light and final tiers override securityTier f
       const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "domain", "security"], tier, securityTier, triage: false, fast: true } });
       assert.equal(result.status, "complete");
       assert.equal(requests.length, 3);
-      assert.deepEqual(requests.map(r => [r.model, r.effort, r.serviceTier]), Array(3).fill([model, tier === "daily" ? "xhigh" : "max", tier === "final" ? "priority" : null]));
+      assert.deepEqual(requests.map(r => [r.model, r.effort, r.serviceTier]), Array(3).fill([model, tier === "final" ? "max" : "xhigh", tier === "final" ? "priority" : null]));
       assert.deepEqual(result.lenses.map(l => [l.tier, l.model]), Array(3).fill([tier, model]));
     }
   }

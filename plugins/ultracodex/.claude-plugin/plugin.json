@@ -2,8 +2,8 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "ultracodex",
   "displayName": "Ultracodex",
-  "version": "0.6.3",
-  "description": "Use Codex (GPT-6 Astra / GPT-6.1 Sol / GPT-6 Luna via codex exec) from Claude Code: cross-model review and verification workflows, implementation delegation and adversarial review skills, run by a tested runner with deadlines, process-tree teardown and provenance. Fork of KingGyuSuh/ultracodex.",
+  "version": "0.6.4",
+  "description": "Use Codex (GPT-6 Astra / GPT-6.1 Sol / GPT-6.1 Terra via codex exec) from Claude Code: cross-model review and verification workflows, implementation delegation and adversarial review skills, run by a tested runner with deadlines, process-tree teardown and provenance. Fork of KingGyuSuh/ultracodex.",
   "author": {
     "name": "Narcis Ciobotariu",
     "url": "https://github.com/narcis2007"

@@ -5,9 +5,9 @@ description: >-
   read-only and hermetic, through lenses (code, domain, security, tests, performance), with
   every finding then verified by Claude in the code before it is reported. Use when the user
   asks for a Codex review, a second-model / cross-model / adversarial review, "have codex
-  review this", "review with astra / sol / luna", a final review gate before merge or deploy,
+  review this", "review with astra / sol / terra", a final review gate before merge or deploy,
   or a specific review lens. Routine reviews, including security lenses, run on
-  gpt-6.1-sol@xhigh. Astra at max is for critical work only; quick sanity passes use gpt-6-luna@max.
+  gpt-6.1-sol@xhigh. Astra at max is for critical work only; quick sanity passes use gpt-6.1-terra@xhigh.
   It also says whether a re-review is worth it and how narrow it should be.
 ---
 
@@ -29,7 +29,7 @@ Settle before starting: the repo (absolute path), the scope (`base` branch, one 
 - `final` → gpt-6-astra@max — critical work only: security-sensitive code (auth, keys, crypto,
   payments, personal data), data migrations, irreversible production steps, or the last gate
   before a production release;
-- `light` → gpt-6-luna@max — a quick pass on a small or mechanical change.
+- `light` → gpt-6.1-terra@xhigh — a quick pass on a small or mechanical change.
 
 Say which pass this is: `1` is the first review of the change. When possible, commit the work
 under review first. Record `git -C "<repo>" rev-parse HEAD` as the reviewed commit before each

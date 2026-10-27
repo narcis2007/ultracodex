@@ -6,8 +6,8 @@ description: >-
   conclusion before acting on it. Claude writes a request file, the runner runs Codex
   read-only and hermetic, and Claude reads the answer directly (no relay agent: the cheapest
   way to consult Codex). Use for "ask codex", "what does codex / gpt think", "second opinion
-  from codex", "double-check this with astra / sol / luna", "have codex refute this",
-  "cross-check before we do X". Tier by role and risk: gpt-6-luna@max for light questions,
+  from codex", "double-check this with astra / sol / terra", "have codex refute this",
+  "cross-check before we do X". Tier by role and risk: gpt-6.1-terra@xhigh for light questions,
   gpt-6.1-sol@xhigh for routine asks, coding analysis and design, gpt-6-astra@max for critical work only.
 ---
 
@@ -24,7 +24,7 @@ for a branch review, `codex-review`.
 
 | the question is… | tier → model | kind + output |
 | --- | --- | --- |
-| light: "where is X handled", a quick sanity check, a small factual claim about the code | `light` → luna@max | `verify` + `schemaPreset: "verdict"`, or `ask` (text) |
+| light: "where is X handled", a quick sanity check, a small factual claim about the code | `light` → 6.1-terra@xhigh | `verify` + `schemaPreset: "verdict"`, or `ask` (text) |
 | coding analysis: a bug hypothesis, complex debugging, a design second opinion, routine checks including security | `daily` → 6.1-sol@xhigh | as above |
 | critical work: security-sensitive code (auth, keys, crypto, payments, personal data), data migrations, irreversible production steps, the last gate before a production release | `final` → astra@max | usually `verify` + `verdict` |
 
@@ -69,7 +69,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" start --request "<request.js
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" wait <runId> --max-wait 7200   # run_in_background: true
 ```
 
-You are notified when the background `wait` exits (luna: minutes; sol: ~5–25 min; astra:
+You are notified when the background `wait` exits (terra@xhigh: ~1–3 min; sol: ~5–25 min; astra:
 ~10–40 min). Keep working meanwhile; `status <runId>` shows progress. For a light question
 you may instead wait in the foreground: `wait <runId> --max-wait 540` with a 600000 ms Bash
 timeout, repeated while the state is `running`.

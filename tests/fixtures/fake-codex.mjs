@@ -37,6 +37,15 @@ const CATALOG = {
       context_window: 272000,
     },
     {
+      slug: "gpt-6.1-terra",
+      display_name: "GPT-6.1-Terra",
+      description: "fake terra",
+      visibility: "list",
+      default_reasoning_level: "low",
+      supported_reasoning_levels: ["low", "medium", "high", "xhigh", "max", "ultra"].map((effort) => ({ effort })),
+      context_window: 500000,
+    },
+    {
       slug: "gpt-6-luna",
       display_name: "GPT-6-Luna",
       description: "fake luna",

@@ -32,7 +32,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" preflight --pretty
 
 It checks the Codex CLI, `codex login status`, refreshes the model catalog and reports any
 policy model missing from it. `ok: false` → stop and tell the user (auth needs an interactive
-`codex login`). `--live` adds one tiny luna call to prove the whole path.
+`codex login`). `--live` adds one tiny terra call to prove the whole path.
 
 ## Step 0 — does this task need Codex?
 
@@ -45,7 +45,7 @@ an echo check with no independent angle, not for open-ended ideation with nothin
 
 | tier | model @ effort | for |
 | --- | --- | --- |
-| `light` | gpt-6-luna @ max | light work: triage, dedupe, wide fan-outs of small checks, summaries |
+| `light` | gpt-6.1-terra @ xhigh (every kind) | light work: quick review or verification passes, triage, dedupe, wide fan-outs of small checks, summaries |
 | `daily` | gpt-6.1-sol @ xhigh (every kind) | implementation including complex code, debugging, design, verification, jurors, routine review lenses |
 | `final` | gpt-6-astra @ max | critical security work, data migrations, irreversible production steps, production release gates, high/critical issues escalated from Sol |
 
@@ -72,7 +72,7 @@ Cost levers, in order of effect:
    what would block a merge — `cross-review` does it by default (`finalGate`), `codex-review`
    sends only high/critical Claude-vs-Codex disagreements to astra (`escalate`). Both report
    an astra disagreement as **disputed** for the owner, never as silently dropped.
-3. **luna@max** for triage, dedupe and quick sanity passes; **Sol 6.1@xhigh** for coding including
+3. **terra@xhigh** (`light`) for triage, dedupe and quick sanity passes (`gpt-6-luna@max` only as an explicit `model`/`effort` override for mechanical, high-volume work); **Sol 6.1@xhigh** for coding including
    complex implementation and routine security lenses; **astra** for critical work only.
    `ultra` and `serviceTier: 'priority'` only on explicit request.
 4. **Read `codexUsage`** in every shipped workflow's result (runs and tokens per model, failed
