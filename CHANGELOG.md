@@ -8,9 +8,13 @@
   explicit `tier`, `securityTier` still sets only the security lens; otherwise it defaults to the
   pass tier. `priorFindings` without `pass` makes pass 2, so it also defaults to `light`.
 - `rereview.securityTier` (new, `null` by default): when the caller passed `securityTier` with no
-  `tier` and the review had a security lens, it holds that tier if it differs from `rereview.tier`.
-  The `Re-review:` line and `reason` then say to keep `securityTier` and leave `tier` out, because an
-  explicit `tier` overrides `securityTier` and would drop the security lens to `light`.
+  `tier`, it holds that tier if it differs from `rereview.tier`. It does not depend on the lenses of the
+  run, so a re-run of a failed non-security lens carries it too, and the failed-lens merge rule keeps a
+  `securityTier` that either run sets. The `Re-review:` line and `reason` say to keep `securityTier` and
+  leave `tier` out, because an explicit `tier` overrides `securityTier` and would drop the security lens
+  to `light`. For a large or design-changing delta the `reason` says to split the next pass: the
+  non-security lenses with `tier: 'daily'` and the security lens with `securityTier`, then merge both
+  results like a failed-lens retry.
 - `rereview.tier` after a non-final pass is `light` for medium and for high/critical findings
   (it was `daily` for high/critical). After a `final` pass it is unchanged: `daily` for medium,
   `final` for high/critical. The `reason` text is the same for both severities and says to use

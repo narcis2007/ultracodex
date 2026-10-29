@@ -87,7 +87,7 @@ Rules of thumb:
 | a quick look at a small or mechanical change | `codex-review` with `tier: 'light'` (terra@xhigh, ~$0.12 and ~80 s per lens) |
 | mechanical, high-volume work with no review value | explicit `model: 'gpt-6-luna', effort: 'max'` (cheapest; weak at finding defects) |
 | a routine review with a security lens | omit `tier`: on pass 1, Sol at `xhigh` on every lens, including `security` |
-| a fix-delta review (pass above 1) | omit `tier` or pass `rereview.tier`: Terra at `xhigh` on every lens (`daily` for a large or design-changing delta); when `rereview.securityTier` is set, pass it and leave `tier` out |
+| a fix-delta review (pass above 1) | omit `tier` or pass `rereview.tier`: Terra at `xhigh` on every lens (`daily` for a large or design-changing delta); when `rereview.securityTier` is set, pass it and leave `tier` out (a large delta is split into two calls, see `codex-review`) |
 | critical security work needing Astra on security only | `codex-review` `securityTier: 'final'`, omit `tier` |
 | a critical change or the last gate before a production release | `codex-review` `tier: 'final'` (astra per lens, ≤2 at a time) |
 

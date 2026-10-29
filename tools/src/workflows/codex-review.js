@@ -202,14 +202,19 @@ if (worst === 'low' || worst === 'none') {
   rereview.tier = TIER === 'final' ? (worst === 'medium' ? 'daily' : 'final') : 'light'
   rereview.nextPass = PASS + 1
   // A caller-chosen securityTier only works with no explicit tier: keep it for the next pass, or tier: light would override it.
-  if (!EXPLICIT_TIER && EXPLICIT_SECURITY_TIER && lensKeys.includes('security') && SECURITY_TIER !== rereview.tier) rereview.securityTier = SECURITY_TIER
+  // It does not depend on the lenses of this run, so a retry of a failed non-security lens carries it too.
+  if (!EXPLICIT_TIER && EXPLICIT_SECURITY_TIER && SECURITY_TIER !== rereview.tier) rereview.securityTier = SECURITY_TIER
   rereview.reason = 'Fix and verify, then review only the fix delta (base = the commit this pass reviewed) at tier ' + rereview.tier + ' with priorFindings.'
-    + (rereview.tier === 'light'
-      ? ' Use daily instead of light when the delta is more than about 50 changed lines or more than 3 files, or when the fix changed the design; a full re-review only for a large or design-changing fix.'
-      : ' A full re-review only when the fix was large or changed the design.')
-    + (rereview.securityTier ? ' Keep securityTier: ' + rereview.securityTier + ' on the next pass and leave tier out (light is the default for pass > 1; an explicit tier overrides securityTier).' : '')
+    + (rereview.securityTier
+      // An explicit tier: daily would override securityTier, so a large delta is split into two calls.
+      ? ' Keep securityTier: ' + rereview.securityTier + ' on the next pass and leave tier out (light is the default for pass > 1; an explicit tier overrides securityTier).'
+        + (lensKeys.every(key => key === 'security') ? '' : ' For a delta of more than about 50 changed lines or more than 3 files, or when the fix changed the design, split the next pass into two calls with the same pass number and base: the non-security lenses with tier daily, and the security lens, if any, with securityTier ' + rereview.securityTier + ' and no tier. Combine both results like a failed-lens retry: keep both, merge the findings and follow the stricter rereview.')
+        + ' A full re-review only for a large or design-changing fix.'
+      : rereview.tier === 'light'
+        ? ' Use daily instead of light when the delta is more than about 50 changed lines or more than 3 files, or when the fix changed the design; a full re-review only for a large or design-changing fix.'
+        : ' A full re-review only when the fix was large or changed the design.')
 }
-if (rereview.rerunLenses.length) rereview.reason = 'Re-run only these lenses on the same scope with the same pass number first — that is not a new pass. Failed lenses: ' + rereview.rerunLenses.join(', ') + '. This decision covers only the lenses that ran. Keep the first result; after the re-run, combine the findings of both runs and follow the stricter of the two rereview objects: worse worst, recommendation owner > delta > none, tier final > daily > light. ' + rereview.reason
+if (rereview.rerunLenses.length) rereview.reason = 'Re-run only these lenses on the same scope with the same pass number first — that is not a new pass. Failed lenses: ' + rereview.rerunLenses.join(', ') + '. This decision covers only the lenses that ran. Keep the first result; after the re-run, combine the findings of both runs and follow the stricter of the two rereview objects: worse worst, recommendation owner > delta > none, tier final > daily > light, and keep a securityTier that either run sets. ' + rereview.reason
 const rereviewLine = 'Re-review: ' + (rereview.recommendation === 'delta'
   ? 'delta (pass ' + rereview.nextPass + ', tier ' + rereview.tier + (rereview.securityTier ? ', securityTier ' + rereview.securityTier : '') + ', base = the commit this pass reviewed)'
   : rereview.recommendation === 'owner' ? 'owner decides' : 'none') + ' — ' + rereview.reason

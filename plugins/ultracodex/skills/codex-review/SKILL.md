@@ -154,7 +154,7 @@ If lenses failed, re-run only `rereview.rerunLenses` first, on the same scope an
 pass number. That is not a new pass.
 Each result covers only its lenses: keep the first result and merge both runs' findings and
 `rereview.carry` after the retry. Follow the stricter `rereview`: worse `worst`, recommendation
-`owner > delta > none`, tier `final > daily > light`.
+`owner > delta > none`, tier `final > daily > light`, and keep a `securityTier` that either run sets.
 
 - **`none`** → no new pass. Low findings are optional: fix now only those that take a few
   lines and are obviously correct. Put the rest in the PR as follow-ups or known limits.
@@ -162,13 +162,17 @@ Each result covers only its lenses: keep the first result and merge both runs' f
 - **`delta`** → fix, verify (build, tests, diff), and commit. Run the workflow with
   `base: '<reviewed commit>'`, `pass: N + 1`, and `tier: rereview.tier`. When `rereview.securityTier`
   is set, pass `securityTier: rereview.securityTier` and leave `tier` out: an explicit `tier` would
-  override `securityTier`, and the security lens would drop to `light`.
+  override `securityTier`, and the security lens would drop to `light`. If the delta is large (more than
+  about 50 changed lines or more than 3 files) or the fix changed the design, split the next pass into
+  two calls with the same pass number and base: the non-security lenses with `tier: 'daily'`, and the
+  security lens with `securityTier: rereview.securityTier` and no `tier`. Combine them like a failed-lens
+  retry: keep both results, merge the findings and `rereview.carry`, and follow the stricter `rereview`.
   Build `priorFindings` from `rereview.carry` (id, status, severity, title, file:line).
   For each, add what was done: fixed (how), still open (why), or left as a follow-up / known limit.
   After a non-final pass, medium and high/critical deltas use `light`. After a `final` pass,
   medium deltas use `daily` and high/critical deltas use `final`.
-  When the tier is `light`, use `daily` instead if the delta is more than about 50 changed lines
-  or more than 3 files, or if the fix changed the design. A full re-review (`base: 'main'`) is only
+  When the tier is `light` and `rereview.securityTier` is not set, use `daily` instead if the delta is
+  more than about 50 changed lines or more than 3 files, or if the fix changed the design. A full re-review (`base: 'main'`) is only
   for a large or design-changing fix.
   When Codex implemented the change, send the fix brief to its open implement session as a
   follow-up (`codex_send` / `send <runId>`), not as a new run (see `codex-implement`).
