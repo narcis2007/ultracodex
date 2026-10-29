@@ -43,8 +43,9 @@ see [CHANGELOG.md](CHANGELOG.md) for what changed.
 Sol 6.1 is the default for implementation, including complex modules, and routine reviews and
 asks. Astra is for critical work only: security-sensitive code (auth, keys, crypto, payments,
 personal data), data migrations, irreversible production steps and the last gate before a
-production release. In `codex-review`, omitting `tier` uses Sol at `xhigh` on every lens,
-including `security`. For critical work, pass `securityTier: 'final'` for Astra on security only,
+production release. In `codex-review`, omitting `tier` uses Sol at `xhigh` on every lens of
+pass 1, including `security`, and Terra at `xhigh` (`light`) on every lens of a fix-delta pass
+(pass above 1). For critical work, pass `securityTier: 'final'` for Astra on security only,
 or `tier: 'final'` for every lens. `securityTier` accepts `light`, `daily` or `final`; invalid
 values are ignored. An explicit `tier` overrides it. Actual routing is reported in
 `lenses[].tier` and `lenses[].model`, and Astra findings are not sent to Astra again for a tiebreak.

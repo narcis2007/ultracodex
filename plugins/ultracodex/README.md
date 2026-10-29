@@ -35,7 +35,8 @@ critical work only: security-sensitive code (auth, keys, crypto, payments, perso
 migrations, irreversible production steps and the last gate before a production release.
 Use Sol at `max` only as an explicit override for an exceptional unresolved problem or
 an owner request, with a stated reason. Task complexity or duration alone does not justify it.
-`codex-review` without `tier` routes every lens, including `security`, to Sol at `xhigh`.
+`codex-review` without `tier` routes every lens of pass 1, including `security`, to Sol at `xhigh`,
+and every lens of a fix-delta pass (pass above 1) to Terra at `xhigh` (`light`).
 For critical work, use `securityTier: 'final'` for Astra on security only, or `tier: 'final'`
 for every lens. `securityTier` accepts `light`, `daily` or `final`; invalid values are ignored.
 An explicit tier overrides it; results name each lens's actual tier and model.

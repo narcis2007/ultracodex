@@ -210,9 +210,10 @@ your best judgement and state the assumption" and goes on. The turn's deadline k
 - Do not poll in a loop: a notification (above), `codex_wait` or a background `wait` tells you.
 - Steer to **redirect**, follow up to **extend**, queue to **sequence**. Do not use a steer to ask
   for a status — read the events.
-- Verify before closing (diff, tests — see `codex-implement`), then `close`; add `--archive` when the
-  work is merged or abandoned. An idle session sleeps by itself after `idleTtlSec`; a dormant one costs
-  nothing but still shows in `status` until it is closed or `gc` removes it.
+- Verify the work (diff, tests — see `codex-implement`). Keep an implementation session open until
+  the change is merged or abandoned, because review fixes go to it as follow-ups; then `close --archive`.
+  Close a question session (`codex-ask`) when you are done. An idle session sleeps by itself after
+  `idleTtlSec`; a dormant one costs nothing but still shows in `status` until it is closed or `gc` removes it.
 - Never stop Codex processes this plugin did not start. `cancel RUN_ID` (immediately ends the session,
   state `cancelled`) only for your own run and only when the owner asks.
 

@@ -929,6 +929,82 @@ test("codex-review explicit daily, light and final tiers override securityTier f
   }
 });
 
+async function reviewTiers(args) {
+  const requests = [];
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      requests.push(request);
+      return okEnvelope(request, { verdict: "approve", summary: "clean", findings: [] });
+    }
+    return opts.label === "report" ? "FINAL" : null;
+  };
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "domain", "security"], triage: false, ...args } });
+  assert.equal(result.status, "complete");
+  assert.equal(requests.length, 3);
+  return { result, requests };
+}
+
+test("codex-review pass 1 without tier reviews every lens on daily (Sol)", async () => {
+  for (const args of [{}, { pass: 1 }]) {
+    const { result, requests } = await reviewTiers(args);
+    assert.equal(result.tier, "daily");
+    assert.deepEqual(requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6.1-sol", "xhigh"]));
+    assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [["code", "daily", "gpt-6.1-sol"], ["domain", "daily", "gpt-6.1-sol"], ["security", "daily", "gpt-6.1-sol"]]);
+  }
+});
+
+test("codex-review pass 2 and later without tier review every lens on light (Terra)", async () => {
+  for (const args of [{ pass: 2 }, { pass: 3 }, { pass: 4, ownerApproved: true }]) {
+    const { result, requests } = await reviewTiers(args);
+    assert.equal(result.tier, "light");
+    assert.deepEqual(requests.map(r => [r.model, r.effort, r.tier]), Array(3).fill(["gpt-6.1-terra", "xhigh", "light"]));
+    assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [["code", "light", "gpt-6.1-terra"], ["domain", "light", "gpt-6.1-terra"], ["security", "light", "gpt-6.1-terra"]]);
+  }
+});
+
+test("codex-review priorFindings without pass is pass 2 and reviews on light", async () => {
+  const { result, requests } = await reviewTiers({ priorFindings: "code:1 fixed by validating the caller" });
+  assert.equal(result.rereview.pass, 2);
+  assert.equal(result.tier, "light");
+  assert.deepEqual(requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6.1-terra", "xhigh"]));
+  assert.deepEqual(result.lenses.map(l => [l.tier, l.model]), Array(3).fill(["light", "gpt-6.1-terra"]));
+});
+
+test("codex-review pass 2 with an explicit tier keeps that tier on every lens", async () => {
+  for (const [tier, model, effort] of [["daily", "gpt-6.1-sol", "xhigh"], ["light", "gpt-6.1-terra", "xhigh"], ["final", "gpt-6-astra", "max"]]) {
+    const { result, requests } = await reviewTiers({ pass: 2, tier, securityTier: "light" });
+    assert.equal(result.tier, tier);
+    assert.deepEqual(requests.map(r => [r.model, r.effort]), Array(3).fill([model, effort]));
+    assert.deepEqual(result.lenses.map(l => [l.tier, l.model]), Array(3).fill([tier, model]));
+  }
+});
+
+test("codex-review pass 2 ignores an invalid tier and falls back to light", async () => {
+  for (const tier of ["astra", "DAILY", "", null, false, 1, {}]) {
+    const { result } = await reviewTiers({ pass: 2, tier });
+    assert.equal(result.tier, "light");
+    assert.deepEqual(result.lenses.map(l => [l.tier, l.model]), Array(3).fill(["light", "gpt-6.1-terra"]));
+  }
+});
+
+test("codex-review pass 2 without tier: securityTier still sets only the security lens", async () => {
+  for (const [securityTier, model, effort] of [["final", "gpt-6-astra", "max"], ["daily", "gpt-6.1-sol", "xhigh"], ["light", "gpt-6.1-terra", "xhigh"]]) {
+    const { result, requests } = await reviewTiers({ pass: 2, securityTier });
+    assert.equal(result.tier, "light", "securityTier does not change the base tier");
+    assert.deepEqual(requests.map(r => [r.label, r.model, r.effort]).sort(), [
+      ["codex:code", "gpt-6.1-terra", "xhigh"],
+      ["codex:domain", "gpt-6.1-terra", "xhigh"],
+      ["codex:security", model, effort],
+    ]);
+    assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [
+      ["code", "light", "gpt-6.1-terra"],
+      ["domain", "light", "gpt-6.1-terra"],
+      ["security", securityTier, model],
+    ]);
+  }
+});
+
 for (const securityTier of [undefined, "final"]) test(`codex-review escalates only non-Astra findings (securityTier: ${securityTier ?? "default"})`, async () => {
   const requests = [];
   let escalated = null;
@@ -1168,22 +1244,27 @@ for (const c of [
   { name: "no findings", findings: [], worst: "none", recommendation: "none", tier: null, nextPass: null },
   { name: "low-only uses Claude's rating", findings: [["high", "confirmed", "low"], ["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
   { name: "medium uses Claude's rating", findings: [["high", "confirmed", "medium"]], worst: "medium", recommendation: "delta", tier: "light", nextPass: 2 },
-  { name: "high raised by Claude", findings: [["low", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "daily", nextPass: 2 },
-  { name: "critical", findings: [["critical", "confirmed", "critical"]], worst: "critical", recommendation: "delta", tier: "daily", nextPass: 2 },
+  { name: "high raised by Claude", findings: [["low", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
+  { name: "critical", findings: [["critical", "confirmed", "critical"]], worst: "critical", recommendation: "delta", tier: "light", nextPass: 2 },
   { name: "high keeps final", args: { tier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "final", nextPass: 2 },
-  { name: "high raises light to daily", args: { tier: "light" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "daily", nextPass: 2 },
+  { name: "critical keeps final", args: { tier: "final" }, findings: [["critical", "confirmed", "critical"]], worst: "critical", recommendation: "delta", tier: "final", nextPass: 2 },
+  { name: "high stays light after a light pass", args: { tier: "light" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
+  { name: "high after an explicit daily pass is light", args: { tier: "daily" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
   { name: "medium uses daily for final work", args: { tier: "final" }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "delta", tier: "daily", nextPass: 2 },
-  { name: "disputed high cannot be lowered", args: { escalate: true }, findings: [["high", "refuted", "low"]], worst: "high", recommendation: "delta", tier: "daily", nextPass: 2 },
-  { name: "disputed uses a higher triage rating", args: { escalate: true }, findings: [["high", "refuted", "critical"]], worst: "critical", recommendation: "delta", tier: "daily", nextPass: 2 },
-  { name: "needs-info Codex high and triage low", findings: [["high", "needs_info", "low"]], worst: "high", recommendation: "delta", tier: "daily", nextPass: 2 },
-  { name: "needs-info uses a higher triage rating", findings: [["low", "needs_info", "critical"]], worst: "critical", recommendation: "delta", tier: "daily", nextPass: 2 },
+  { name: "disputed high cannot be lowered", args: { escalate: true }, findings: [["high", "refuted", "low"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
+  { name: "disputed uses a higher triage rating", args: { escalate: true }, findings: [["high", "refuted", "critical"]], worst: "critical", recommendation: "delta", tier: "light", nextPass: 2 },
+  { name: "needs-info Codex high and triage low", findings: [["high", "needs_info", "low"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
+  { name: "needs-info uses a higher triage rating", findings: [["low", "needs_info", "critical"]], worst: "critical", recommendation: "delta", tier: "light", nextPass: 2 },
   { name: "refuted critical does not count", findings: [["critical", "refuted", "critical"]], worst: "none", recommendation: "none", tier: null, nextPass: null },
   { name: "settled escalation does not count", args: { escalate: true }, settled: true, findings: [["high", "refuted", "high"]], worst: "none", recommendation: "none", tier: null, nextPass: null },
   { name: "worst across mixed buckets", findings: [["critical", "refuted", "critical"], ["low", "confirmed", "low"], ["high", "confirmed", "medium"], ["low", "needs_info", "medium"]], worst: "medium", recommendation: "delta", tier: "light", nextPass: 2 },
   { name: "untriaged low", args: { triage: false }, findings: [["low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
   { name: "untriaged medium", args: { triage: false }, findings: [["medium"]], worst: "medium", recommendation: "delta", tier: "light", nextPass: 2 },
-  { name: "untriaged highest severity", args: { triage: false }, findings: [["low"], ["high"], ["medium"]], worst: "high", recommendation: "delta", tier: "daily", nextPass: 2 },
+  { name: "untriaged highest severity", args: { triage: false }, findings: [["low"], ["high"], ["medium"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
   { name: "pass 2 medium", args: { pass: 2 }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "delta", tier: "light", nextPass: 3 },
+  { name: "pass 2 high", args: { pass: 2 }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 3 },
+  { name: "pass 2 critical after an explicit daily pass", args: { pass: 2, tier: "daily" }, findings: [["critical", "confirmed", "critical"]], worst: "critical", recommendation: "delta", tier: "light", nextPass: 3 },
+  { name: "pass 2 high after a final pass keeps final", args: { pass: 2, tier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "final", nextPass: 3 },
   { name: "pass 3 low", args: { pass: 3 }, findings: [["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
   { name: "pass 3 medium stops", args: { pass: 3 }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "none", tier: null, nextPass: null },
   { name: "pass 3 high needs owner", args: { pass: 3 }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "owner", tier: null, nextPass: null },
@@ -1191,6 +1272,17 @@ for (const c of [
   { name: "approved pass 4 low stops", args: { pass: 4, ownerApproved: true }, findings: [["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
   { name: "approved pass 4 medium stops", args: { pass: 4, ownerApproved: true }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "none", tier: null, nextPass: null },
   { name: "approved pass 4 high still needs owner", args: { pass: 4, ownerApproved: true }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "owner", tier: null, nextPass: null },
+  { name: "securityTier final is kept for the next pass (high)", args: { lenses: ["code", "security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
+  { name: "securityTier final is kept for the next pass (medium)", args: { lenses: ["code", "security"], securityTier: "final" }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
+  { name: "securityTier final is kept on pass 2", args: { pass: 2, lenses: ["code", "security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 3 },
+  { name: "securityTier daily is kept for the next pass", args: { lenses: ["code", "security"], securityTier: "daily" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "daily", nextPass: 2 },
+  { name: "securityTier is null without a security lens", args: { lenses: ["code", "domain"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
+  { name: "securityTier is null when tier is explicit daily", args: { lenses: ["code", "security"], tier: "daily", securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
+  { name: "securityTier is null when tier is explicit final", args: { lenses: ["code", "security"], tier: "final", securityTier: "daily" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "final", nextPass: 2 },
+  { name: "securityTier equal to the next tier is null", args: { lenses: ["code", "security"], securityTier: "light" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
+  { name: "securityTier is null when the caller gave none", args: { lenses: ["code", "security"] }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
+  { name: "an invalid securityTier is null", args: { lenses: ["code", "security"], securityTier: "astra" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
+  { name: "securityTier is null when no re-review follows", args: { lenses: ["code", "security"], securityTier: "final" }, findings: [["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
 ]) test(`codex-review re-review: ${c.name}`, async () => {
   let reportPrompt = null;
   const agent = async (prompt, opts) => {
@@ -1217,7 +1309,7 @@ for (const c of [
   const { result } = await runWorkflow("codex-review", { agent, args });
   const { reason, carry, ...policy } = result.rereview;
   assert.equal(result.status, "complete");
-  assert.deepEqual(policy, { pass: args.pass || 1, worst: c.worst, recommendation: c.recommendation, tier: c.tier, nextPass: c.nextPass, rerunLenses: [] });
+  assert.deepEqual(policy, { pass: args.pass || 1, worst: c.worst, recommendation: c.recommendation, tier: c.tier, securityTier: c.securityTier ?? null, nextPass: c.nextPass, rerunLenses: [] });
   assert.ok(Array.isArray(carry));
   if (c.worst === "none") assert.deepEqual(carry, []);
   if (c.worst === "low" || c.worst === "none") {
@@ -1226,17 +1318,23 @@ for (const c of [
     assert.match(reason, /cap of 3.*fix and verify without another pass.*known limits/);
   } else if (c.recommendation === "owner") {
     assert.match(reason, /cap of 3.*do not ship.*owner.*ownerApproved: true/);
-  } else if (c.worst === "medium") {
+  } else {
     assert.match(reason, /Fix and verify.*only the fix delta.*base = the commit this pass reviewed.*priorFindings/);
     assert.ok(reason.includes("at tier " + c.tier + " with priorFindings"));
-    if (c.tier === "light") assert.match(reason, /daily instead of light.*50 changed lines.*3 files/);
-    else assert.doesNotMatch(reason, /instead of light|50 changed lines|3 files/);
+    if (c.tier === "light") {
+      assert.match(reason, /daily instead of light.*50 changed lines.*3 files.*fix changed the design.*full re-review only for a large or design-changing fix/);
+    } else {
+      assert.doesNotMatch(reason, /instead of light|50 changed lines|3 files/);
+      assert.match(reason, /full re-review only when the fix was large or changed the design/);
+    }
+  }
+  if (c.securityTier) {
+    assert.ok(reason.includes(` Keep securityTier: ${c.securityTier} on the next pass and leave tier out (light is the default for pass > 1; an explicit tier overrides securityTier).`));
   } else {
-    assert.ok(reason.includes("fix delta at tier " + c.tier + " with priorFindings"));
-    assert.match(reason, /full re-review only when the fix was large or changed the design/);
+    assert.doesNotMatch(reason, /securityTier/);
   }
   const advice = c.recommendation === "delta"
-    ? `delta (pass ${c.nextPass}, tier ${c.tier}, base = the commit this pass reviewed)`
+    ? `delta (pass ${c.nextPass}, tier ${c.tier}${c.securityTier ? `, securityTier ${c.securityTier}` : ""}, base = the commit this pass reviewed)`
     : c.recommendation === "owner" ? "owner decides" : "none";
   const line = `Re-review: ${advice} — ${reason}`;
   assert.match(reportPrompt, /Do not write a Re-review: line; the workflow adds it/);

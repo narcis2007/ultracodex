@@ -6,8 +6,9 @@ description: >-
   every finding then verified by Claude in the code before it is reported. Use when the user
   asks for a Codex review, a second-model / cross-model / adversarial review, "have codex
   review this", "review with astra / sol / terra", a final review gate before merge or deploy,
-  or a specific review lens. Routine reviews, including security lenses, run on
-  gpt-6.1-sol@xhigh. Astra at max is for critical work only; quick sanity passes use gpt-6.1-terra@xhigh.
+  or a specific review lens. With no tier, pass 1 runs every lens, including security, on
+  gpt-6.1-sol@xhigh, and a fix-delta pass (pass above 1) runs on gpt-6.1-terra@xhigh. Astra at
+  max is for critical work only; quick sanity passes use gpt-6.1-terra@xhigh.
   It also says whether a re-review is worth it and how narrow it should be.
 ---
 
@@ -29,13 +30,15 @@ Settle before starting: the repo (absolute path), the scope (`base` branch, one 
 - `final` → gpt-6-astra@max — critical work only: security-sensitive code (auth, keys, crypto,
   payments, personal data), data migrations, irreversible production steps, or the last gate
   before a production release;
-- `light` → gpt-6.1-terra@xhigh — a quick pass on a small or mechanical change.
+- `light` → gpt-6.1-terra@xhigh — a quick pass on a small or mechanical change, and the default
+  for a fix-delta pass (pass above 1).
 
 Say which pass this is: `1` is the first review of the change. When possible, commit the work
 under review first. Record `git -C "<repo>" rev-parse HEAD` as the reviewed commit before each
 pass — it is the base of a later fix delta.
 
-When the owner named no tier, pick it from the change itself — measure it first with
+For pass 2 and later, use `rereview.tier` and `rereview.securityTier` (see section 6) or omit `tier`:
+the workflow then uses `light`. For pass 1, when the owner named no tier, pick it from the change itself — measure it first with
 `git -C "<repo>" diff --shortstat <scope>` (and `--name-only`):
 
 - **`final`** for the critical categories above — whatever the change's size. Use
@@ -43,7 +46,7 @@ When the owner named no tier, pick it from the change itself — measure it firs
 - else **`light`** if no security lens was requested and the change is either small (about
   50 changed lines or fewer, in at most 3 files) or mechanical (docs, comments, renames,
   formatting, config values, test scaffolding only);
-- else **omit `tier`**: the workflow uses `daily` on every lens, including `security`.
+- else **omit `tier`**: on pass 1 the workflow uses `daily` on every lens, including `security`.
 
 An explicit owner-selected tier applies to every lens, including security. For a critical
 final gate, pass `tier: 'final'` so Astra reviews every requested lens.
@@ -67,8 +70,9 @@ Workflow({ name: 'ultracodex:codex-review', args: {
   context: '<what the change is for>', lessons: '<abs path or omit>' } })
 ```
 
-Add `tier` when selected above or explicitly requested by the owner. With no tier, every lens
-uses Sol 6.1 at `xhigh`. Optional `securityTier: 'light'|'daily'|'final'` changes only the security
+Add `tier` when selected above or explicitly requested by the owner. With no tier, pass 1 uses
+Sol 6.1 at `xhigh` on every lens, and a pass above 1 uses Terra 6.1 at `xhigh` (`light`) on every
+lens. Optional `securityTier: 'light'|'daily'|'final'` changes only the security
 lens; use `securityTier: 'final'` for critical security work. Invalid values are ignored.
 An explicit `tier` overrides `securityTier` for every lens. `lenses[].tier` and `lenses[].model`
 record the model used, including failed lenses.
@@ -107,8 +111,8 @@ backslashes break Bash commands on Windows):
 
 The brief = the lens text from `references/lenses.md` + the scope sentence ("Review the changes
 on the current branch against main: `git diff main...HEAD`, plus uncommitted changes") + context
-+ lessons. Use `daily` for every routine lens, including security, or `light` when selected
-above. For critical work, use `final` on the security lens or on every lens for a final critical
++ lessons. Use `daily` for every routine lens on pass 1, including security, `light` on a fix-delta
+pass (pass above 1), or `light` when selected above. For critical work, use `final` on the security lens or on every lens for a final critical
 gate. An explicit owner-selected tier overrides that choice. Then:
 
 ```bash
@@ -156,12 +160,18 @@ Each result covers only its lenses: keep the first result and merge both runs' f
   lines and are obviously correct. Put the rest in the PR as follow-ups or known limits.
   At the cap with medium findings, fix and verify without another pass, or document known limits.
 - **`delta`** → fix, verify (build, tests, diff), and commit. Run the workflow with
-  `base: '<reviewed commit>'`, `pass: N + 1`, and `tier: rereview.tier`.
+  `base: '<reviewed commit>'`, `pass: N + 1`, and `tier: rereview.tier`. When `rereview.securityTier`
+  is set, pass `securityTier: rereview.securityTier` and leave `tier` out: an explicit `tier` would
+  override `securityTier`, and the security lens would drop to `light`.
   Build `priorFindings` from `rereview.carry` (id, status, severity, title, file:line).
   For each, add what was done: fixed (how), still open (why), or left as a follow-up / known limit.
-  Medium deltas use `daily` after a `final` pass, otherwise `light`.
+  After a non-final pass, medium and high/critical deltas use `light`. After a `final` pass,
+  medium deltas use `daily` and high/critical deltas use `final`.
   When the tier is `light`, use `daily` instead if the delta is more than about 50 changed lines
-  or more than 3 files. A full re-review (`base: 'main'`) is only for a large or design-changing fix.
+  or more than 3 files, or if the fix changed the design. A full re-review (`base: 'main'`) is only
+  for a large or design-changing fix.
+  When Codex implemented the change, send the fix brief to its open implement session as a
+  follow-up (`codex_send` / `send <runId>`), not as a new run (see `codex-implement`).
 - **`owner`** → stop and report; do not ship with a high or critical finding open. At most
   3 passes per change. A fourth pass needs the owner's OK (`ownerApproved: true`).
 

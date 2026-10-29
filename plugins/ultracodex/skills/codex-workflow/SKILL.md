@@ -90,7 +90,8 @@ Run by name with `args` (JSON values, not strings):
   `tests`, `performance`) → Claude checks every finding in the code (Haiku 5.5 @high by default;
   `triageModel` / `triageEffort` override it, `'inherit'` = Claude Code's default for workflow agents: the session's model, or `CLAUDE_CODE_SUBAGENT_MODEL` when set) → high/critical findings
   from non-Astra lenses that Claude refuted or could not settle go to astra in one run → report.
-  Omit `tier` for Sol 6.1 at `xhigh` on every lens, including `security`. For critical work,
+  Omit `tier` for Sol 6.1 at `xhigh` on every lens of pass 1, including `security`, and for
+  Terra 6.1 at `xhigh` on every lens of a fix-delta pass (`pass` above 1). For critical work,
   `securityTier: 'final'` selects Astra for security only, or `tier: 'final'` for every lens.
   `securityTier` accepts `light`, `daily` or `final`; invalid values are ignored. An explicit
   `tier` overrides it. `lenses[].tier` and `lenses[].model` report actual routing.

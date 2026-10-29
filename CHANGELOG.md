@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.6.5 — 2026-10-29 (fix-delta reviews on light; implement sessions stay open)
+
+- `codex-review`: with no `tier`, a pass above 1 (a fix-delta review) runs every lens on `light`
+  (`gpt-6.1-terra@xhigh`). Pass 1 is unchanged: `daily` (`gpt-6.1-sol@xhigh`) on every lens. An
+  explicit `tier` keeps its meaning and still overrides `securityTier` on every lens. Without an
+  explicit `tier`, `securityTier` still sets only the security lens; otherwise it defaults to the
+  pass tier. `priorFindings` without `pass` makes pass 2, so it also defaults to `light`.
+- `rereview.securityTier` (new, `null` by default): when the caller passed `securityTier` with no
+  `tier` and the review had a security lens, it holds that tier if it differs from `rereview.tier`.
+  The `Re-review:` line and `reason` then say to keep `securityTier` and leave `tier` out, because an
+  explicit `tier` overrides `securityTier` and would drop the security lens to `light`.
+- `rereview.tier` after a non-final pass is `light` for medium and for high/critical findings
+  (it was `daily` for high/critical). After a `final` pass it is unchanged: `daily` for medium,
+  `final` for high/critical. The `reason` text is the same for both severities and says to use
+  `daily` instead of `light` for a delta of more than about 50 changed lines or more than 3 files,
+  or when the fix changed the design. A full re-review is only for a large or design-changing fix.
+- `codex-implement`: keep the implementation session open until the change is merged or abandoned,
+  and send review fixes to it as one complete follow-up (`send` / `codex_send`). A dormant session
+  wakes on `send`. A new run is only for a closed or failed session, and then through the one-shot
+  resume fallback with `provenance.threadId`, so Codex keeps its context. Close with `--archive`
+  after the merge. `codex-review` and `codex-steer` skills say the same.
+- Why, from the owner's runs of 2026-10-23 to 2026-10-29: 18 of 26 pass-2 reviews ran on Sol,
+  although the policy says a small delta uses Terra. 13 implementation fix runs started a new
+  session instead of a follow-up. The 2026-10-27 benchmark found terra@xhigh at least as good as
+  sol@xhigh on replayed review lens jobs, at about a quarter of the cost per run ($0.12 against
+  $0.48). Small sample.
+- Align the skills, READMEs and model policy, and add offline tests for the new defaults and the
+  re-review table. The runner's tier-to-model policy is unchanged.
+
 ## 0.6.4 — 2026-10-27 (light tier on GPT-6.1 Terra @xhigh)
 
 - The `light` tier moves from `gpt-6-luna@max` to `gpt-6.1-terra@xhigh` for every kind. Luna is no

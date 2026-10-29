@@ -146,15 +146,21 @@ a follow-up is then a new run with `"resume": { "sessionId": "<provenance.thread
   routine changes, including security lenses. For the critical categories in section 1,
   use `securityTier: 'final'` for an Astra security review or `tier: 'final'` for every lens.
   Or use `ultracodex:cross-review` so Claude finds and Codex verifies.
-- Fix findings and re-verify, then follow the `codex-review` skill's fixes and re-review policy:
+- **Review fixes go to the same session.** Send the confirmed findings from `codex-review`, with
+  `rereview.carry`, as one complete follow-up: `send <runId> --message-file "<fix brief>"`
+  (`codex_send`). A sleeping (dormant) session wakes on `send`. Start a new run only when the
+  session is closed or failed. Then use the one-shot fallback above with its `provenance.threadId`,
+  so Codex keeps its context. Do not start a fresh session for fixes.
+- Re-verify the fixes (section 5), then follow the `codex-review` skill's fixes and re-review policy:
   no new pass after low-only findings; otherwise review only the fix delta; at most 3 passes.
 
-## 7. Close and hand over
+## 7. Keep the session, hand over, then close
 
-After verification, `close <runId>` (`--archive` when the work is merged or abandoned: it also archives the Codex
-thread; without it the thread stays in Codex's history). An idle session would sleep by itself, but a session you
-are done with should be closed. Then summarize what was built, what you verified and how, the open items, and where
-the branch is.
+Do not close the session right after verification. Keep it open until the change is merged or
+abandoned, because review fixes go to this session (section 6). An idle session sleeps by itself and
+holds no process or slot. When the change is merged or abandoned, `close <runId> --archive`: it also
+archives the Codex thread; without `--archive` the thread stays in Codex's history. Summarize what
+was built, what you verified and how, the open items, and where the branch is.
 **Do not merge or push to shared branches without the owner's explicit OK** — they review
 locally first.
 
