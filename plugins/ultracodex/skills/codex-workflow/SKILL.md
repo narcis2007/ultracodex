@@ -94,7 +94,8 @@ Run by name with `args` (JSON values, not strings):
   Terra 6.1 at `xhigh` on every lens of a fix-delta pass (`pass` above 1). For critical work,
   `securityTier: 'final'` selects Astra for security only, or `tier: 'final'` for every lens.
   `securityTier` accepts `light`, `daily` or `final`; invalid values are ignored. An explicit
-  `tier` overrides it. `lenses[].tier` and `lenses[].model` report actual routing.
+  `securityTier` always sets the security lens, also when `tier` is given; `tier` sets every other
+  lens. `lenses[].tier` and `lenses[].model` report actual routing.
   `args: { cwd, base | commit | uncommitted, lenses, tier: 'light'|'daily'|'final', securityTier: 'light'|'daily'|'final', escalate, context, lessons, triage, triageModel, triageEffort }`
 - **`ultracodex:crosscheck`** — one Codex attempt (astra@max) to refute one claim.
   `args: { claim, evidence, cwd, tier }`

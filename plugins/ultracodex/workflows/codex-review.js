@@ -1,6 +1,6 @@
 export const meta = {
   name: 'codex-review',
-  description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude (Haiku 5.5 @high by default); high/critical disagreements go to astra@max. Pass-1 lenses default to 6.1-sol@xhigh, including security; fix-delta passes (pass > 1) default to 6.1-terra@xhigh. For critical work, securityTier: final selects astra@max for security only; an explicit tier overrides every lens. Fails closed.',
+  description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude (Haiku 5.5 @high by default); high/critical disagreements go to astra@max. Pass-1 lenses default to 6.1-sol@xhigh, including security; fix-delta passes (pass > 1) default to 6.1-terra@xhigh. For critical work, securityTier: final selects astra@max for security only; an explicit tier sets every lens; an explicit securityTier always sets the security lens. Fails closed.',
   whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: light (6.1-terra@xhigh)|daily (6.1-sol@xhigh)|final (astra@max), securityTier: light|daily|final, context, lessons, triage, triageModel: haiku|sonnet|opus|inherit, triageEffort, escalate, fast, pass: positive integer (default 2 with priorFindings, else 1), priorFindings: previous findings and fixes (string, array or object), ownerApproved: true to allow pass > 3 }. With no tier, pass 1 uses daily and pass > 1 uses light. Pass > 1 reviews only the fix delta and prior findings.',
   phases: [
     { title: 'Review', detail: 'one Codex review per lens (read-only, hermetic)' },
@@ -584,8 +584,8 @@ const CWD = A.cwd || null
 const EXPLICIT_TIER = ['light', 'daily', 'final'].includes(A.tier)
 // With no valid tier: pass 1 reviews on daily, a fix-delta pass (pass > 1) on light.
 const TIER = EXPLICIT_TIER ? A.tier : PASS > 1 ? 'light' : 'daily'
-const EXPLICIT_SECURITY_TIER = ['light', 'daily', 'final'].includes(A.securityTier)
-const SECURITY_TIER = EXPLICIT_SECURITY_TIER ? A.securityTier : TIER
+// A valid securityTier always sets the security lens, also when tier is explicit. Otherwise the security lens follows TIER.
+const SECURITY_TIER = ['light', 'daily', 'final'].includes(A.securityTier) ? A.securityTier : null
 const TRIAGE = A.triage !== false
 // Triage runs on Haiku 5.5 at high effort unless the owner names another model. Measured on
 // 249 recorded triage cases replayed at their reviewed commits, disagreements judged blind by
@@ -623,8 +623,8 @@ const LENSES = {
 }
 const lensKeys = (Array.isArray(A.lenses) && A.lenses.length ? A.lenses : ['code', 'domain']).filter(k => LENSES[k])
 if (!lensKeys.length) throw new Error('codex-review: no known lens in args.lenses (use code, domain, security, tests, performance)')
-// Every lens defaults to TIER (daily on pass 1, light on a fix-delta pass); security can opt into another tier unless tier is explicit.
-const lensTier = key => !EXPLICIT_TIER && key === 'security' ? SECURITY_TIER : TIER
+// Every lens uses TIER (an explicit tier, else daily on pass 1 and light on a fix-delta pass); the security lens uses securityTier when one is given.
+const lensTier = key => key === 'security' && SECURITY_TIER ? SECURITY_TIER : TIER
 // Only findings from non-Astra lenses can need an Astra tiebreak.
 const ESCALATE = TRIAGE && A.escalate !== false && lensKeys.some(key => lensTier(key) !== 'final')
 
@@ -752,7 +752,7 @@ const carry = [
   ...untriaged.map(f => carryFinding(f, 'untriaged')),
 ]
 const worst = SEVERITIES.find(severity => carry.some(f => f.severity === severity)) || 'none'
-const rereview = { pass: PASS, worst, recommendation: 'none', tier: null, securityTier: null, nextPass: null, rerunLenses: failedLenses.map(l => l.lens), carry, reason: '' }
+const rereview = { pass: PASS, worst, recommendation: 'none', tier: null, securityTier: SECURITY_TIER, nextPass: null, rerunLenses: failedLenses.map(l => l.lens), carry, reason: '' }
 if (worst === 'low' || worst === 'none') {
   rereview.reason = 'No re-review; fix only low findings that take a few lines and are obviously correct; list the rest as follow-ups.'
 } else if (worst === 'medium' && PASS >= 3) {
@@ -765,20 +765,13 @@ if (worst === 'low' || worst === 'none') {
   // After a final pass: medium → daily, high/critical → final. After any other pass: light for every severity.
   rereview.tier = TIER === 'final' ? (worst === 'medium' ? 'daily' : 'final') : 'light'
   rereview.nextPass = PASS + 1
-  // A caller-chosen securityTier only works with no explicit tier: keep it for the next pass, or tier: light would override it.
-  // It does not depend on the lenses of this run, so a retry of a failed non-security lens carries it too.
-  if (!EXPLICIT_TIER && EXPLICIT_SECURITY_TIER && SECURITY_TIER !== rereview.tier) rereview.securityTier = SECURITY_TIER
   rereview.reason = 'Fix and verify, then review only the fix delta (base = the commit this pass reviewed) at tier ' + rereview.tier + ' with priorFindings.'
-    + (rereview.securityTier
-      // An explicit tier: daily would override securityTier, so a large delta is split into two calls.
-      ? ' Keep securityTier: ' + rereview.securityTier + ' on the next pass and leave tier out (light is the default for pass > 1; an explicit tier overrides securityTier).'
-        + (lensKeys.every(key => key === 'security') ? '' : ' For a delta of more than about 50 changed lines or more than 3 files, or when the fix changed the design, split the next pass into two calls with the same pass number and base: the non-security lenses with tier daily, and the security lens, if any, with securityTier ' + rereview.securityTier + ' and no tier. Combine both results like a failed-lens retry: keep both, merge the findings and follow the stricter rereview.')
-        + ' A full re-review only for a large or design-changing fix.'
-      : rereview.tier === 'light'
-        ? ' Use daily instead of light when the delta is more than about 50 changed lines or more than 3 files, or when the fix changed the design; a full re-review only for a large or design-changing fix.'
-        : ' A full re-review only when the fix was large or changed the design.')
+    + (rereview.tier === 'light'
+      ? ' Use daily instead of light when the delta is more than about 50 changed lines or more than 3 files, or when the fix changed the design; a full re-review only for a large or design-changing fix.'
+      : ' A full re-review only when the fix was large or changed the design.')
+    + (rereview.securityTier ? ' Pass securityTier: ' + rereview.securityTier + ' again on the next pass.' : '')
 }
-if (rereview.rerunLenses.length) rereview.reason = 'Re-run only these lenses on the same scope with the same pass number first — that is not a new pass. Failed lenses: ' + rereview.rerunLenses.join(', ') + '. This decision covers only the lenses that ran. Keep the first result; after the re-run, combine the findings of both runs and follow the stricter of the two rereview objects: worse worst, recommendation owner > delta > none, tier final > daily > light, and keep a securityTier that either run sets. ' + rereview.reason
+if (rereview.rerunLenses.length) rereview.reason = 'Re-run only these lenses on the same scope with the same pass number first — that is not a new pass. Failed lenses: ' + rereview.rerunLenses.join(', ') + '. This decision covers only the lenses that ran. Keep the first result; after the re-run, combine the findings of both runs and follow the stricter of the two rereview objects: worse worst, recommendation owner > delta > none, tier final > daily > light. ' + rereview.reason
 const rereviewLine = 'Re-review: ' + (rereview.recommendation === 'delta'
   ? 'delta (pass ' + rereview.nextPass + ', tier ' + rereview.tier + (rereview.securityTier ? ', securityTier ' + rereview.securityTier : '') + ', base = the commit this pass reviewed)'
   : rereview.recommendation === 'owner' ? 'owner decides' : 'none') + ' — ' + rereview.reason

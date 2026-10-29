@@ -47,7 +47,8 @@ production release. In `codex-review`, omitting `tier` uses Sol at `xhigh` on ev
 pass 1, including `security`, and Terra at `xhigh` (`light`) on every lens of a fix-delta pass
 (pass above 1). For critical work, pass `securityTier: 'final'` for Astra on security only,
 or `tier: 'final'` for every lens. `securityTier` accepts `light`, `daily` or `final`; invalid
-values are ignored. An explicit `tier` overrides it. Actual routing is reported in
+values are ignored. An explicit `securityTier` always sets the security lens, also when `tier` is
+given; `tier` sets every other lens. Actual routing is reported in
 `lenses[].tier` and `lenses[].model`, and Astra findings are not sent to Astra again for a tiebreak.
 
 Prefer Sol 6.1 at `xhigh`, including complex and long tasks. Use Sol at `max` only with an

@@ -39,7 +39,8 @@ an owner request, with a stated reason. Task complexity or duration alone does n
 and every lens of a fix-delta pass (pass above 1) to Terra at `xhigh` (`light`).
 For critical work, use `securityTier: 'final'` for Astra on security only, or `tier: 'final'`
 for every lens. `securityTier` accepts `light`, `daily` or `final`; invalid values are ignored.
-An explicit tier overrides it; results name each lens's actual tier and model.
+An explicit `securityTier` always sets the security lens, also when `tier` is given; `tier` sets every
+other lens. Results name each lens's actual tier and model.
 
 Requires the Codex CLI (logged in) and Node.js 18+. Check with
 `node scripts/codex-node.mjs preflight --pretty`.

@@ -37,8 +37,8 @@ Say which pass this is: `1` is the first review of the change. When possible, co
 under review first. Record `git -C "<repo>" rev-parse HEAD` as the reviewed commit before each
 pass — it is the base of a later fix delta.
 
-For pass 2 and later, use `rereview.tier` and `rereview.securityTier` (see section 6) or omit `tier`:
-the workflow then uses `light`. For pass 1, when the owner named no tier, pick it from the change itself — measure it first with
+For pass 2 and later, use `rereview.tier` and, when it is set, `rereview.securityTier` (see section 6),
+or omit `tier`: the workflow then uses `light`. For pass 1, when the owner named no tier, pick it from the change itself — measure it first with
 `git -C "<repo>" diff --shortstat <scope>` (and `--name-only`):
 
 - **`final`** for the critical categories above — whatever the change's size. Use
@@ -48,8 +48,10 @@ the workflow then uses `light`. For pass 1, when the owner named no tier, pick i
   formatting, config values, test scaffolding only);
 - else **omit `tier`**: on pass 1 the workflow uses `daily` on every lens, including `security`.
 
-An explicit owner-selected tier applies to every lens, including security. For a critical
-final gate, pass `tier: 'final'` so Astra reviews every requested lens.
+An explicit owner-selected `tier` sets every lens, including security, unless you also pass
+`securityTier`: an explicit `securityTier` always sets the security lens. When the owner names one
+tier for every lens ("use sol"), do not pass `securityTier`. For a critical final gate, pass
+`tier: 'final'` so Astra reviews every requested lens.
 
 Keep routine Sol reviews at `xhigh`, including large diffs. Use Sol at `max` only as an
 explicit request-field override in a direct run or `codexNode` call for an exceptional
@@ -72,10 +74,12 @@ Workflow({ name: 'ultracodex:codex-review', args: {
 
 Add `tier` when selected above or explicitly requested by the owner. With no tier, pass 1 uses
 Sol 6.1 at `xhigh` on every lens, and a pass above 1 uses Terra 6.1 at `xhigh` (`light`) on every
-lens. Optional `securityTier: 'light'|'daily'|'final'` changes only the security
-lens; use `securityTier: 'final'` for critical security work. Invalid values are ignored.
-An explicit `tier` overrides `securityTier` for every lens. `lenses[].tier` and `lenses[].model`
-record the model used, including failed lenses.
+lens. Optional `securityTier: 'light'|'daily'|'final'` always sets the security lens, also when
+`tier` is given; `tier` sets every other lens, and the security lens only when no valid
+`securityTier` is given. Use `securityTier: 'final'` for critical security work, and pass the same
+`securityTier` on every pass of a change. Invalid values are ignored. If the owner names one tier for
+every lens ("use sol"), do not pass `securityTier`. `lenses[].tier` and `lenses[].model` record the
+model used, including failed lenses.
 
 `pass` is a positive integer. Missing or invalid values default to `2` when `priorFindings`
 is given, otherwise `1`. `priorFindings` holds the previous findings and what was done about each;
@@ -154,25 +158,22 @@ If lenses failed, re-run only `rereview.rerunLenses` first, on the same scope an
 pass number. That is not a new pass.
 Each result covers only its lenses: keep the first result and merge both runs' findings and
 `rereview.carry` after the retry. Follow the stricter `rereview`: worse `worst`, recommendation
-`owner > delta > none`, tier `final > daily > light`, and keep a `securityTier` that either run sets.
+`owner > delta > none`, tier `final > daily > light`.
 
 - **`none`** → no new pass. Low findings are optional: fix now only those that take a few
   lines and are obviously correct. Put the rest in the PR as follow-ups or known limits.
   At the cap with medium findings, fix and verify without another pass, or document known limits.
 - **`delta`** → fix, verify (build, tests, diff), and commit. Run the workflow with
-  `base: '<reviewed commit>'`, `pass: N + 1`, and `tier: rereview.tier`. When `rereview.securityTier`
-  is set, pass `securityTier: rereview.securityTier` and leave `tier` out: an explicit `tier` would
-  override `securityTier`, and the security lens would drop to `light`. If the delta is large (more than
-  about 50 changed lines or more than 3 files) or the fix changed the design, split the next pass into
-  two calls with the same pass number and base: the non-security lenses with `tier: 'daily'`, and the
-  security lens with `securityTier: rereview.securityTier` and no `tier`. Combine them like a failed-lens
-  retry: keep both results, merge the findings and `rereview.carry`, and follow the stricter `rereview`.
+  `base: '<reviewed commit>'`, `pass: N + 1`, and `tier: rereview.tier` (or `daily` for a large delta,
+  see below). When `rereview.securityTier` is set, also pass `securityTier: rereview.securityTier`:
+  it sets the security lens even when `tier` is given, so one call can run the other lenses on
+  `daily` and the security lens on `final`.
   Build `priorFindings` from `rereview.carry` (id, status, severity, title, file:line).
   For each, add what was done: fixed (how), still open (why), or left as a follow-up / known limit.
   After a non-final pass, medium and high/critical deltas use `light`. After a `final` pass,
   medium deltas use `daily` and high/critical deltas use `final`.
-  When the tier is `light` and `rereview.securityTier` is not set, use `daily` instead if the delta is
-  more than about 50 changed lines or more than 3 files, or if the fix changed the design. A full re-review (`base: 'main'`) is only
+  When the tier is `light`, use `daily` instead if the delta is more than about 50 changed lines
+  or more than 3 files, or if the fix changed the design. A full re-review (`base: 'main'`) is only
   for a large or design-changing fix.
   When Codex implemented the change, send the fix brief to its open implement session as a
   follow-up (`codex_send` / `send <runId>`), not as a new run (see `codex-implement`).

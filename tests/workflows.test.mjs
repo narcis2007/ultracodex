@@ -908,9 +908,10 @@ test("codex-review ignores invalid securityTier values", async () => {
   }
 });
 
-test("codex-review explicit daily, light and final tiers override securityTier for every lens", async () => {
-  for (const [tier, model] of [["daily", "gpt-6.1-sol"], ["light", "gpt-6.1-terra"], ["final", "gpt-6-astra"]]) {
-    for (const securityTier of ["light", "daily", "final"]) {
+test("codex-review: an explicit tier sets every lens, an explicit securityTier always sets the security lens", async () => {
+  const MODEL = { light: ["gpt-6.1-terra", "xhigh"], daily: ["gpt-6.1-sol", "xhigh"], final: ["gpt-6-astra", "max"] };
+  for (const tier of ["daily", "light", "final"]) {
+    for (const securityTier of [undefined, "light", "daily", "final"]) {
       const requests = [];
       const agent = async (prompt, opts) => {
         if (opts.agentType === RELAY) {
@@ -921,15 +922,24 @@ test("codex-review explicit daily, light and final tiers override securityTier f
         return opts.label === "report" ? "FINAL" : null;
       };
       const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "domain", "security"], tier, securityTier, triage: false, fast: true } });
+      const securityLensTier = securityTier ?? tier;
       assert.equal(result.status, "complete");
-      assert.equal(requests.length, 3);
-      assert.deepEqual(requests.map(r => [r.model, r.effort, r.serviceTier]), Array(3).fill([model, tier === "final" ? "max" : "xhigh", tier === "final" ? "priority" : null]));
-      assert.deepEqual(result.lenses.map(l => [l.tier, l.model]), Array(3).fill([tier, model]));
+      assert.equal(result.tier, tier, "securityTier does not change the base tier");
+      assert.deepEqual(requests.map(r => [r.label, r.model, r.effort, r.serviceTier]).sort(), [
+        ["codex:code", ...MODEL[tier], tier === "final" ? "priority" : null],
+        ["codex:domain", ...MODEL[tier], tier === "final" ? "priority" : null],
+        ["codex:security", ...MODEL[securityLensTier], securityLensTier === "final" ? "priority" : null],
+      ]);
+      assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [
+        ["code", tier, MODEL[tier][0]],
+        ["domain", tier, MODEL[tier][0]],
+        ["security", securityLensTier, MODEL[securityLensTier][0]],
+      ]);
     }
   }
 });
 
-async function reviewTiers(args) {
+async function reviewTiers(args, expectedRequests = 3) {
   const requests = [];
   const agent = async (prompt, opts) => {
     if (opts.agentType === RELAY) {
@@ -941,7 +951,7 @@ async function reviewTiers(args) {
   };
   const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "domain", "security"], triage: false, ...args } });
   assert.equal(result.status, "complete");
-  assert.equal(requests.length, 3);
+  assert.equal(requests.length, expectedRequests);
   return { result, requests };
 }
 
@@ -973,11 +983,22 @@ test("codex-review priorFindings without pass is pass 2 and reviews on light", a
 
 test("codex-review pass 2 with an explicit tier keeps that tier on every lens", async () => {
   for (const [tier, model, effort] of [["daily", "gpt-6.1-sol", "xhigh"], ["light", "gpt-6.1-terra", "xhigh"], ["final", "gpt-6-astra", "max"]]) {
-    const { result, requests } = await reviewTiers({ pass: 2, tier, securityTier: "light" });
+    const { result, requests } = await reviewTiers({ pass: 2, tier });
     assert.equal(result.tier, tier);
     assert.deepEqual(requests.map(r => [r.model, r.effort]), Array(3).fill([model, effort]));
     assert.deepEqual(result.lenses.map(l => [l.tier, l.model]), Array(3).fill([tier, model]));
   }
+});
+
+test("codex-review pass 2 with tier daily and securityTier final: other lenses on Sol, security on Astra, in one call", async () => {
+  const { result, requests } = await reviewTiers({ pass: 2, tier: "daily", securityTier: "final", lenses: ["code", "security"] }, 2);
+  assert.equal(result.tier, "daily");
+  assert.deepEqual(requests.map(r => [r.label, r.model, r.effort]).sort(), [
+    ["codex:code", "gpt-6.1-sol", "xhigh"],
+    ["codex:security", "gpt-6-astra", "max"],
+  ]);
+  assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [["code", "daily", "gpt-6.1-sol"], ["security", "final", "gpt-6-astra"]]);
+  assert.equal(result.rereview.securityTier, "final");
 });
 
 test("codex-review pass 2 ignores an invalid tier and falls back to light", async () => {
@@ -1272,18 +1293,21 @@ for (const c of [
   { name: "approved pass 4 low stops", args: { pass: 4, ownerApproved: true }, findings: [["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
   { name: "approved pass 4 medium stops", args: { pass: 4, ownerApproved: true }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "none", tier: null, nextPass: null },
   { name: "approved pass 4 high still needs owner", args: { pass: 4, ownerApproved: true }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "owner", tier: null, nextPass: null },
-  { name: "securityTier final is kept for the next pass (high)", args: { lenses: ["code", "security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
-  { name: "securityTier final is kept for the next pass (medium)", args: { lenses: ["code", "security"], securityTier: "final" }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
-  { name: "securityTier final is kept on pass 2", args: { pass: 2, lenses: ["code", "security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 3 },
-  { name: "securityTier daily is kept for the next pass", args: { lenses: ["code", "security"], securityTier: "daily" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "daily", nextPass: 2 },
-  { name: "securityTier is carried by a run without a security lens", args: { lenses: ["code", "domain"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
-  { name: "securityTier is carried by a security-only run", args: { lenses: ["security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
-  { name: "securityTier is null when tier is explicit daily", args: { lenses: ["code", "security"], tier: "daily", securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
-  { name: "securityTier is null when tier is explicit final", args: { lenses: ["code", "security"], tier: "final", securityTier: "daily" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "final", nextPass: 2 },
-  { name: "securityTier equal to the next tier is null", args: { lenses: ["code", "security"], securityTier: "light" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
+  { name: "securityTier final is echoed for the next pass (high)", args: { lenses: ["code", "security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
+  { name: "securityTier final is echoed for the next pass (medium)", args: { lenses: ["code", "security"], securityTier: "final" }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
+  { name: "securityTier final is echoed on pass 2", args: { pass: 2, lenses: ["code", "security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 3 },
+  { name: "securityTier daily is echoed for the next pass", args: { lenses: ["code", "security"], securityTier: "daily" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "daily", nextPass: 2 },
+  { name: "securityTier is echoed by a run without a security lens", args: { lenses: ["code", "domain"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
+  { name: "securityTier is echoed by a security-only run", args: { lenses: ["security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
+  { name: "securityTier is echoed with an explicit tier daily", args: { lenses: ["code", "security"], tier: "daily", securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
+  { name: "securityTier is echoed with an explicit tier final", args: { lenses: ["code", "security"], tier: "final", securityTier: "daily" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "final", securityTier: "daily", nextPass: 2 },
+  { name: "securityTier light is echoed", args: { lenses: ["code", "security"], securityTier: "light" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "light", nextPass: 2 },
   { name: "securityTier is null when the caller gave none", args: { lenses: ["code", "security"] }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
   { name: "an invalid securityTier is null", args: { lenses: ["code", "security"], securityTier: "astra" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
-  { name: "securityTier is null when no re-review follows", args: { lenses: ["code", "security"], securityTier: "final" }, findings: [["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
+  { name: "securityTier is echoed when the review is clean", args: { lenses: ["code", "security"], securityTier: "final" }, findings: [], worst: "none", recommendation: "none", tier: null, securityTier: "final", nextPass: null },
+  { name: "securityTier is echoed when only low findings remain", args: { lenses: ["code", "security"], securityTier: "final" }, findings: [["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, securityTier: "final", nextPass: null },
+  { name: "securityTier is echoed at the pass cap with a medium", args: { pass: 3, lenses: ["code", "security"], securityTier: "final" }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "none", tier: null, securityTier: "final", nextPass: null },
+  { name: "securityTier is echoed when the owner decides", args: { pass: 3, lenses: ["code", "security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "owner", tier: null, securityTier: "final", nextPass: null },
 ]) test(`codex-review re-review: ${c.name}`, async () => {
   let reportPrompt = null;
   const agent = async (prompt, opts) => {
@@ -1322,23 +1346,16 @@ for (const c of [
   } else {
     assert.match(reason, /Fix and verify.*only the fix delta.*base = the commit this pass reviewed.*priorFindings/);
     assert.ok(reason.includes("at tier " + c.tier + " with priorFindings"));
-    if (c.securityTier) {
-      assert.doesNotMatch(reason, /daily instead of light/);
-      assert.match(reason, /A full re-review only for a large or design-changing fix\./);
-      if (args.lenses.every(key => key === "security")) {
-        assert.doesNotMatch(reason, /split the next pass|50 changed lines|3 files/);
-      } else {
-        assert.ok(reason.includes(` For a delta of more than about 50 changed lines or more than 3 files, or when the fix changed the design, split the next pass into two calls with the same pass number and base: the non-security lenses with tier daily, and the security lens, if any, with securityTier ${c.securityTier} and no tier. Combine both results like a failed-lens retry: keep both, merge the findings and follow the stricter rereview.`));
-      }
-    } else if (c.tier === "light") {
+    if (c.tier === "light") {
       assert.match(reason, /daily instead of light.*50 changed lines.*3 files.*fix changed the design.*full re-review only for a large or design-changing fix/);
     } else {
       assert.doesNotMatch(reason, /instead of light|50 changed lines|3 files/);
       assert.match(reason, /full re-review only when the fix was large or changed the design/);
     }
   }
-  if (c.securityTier) {
-    assert.ok(reason.includes(` Keep securityTier: ${c.securityTier} on the next pass and leave tier out (light is the default for pass > 1; an explicit tier overrides securityTier).`));
+  assert.doesNotMatch(reason, /split the next pass|leave tier out|Keep securityTier/);
+  if (c.recommendation === "delta" && c.securityTier) {
+    assert.ok(reason.endsWith(` Pass securityTier: ${c.securityTier} again on the next pass.`));
   } else {
     assert.doesNotMatch(reason, /securityTier/);
   }
@@ -1494,10 +1511,11 @@ test("codex-review re-runs only failed lenses on the same scope and pass before 
   assert.match(result.rereview.reason, /Failed lenses: domain, security/);
   assert.match(result.rereview.reason, /decision covers only the lenses that ran/);
   assert.match(result.rereview.reason, /Keep the first result.*combine the findings of both runs.*stricter of the two rereview objects/);
-  assert.match(result.rereview.reason, /worse worst, recommendation owner > delta > none, tier final > daily > light, and keep a securityTier that either run sets/);
+  assert.match(result.rereview.reason, /worse worst, recommendation owner > delta > none, tier final > daily > light\./);
+  assert.doesNotMatch(result.rereview.reason, /keep a securityTier that either run sets/);
 });
 
-test("codex-review reason for securityTier final: split-run advice, not the plain daily-instead-of-light sentence", async () => {
+test("codex-review reason with securityTier final: the normal light advice plus a request to pass securityTier again", async () => {
   const finding = { id: "f", severity: "high", category: "c", title: "defect", file: "x.rs", line: 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.7 };
   const agent = async (prompt, opts) => {
     if (opts.agentType === RELAY) {
@@ -1512,14 +1530,13 @@ test("codex-review reason for securityTier final: split-run advice, not the plai
   assert.equal(result.rereview.securityTier, "final");
   assert.equal(result.rereview.reason,
     "Fix and verify, then review only the fix delta (base = the commit this pass reviewed) at tier light with priorFindings."
-    + " Keep securityTier: final on the next pass and leave tier out (light is the default for pass > 1; an explicit tier overrides securityTier)."
-    + " For a delta of more than about 50 changed lines or more than 3 files, or when the fix changed the design, split the next pass into two calls with the same pass number and base: the non-security lenses with tier daily, and the security lens, if any, with securityTier final and no tier. Combine both results like a failed-lens retry: keep both, merge the findings and follow the stricter rereview."
-    + " A full re-review only for a large or design-changing fix.");
-  assert.doesNotMatch(result.rereview.reason, /daily instead of light/);
+    + " Use daily instead of light when the delta is more than about 50 changed lines or more than 3 files, or when the fix changed the design; a full re-review only for a large or design-changing fix."
+    + " Pass securityTier: final again on the next pass.");
+  assert.doesNotMatch(result.rereview.reason, /split|leave tier out|Keep securityTier/);
   assert.ok(result.report.endsWith("Re-review: delta (pass 2, tier light, securityTier final, base = the commit this pass reviewed) — " + result.rereview.reason));
 });
 
-test("codex-review keeps securityTier when a failed non-security lens is re-run alone", async () => {
+test("codex-review echoes the same securityTier on a failed run and on its code-only retry", async () => {
   const finding = { id: "f", severity: "medium", category: "c", title: "defect", file: "x.rs", line: 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.7 };
   const make = codeFails => async (prompt, opts) => {
     if (opts.agentType === RELAY) {
@@ -1530,21 +1547,21 @@ test("codex-review keeps securityTier when a failed non-security lens is re-run 
     if (opts.label?.startsWith("triage:")) return { verdict: "confirmed", severity: "medium", severityReason: "", reasoning: "seen" };
     return opts.label === "report" ? "FINAL" : null;
   };
-  // first run: security is clean, code failed — no finding yet, so no securityTier to carry
+  // first run: security is clean, code failed
   const first = await runWorkflow("codex-review", { agent: make(true), args: { lenses: ["code", "security"], securityTier: "final", escalate: false } });
   assert.equal(first.result.status, "incomplete");
   assert.deepEqual(first.result.rereview.rerunLenses, ["code"]);
   assert.equal(first.result.rereview.worst, "none");
-  assert.equal(first.result.rereview.securityTier, null);
-  assert.match(first.result.rereview.reason, /and keep a securityTier that either run sets/);
-  // the code-only retry gets the same args and finds a medium: its rereview still carries securityTier
+  assert.equal(first.result.rereview.securityTier, "final");
+  assert.doesNotMatch(first.result.rereview.reason, /securityTier/);
+  // the code-only retry gets the same args and finds a medium: it echoes the same securityTier
   const retry = await runWorkflow("codex-review", { agent: make(false), args: { lenses: ["code"], securityTier: "final", escalate: false } });
   assert.equal(retry.result.status, "complete");
   assert.equal(retry.result.rereview.worst, "medium");
   assert.equal(retry.result.rereview.recommendation, "delta");
   assert.equal(retry.result.rereview.tier, "light");
   assert.equal(retry.result.rereview.securityTier, "final");
-  assert.match(retry.result.rereview.reason, /Keep securityTier: final on the next pass and leave tier out/);
+  assert.ok(retry.result.rereview.reason.endsWith(" Pass securityTier: final again on the next pass."));
   assert.match(retry.result.report, /Re-review: delta \(pass 2, tier light, securityTier final, base = the commit this pass reviewed\)/);
 });
 

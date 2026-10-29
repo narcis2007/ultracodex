@@ -4,17 +4,11 @@
 
 - `codex-review`: with no `tier`, a pass above 1 (a fix-delta review) runs every lens on `light`
   (`gpt-6.1-terra@xhigh`). Pass 1 is unchanged: `daily` (`gpt-6.1-sol@xhigh`) on every lens. An
-  explicit `tier` keeps its meaning and still overrides `securityTier` on every lens. Without an
-  explicit `tier`, `securityTier` still sets only the security lens; otherwise it defaults to the
-  pass tier. `priorFindings` without `pass` makes pass 2, so it also defaults to `light`.
-- `rereview.securityTier` (new, `null` by default): when the caller passed `securityTier` with no
-  `tier`, it holds that tier if it differs from `rereview.tier`. It does not depend on the lenses of the
-  run, so a re-run of a failed non-security lens carries it too, and the failed-lens merge rule keeps a
-  `securityTier` that either run sets. The `Re-review:` line and `reason` say to keep `securityTier` and
-  leave `tier` out, because an explicit `tier` overrides `securityTier` and would drop the security lens
-  to `light`. For a large or design-changing delta the `reason` says to split the next pass: the
-  non-security lenses with `tier: 'daily'` and the security lens with `securityTier`, then merge both
-  results like a failed-lens retry.
+  explicit `tier` keeps its meaning for every lens that has no `securityTier`. `priorFindings` without
+  `pass` makes pass 2, so it also defaults to `light`.
+- Precedence change: an explicit `securityTier` now sets the security lens even when `tier` is given
+  (before: an explicit `tier` overrode it). `rereview.securityTier` echoes the caller's `securityTier`
+  so the next pass can pass it again.
 - `rereview.tier` after a non-final pass is `light` for medium and for high/critical findings
   (it was `daily` for high/critical). After a `final` pass it is unchanged: `daily` for medium,
   `final` for high/critical. The `reason` text is the same for both severities and says to use

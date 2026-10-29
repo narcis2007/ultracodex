@@ -61,10 +61,11 @@ Rules of thumb:
   lens jobs, at about a quarter of the cost. After a non-final pass, `rereview.tier` is `light` for
   medium and for high/critical findings; use `daily` for a delta of more than about 50 changed lines
   or more than 3 files, or when the fix changed the design. After a `final` pass it is `daily` for
-  medium and `final` for high/critical. Optional `securityTier: 'light'|'daily'|'final'` changes only the
-  security lens; invalid values are ignored. Use `securityTier: 'final'` for critical security
-  work, or `tier: 'final'` for a critical gate across every lens. An explicit `tier` overrides
-  `securityTier`. The result's top-level `tier` is the base tier; `lenses[].tier` and
+  medium and `final` for high/critical. Optional `securityTier: 'light'|'daily'|'final'` always sets the
+  security lens, also when `tier` is given; `tier` sets every other lens. Invalid values are ignored.
+  Use `securityTier: 'final'` for critical security work, or `tier: 'final'` for a critical gate across
+  every lens. Pass the same `securityTier` on every pass of a change; `rereview.securityTier` echoes
+  it. When the owner names one tier for every lens, do not pass `securityTier`. The result's top-level `tier` is the base tier; `lenses[].tier` and
   `lenses[].model` show actual routing. Findings already reviewed by Astra do not get another
   Astra tiebreak.
 - **Escalate high/critical disagreements.** When Claude and sol disagree on such a finding,
@@ -87,8 +88,8 @@ Rules of thumb:
 | a quick look at a small or mechanical change | `codex-review` with `tier: 'light'` (terra@xhigh, ~$0.12 and ~80 s per lens) |
 | mechanical, high-volume work with no review value | explicit `model: 'gpt-6-luna', effort: 'max'` (cheapest; weak at finding defects) |
 | a routine review with a security lens | omit `tier`: on pass 1, Sol at `xhigh` on every lens, including `security` |
-| a fix-delta review (pass above 1) | omit `tier` or pass `rereview.tier`: Terra at `xhigh` on every lens (`daily` for a large or design-changing delta); when `rereview.securityTier` is set, pass it and leave `tier` out (a large delta is split into two calls, see `codex-review`) |
-| critical security work needing Astra on security only | `codex-review` `securityTier: 'final'`, omit `tier` |
+| a fix-delta review (pass above 1) | omit `tier` or pass `rereview.tier`: Terra at `xhigh` on every lens (`daily` for a large or design-changing delta); when `rereview.securityTier` is set, pass it again |
+| critical security work needing Astra on security only | `codex-review` `securityTier: 'final'`, omit `tier` (or add `tier` for the other lenses) |
 | a critical change or the last gate before a production release | `codex-review` `tier: 'final'` (astra per lens, ≤2 at a time) |
 
 When astra disagrees with sol or Claude, the item is **disputed**: report both reasonings and
