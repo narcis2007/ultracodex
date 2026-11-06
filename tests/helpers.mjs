@@ -2,7 +2,7 @@
 // fake Codex CLI on ULTRACODEX_CODEX_PATH, and fast timing knobs.
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +18,7 @@ import {
   requestMac,
   schemaHash,
 } from "../plugins/ultracodex/scripts/codex-node.mjs";
+import { gitEnv } from "../plugins/ultracodex/scripts/worktree.mjs";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const RUNNER = path.join(ROOT, "plugins", "ultracodex", "scripts", "codex-node.mjs");
@@ -87,6 +88,45 @@ export function fastEnv(home, extra = {}) {
     CLAUDE_CODE_SESSION_ID: "",
     ...extra,
   };
+}
+
+// All writes stay in this temporary family, separate from the runner home.
+// No host templates, hooks, signing, identity or global/system config is used.
+export function makeGitFixture(t, { layout = "family/repo" } = {}) {
+  const temp = makeHome(t);
+  const runnerHome = path.join(temp, "runner");
+  const home = path.join(temp, "home");
+  const hooks = path.join(temp, "hooks");
+  for (const dir of [runnerHome, home, hooks]) fs.mkdirSync(dir, { recursive: true });
+  const globalConfig = path.join(temp, "global.gitconfig");
+  fs.writeFileSync(globalConfig, "");
+  const env = gitEnv(fastEnv(runnerHome));
+  // Inline config is another source of host hooks and signing settings.
+  for (const key of Object.keys(env)) {
+    if (/^GIT_CONFIG(?:_|$)/i.test(key) || /^ULTRACODEX_WORKTREE_/i.test(key)) delete env[key];
+  }
+  Object.assign(env, { HOME: home, USERPROFILE: home, GIT_CONFIG_GLOBAL: globalConfig, GIT_CONFIG_NOSYSTEM: "1",
+    GIT_AUTHOR_NAME: "Fixture", GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+    GIT_COMMITTER_NAME: "Fixture", GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+    GIT_CONFIG_COUNT: "2", GIT_CONFIG_KEY_0: "commit.gpgsign", GIT_CONFIG_VALUE_0: "false",
+    GIT_CONFIG_KEY_1: "core.hooksPath", GIT_CONFIG_VALUE_1: hooks,
+  });
+  const repo = path.join(temp, layout);
+  fs.mkdirSync(repo, { recursive: true });
+  const run = (args, target = repo, { allowFailure = false } = {}) => {
+    assert.ok(path.resolve(target).startsWith(`${temp}${path.sep}`) || path.resolve(target) === temp, "fixture git target stays temporary");
+    const out = spawnSync("git", ["-C", path.resolve(target), ...args], {
+      cwd: runnerHome, env, shell: false, windowsHide: true, encoding: "utf8", timeout: 30_000,
+    });
+    if (!allowFailure) assert.equal(out.status, 0, `${args.join(" ")}: ${out.stderr || out.error?.message}`);
+    return out;
+  };
+  run(["init", "--template=", "--initial-branch=main"]);
+  fs.writeFileSync(path.join(repo, "tracked.txt"), "fixture\n");
+  run(["add", "tracked.txt"]);
+  run(["commit", "-m", "fixture"]);
+  return { temp, repo, runnerHome, home, hooks, globalConfig, env, git: run,
+    options: { repo, slug: "task", env, home, runnerHome, noVolumeCheck: true } };
 }
 
 // Runs the runner CLI; resolves { code, stdout, stderr, json } where json is the

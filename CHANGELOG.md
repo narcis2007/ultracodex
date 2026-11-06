@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.6.6 — 2026-11-06 (configurable worktree locations)
+
+- Add runner commands `worktree path` and `worktree add`. Choose an exact path or root, read
+  `ultracodex.worktreeRoot` before `ULTRACODEX_WORKTREE_ROOT`, then auto-detect `wt` or `.worktrees`
+  in the main checkout's parent or grandparent. Auto-detection can be disabled. Without a match,
+  keep the sibling layout. `codex-implement` uses the command and keeps the raw Git fallback.
+- Resolve from the main checkout, including when called from a linked worktree. Check lexical
+  and canonical paths against every checkout and re-check the destination before creation.
+  Check the runner home, validate the base commit and new branch,
+  sanitize Git's repository-selection environment and keep worktrees after hook failures.
+  Bare-backed repos, separate git dirs and submodules are not supported yet. Resolve Git once
+  from absolute PATH directories and spawn its absolute path from the runner home.
+- On Windows, Git lookup skips batch-file shims and uses `.exe` or `.com` from PATH.
+- On Windows, report the filesystem and suggest available ReFS locations. The volume probe is
+  advisory; ReFS alone does not prove a Dev Drive. Config hints target the main checkout, use
+  PowerShell-safe forward slashes and suggest a `wt` folder for a drive root. Report the mount
+  path actually used to reach the destination. Observed with Docker Desktop on Windows: bind
+  mounts from a folder-mounted volume fail. If this task's Docker tests bind-mount files from
+  the worktree, put the worktree on a drive-letter path for this task (`--dir` / `--root`).
+  `--no-volume-check` skips the probe. Creation gets ten minutes; readers keep thirty seconds.
+- Add offline temporary-repository tests for resolution, creation, failure paths and volume hints.
+  `worktree remove` is deferred. Node 18/22 and Linux were not run here; the local gate uses
+  Windows and the installed Node 24. Manual acceptance on Windows 11 with folder-mounted Dev Drives:
+  auto-detection picked the `wt` / `.worktrees` volume in three repo families, and a Codex
+  `workspace-write` run (CLI 0.163.0-alpha.2) wrote inside a worktree on such a volume and was
+  denied outside it.
+
 ## 0.6.5 — 2026-10-29 (fix-delta reviews on light; implement sessions stay open)
 
 - `codex-review`: with no `tier`, a pass above 1 (a fix-delta review) runs every lens on `light`

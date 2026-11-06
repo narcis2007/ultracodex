@@ -37,6 +37,7 @@ import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { cmdNotify } from "./notify.mjs";
+import { cmdWorktree } from "./worktree.mjs";
 import {
   abandonSteerableState,
   buildAppServerArgs,
@@ -58,7 +59,7 @@ import {
   sessionWaitPrint,
 } from "./session.mjs";
 
-export const RUNNER_VERSION = "0.6.5";
+export const RUNNER_VERSION = "0.6.6";
 export const RUNNER_FILE = fileURLToPath(import.meta.url);
 
 export const EFFORTS = Object.freeze(["low", "medium", "high", "xhigh", "max", "ultra"]);
@@ -2036,13 +2037,14 @@ export function windowsPowerShell(env = process.env) {
   return path.join(env.SystemRoot || env.windir || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 }
 
-function runPowerShell(script, { timeout = 60_000 } = {}) {
+export function runPowerShell(script, { timeout = 60_000, env = process.env } = {}) {
   return spawnSync(windowsPowerShell(), ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], {
     encoding: "utf8",
     timeout,
     windowsHide: true,
     cwd: path.dirname(windowsPowerShell()), // neither the repository nor the home (which must stay deletable)
     maxBuffer: 16 * 1024 * 1024,
+    env,
   });
 }
 
@@ -4607,6 +4609,8 @@ function helpText() {
     "  node codex-node.mjs schema-check --schema FILE|-                 OpenAI strict-mode check for a schema",
     "  node codex-node.mjs dry-run (--request FILE|- | --framed FILE|-) show the codex invocation, no model call",
     "  node codex-node.mjs gc [--older-than-days N]                     remove finished run directories (and dormant sessions)",
+    "  node codex-node.mjs worktree path --repo PATH --slug SLUG [--root DIR | --dir PATH] [--no-volume-check] [--pretty]",
+    "  node codex-node.mjs worktree add --repo PATH --slug SLUG [--base REF] [--branch NAME] [--root DIR | --dir PATH] [--no-volume-check] [--pretty]",
     "",
     "  Sessions (request \"session\": true; direct runs only — see the codex-steer skill):",
     "  node codex-node.mjs send RUN_ID (--message TEXT | --message-file FILE) [--mode auto|steer|queue]",
@@ -4678,6 +4682,12 @@ function parseCli(argv) {
     "--from": "from",
     "--limit": "limit",
   };
+  const worktreeValued = {
+    "--repo": "repo", "--slug": "slug", "--base": "base", "--branch": "branch", "--root": "root", "--dir": "dir",
+  };
+  if (command === "worktree") Object.assign(valued, worktreeValued);
+  const knownFlags = new Set([...Object.keys(valued), "--pretty", "--all", "--live", "--orphaned", "--follow",
+    "--force", "--archive", "--mine", "--forever", "--sessions", "--no-volume-check", "--help"]);
   for (let index = 0; index < rest.length; index += 1) {
     const token = rest[index];
     if (token === "--pretty") options.pretty = true;
@@ -4690,9 +4700,12 @@ function parseCli(argv) {
     else if (token === "--mine") options.mine = true;
     else if (token === "--forever") options.forever = true;
     else if (token === "--sessions") options.sessions = true;
+    else if (command === "worktree" && token === "--no-volume-check") options.noVolumeCheck = true;
     else if (valued[token]) {
       const value = rest[index + 1];
-      if (value === undefined) throw new UsageError(`${token} requires a value`);
+      if (value === undefined || (command === "worktree" && worktreeValued[token] && (value.startsWith("-") || knownFlags.has(value)))) {
+        throw new UsageError(`${token} requires a value`);
+      }
       options[valued[token]] = value;
       index += 1;
     } else if (token.startsWith("--")) throw new UsageError(`unknown option ${token}`);
@@ -4731,6 +4744,8 @@ export async function main(argv = process.argv.slice(2)) {
         return 0;
       case "start":
         return await cmdStart(options);
+      case "worktree":
+        return cmdWorktree(id, options);
       case "part":
         return await cmdPart(options.positionals[0], options.positionals[1], options.positionals[2], options.positionals[3], options);
       case "run": {

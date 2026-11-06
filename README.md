@@ -72,6 +72,34 @@ workflow returns `codexUsage` — runs and tokens per model.
 - Codex CLI, logged in (`codex login`; tested on 0.156.1; sessions drive `codex app-server`, tested on 0.163.0-alpha.2)
 - Node.js 18+
 
+## Where worktrees go
+
+`codex-implement` uses `node scripts/codex-node.mjs worktree add --repo "<repo>" --slug "<slug>"`.
+Use `worktree path` with the same location flags to preview the location, without `--base` or
+`--branch`. Both return JSON with `path`,
+`source`, `root`, `repo`, `volume` and `hints`. `add` also accepts `--base` (main checkout's `HEAD`
+by default) and `--branch` (`codex/<slug>` by default).
+
+`--dir` chooses an exact path. `--root` chooses a container; the two flags are mutually exclusive.
+Then `git config ultracodex.worktreeRoot "<family>/wt"` wins over `ULTRACODEX_WORKTREE_ROOT`,
+the machine-wide fallback. Relative config roots resolve from the main checkout; `~` expands
+to home. Otherwise, auto-detection checks the main checkout's parent and grandparent for `wt`,
+then `.worktrees`, skipping containers inside Git working trees and levels at or above home
+or the filesystem root. Disable it with `git config ultracodex.worktreeAuto false` or
+`ULTRACODEX_WORKTREE_AUTO=0`. With no match, worktrees stay siblings named `<repo-name>.codex-<slug>`.
+
+On Windows, an existing Dev Drive container such as `D:\wt` can keep worktree I/O on that volume.
+The runner reports the filesystem and suggests available ReFS paths; ReFS alone does not prove
+a Dev Drive. The probe is advisory; skip it with `--no-volume-check`. Its config hints use
+PowerShell syntax with forward slashes and target the main checkout. `volume.mountPath` reports
+the mount path used to reach the destination.
+Observed with Docker Desktop on Windows: bind mounts from a folder-mounted volume fail.
+If this task's Docker tests bind-mount files from the worktree, put the worktree on a
+drive-letter path for this task (`--dir` / `--root`).
+Bare-backed repos, separate git dirs and submodules are not supported yet.
+A failed post-checkout hook can return `ok: false, created: true`; the
+runner keeps the worktree for inspection.
+
 ## Usage limits and account switching
 
 Jobs retain their Codex thread history by default. If a ChatGPT job reaches a

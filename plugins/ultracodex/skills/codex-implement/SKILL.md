@@ -46,12 +46,37 @@ state the reason. Complexity or duration alone does not justify `max`.
 ## 2. Isolate — a worktree outside the repo
 
 ```bash
-git -C "<repo>" worktree add "<repo>/../<repo-name>.codex-<slug>" -b codex/<slug> <base-branch>
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" worktree add --repo "<repo>" --slug "<slug>" --base "<base-branch>"
 ```
 
-A sibling directory, never inside the repo (tools that walk up the tree, like dotenv, would
-pick up the owner's `.env`) and never the owner's own working tree. One worktree per run; with
-Rust, give it its own `CARGO_TARGET_DIR` in the brief.
+Read `path` from the JSON and use it as the implementation cwd. Show `hints` to the owner when
+they matter. If `ok` is false, inspect the error before retrying. A hook failure can leave
+`created: true`; keep that worktree and inspect it. Do not create a second one blindly.
+
+Choose an exact path with `--dir`, or a container with `--root` (mutually exclusive). Otherwise,
+`git config ultracodex.worktreeRoot "<family>/wt"` wins over `ULTRACODEX_WORKTREE_ROOT`, the
+machine-wide fallback. Relative git config roots resolve from the main checkout; `~` expands
+to home. With neither set, the runner looks for `wt`, then `.worktrees`, in the main checkout's
+parent and grandparent. It skips containers inside Git working trees and levels at or above
+home or the filesystem root. Disable auto-detection with `git config ultracodex.worktreeAuto false`
+or `ULTRACODEX_WORKTREE_AUTO=0`. Without a match, it uses a sibling directory.
+
+On Windows, the runner reports the filesystem and suggests available ReFS locations when
+appropriate. ReFS alone does not prove a Dev Drive. `--no-volume-check` skips this advisory
+probe. Config hints target the main checkout and use forward slashes for PowerShell.
+Observed with Docker Desktop on Windows: bind mounts from a folder-mounted volume fail.
+If this task's Docker tests bind-mount files from the worktree, put the worktree on a
+drive-letter path for this task (`--dir` / `--root`).
+Preview without creating anything with `worktree path --repo "<repo>" --slug "<slug>"`;
+it takes the same location flags as `add`, without `--base` or `--branch`.
+Bare-backed repos, separate git dirs and submodules are not supported yet.
+
+Raw Git fallback (choose a safe location first):
+`git -C "<repo>" worktree add "<repo>/../<repo-name>.codex-<slug>" -b codex/<slug> <base-branch>`.
+
+Keep the worktree outside every checkout of the repo (tools that walk up the tree, like dotenv,
+would pick up the owner's `.env`). One worktree per run; with Rust, give it its own
+`CARGO_TARGET_DIR` in the brief.
 
 ## 3. Write the brief (Write tool, never a heredoc)
 

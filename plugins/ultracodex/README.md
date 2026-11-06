@@ -58,4 +58,31 @@ If cross-account resumption rejects encrypted reasoning, the runner continues
 from visible messages and completed tool records in a fresh thread, leaving the
 original rollout intact. This fallback runs once per handoff and keeps permissions.
 
+## Where worktrees go
+
+`codex-implement` uses `node scripts/codex-node.mjs worktree add --repo "<repo>" --slug "<slug>"`.
+Use `worktree path` with the same location flags, without `--base` or `--branch`, to preview the
+JSON `path`, `source`, `root`, `repo`, `volume` and `hints`.
+`add` accepts `--base` (main checkout's `HEAD` by default) and `--branch`
+(`codex/<slug>` by default).
+
+`--dir` sets the exact path; `--root` sets a container. They are mutually exclusive. Otherwise,
+`git config ultracodex.worktreeRoot "<family>/wt"` wins over `ULTRACODEX_WORKTREE_ROOT`, the
+machine-wide fallback. Relative config roots resolve from the main checkout; `~` expands to
+home. Auto-detection then checks the main checkout's parent and grandparent for `wt`, then
+`.worktrees`. It skips containers inside Git working trees and levels at or above home or the
+filesystem root. Disable it with `git config ultracodex.worktreeAuto false` or
+`ULTRACODEX_WORKTREE_AUTO=0`. With no match, the runner uses a sibling `<repo-name>.codex-<slug>`.
+
+On Windows, set an existing Dev Drive container such as `D:\wt` to keep worktree I/O there.
+The runner reports the filesystem and suggests available ReFS paths. ReFS alone does not prove
+a Dev Drive. The probe is advisory; `--no-volume-check` skips it. Config hints use PowerShell
+syntax with forward slashes and target the main checkout. `volume.mountPath` reports the mount
+path used to reach the destination.
+Observed with Docker Desktop on Windows: bind mounts from a folder-mounted volume fail.
+If this task's Docker tests bind-mount files from the worktree, put the worktree on a
+drive-letter path for this task (`--dir` / `--root`).
+Bare-backed repos, separate git dirs and submodules are not supported yet.
+A failed post-checkout hook can return `ok: false, created: true`; inspect the retained worktree.
+
 Fork of KingGyuSuh/ultracodex — Apache-2.0.
