@@ -59,7 +59,7 @@ import {
   sessionWaitPrint,
 } from "./session.mjs";
 
-export const RUNNER_VERSION = "0.6.6";
+export const RUNNER_VERSION = "0.6.7";
 export const RUNNER_FILE = fileURLToPath(import.meta.url);
 
 export const EFFORTS = Object.freeze(["low", "medium", "high", "xhigh", "max", "ultra"]);
@@ -69,7 +69,8 @@ export const KINDS = Object.freeze(["verify", "ask", "review", "implement"]);
 
 // Routing policy (owner's rule, updated 2026-10-27): light = 6.1 Terra at xhigh (benchmark 2026-10-27: Terra
 // xhigh found 5 of 12 known medium+ defects at 0.12 USD a run, Luna max 2 of 12; Terra max found 10 of 12 but costs
-// as much as Sol, so light stays at xhigh); 6.1 Sol at xhigh for every workload, including complex implementation.
+// as much as Sol, so the light tier default stays at xhigh; codex-review pass 1 asks for Terra at max itself, as an
+// explicit effort on the light tier); 6.1 Sol at xhigh for every workload, including complex implementation.
 // Sol max needs an explicit exceptional override; Astra max handles critical work. Luna is no tier model any more:
 // it stays usable as an explicit `model` (default effort max, see explicitModels) for mechanical, high-volume work.
 // `ultra` is never implicit.

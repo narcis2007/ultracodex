@@ -824,7 +824,7 @@ test("cross-review: an ambiguous batch answer is unverified and a dead finder ma
   assert.deepEqual(result.failedDimensions.map((x) => x.dimension), ["security"]);
 });
 
-test("codex-review defaults every lens including security to Sol and reports each model", async () => {
+test("codex-review pass 1 defaults every lens including security to Terra at max and reports each model and effort", async () => {
   const requests = [];
   let reportPrompt = null;
   const agent = async (prompt, opts) => {
@@ -841,23 +841,26 @@ test("codex-review defaults every lens including security to Sol and reports eac
   };
   const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "domain", "security"], fast: true } });
   assert.equal(result.status, "complete");
-  assert.equal(result.tier, "daily");
-  assert.deepEqual(requests.map(r => [r.label, r.model, r.effort, r.serviceTier]).sort(), [
-    ["codex:code", "gpt-6.1-sol", "xhigh", null],
-    ["codex:domain", "gpt-6.1-sol", "xhigh", null],
-    ["codex:security", "gpt-6.1-sol", "xhigh", null],
+  assert.equal(result.tier, "light");
+  assert.equal(result.effort, "max");
+  assert.deepEqual(requests.map(r => [r.label, r.tier, r.model, r.effort, r.serviceTier]).sort(), [
+    ["codex:code", "light", "gpt-6.1-terra", "max", null],
+    ["codex:domain", "light", "gpt-6.1-terra", "max", null],
+    ["codex:security", "light", "gpt-6.1-terra", "max", null],
   ]);
-  assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [
-    ["code", "daily", "gpt-6.1-sol"],
-    ["domain", "daily", "gpt-6.1-sol"],
-    ["security", "daily", "gpt-6.1-sol"],
+  assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model, l.effort]), [
+    ["code", "light", "gpt-6.1-terra", "max"],
+    ["domain", "light", "gpt-6.1-terra", "max"],
+    ["security", "light", "gpt-6.1-terra", "max"],
   ]);
   for (const lens of ["code", "domain", "security"]) {
-    assert.ok(reportPrompt.includes(JSON.stringify({ lens, tier: "daily", model: "gpt-6.1-sol" }).slice(0, -1)));
+    assert.ok(reportPrompt.includes(JSON.stringify({ lens, tier: "light", model: "gpt-6.1-terra", effort: "max" }).slice(0, -1)));
   }
+  assert.match(reportPrompt, /include the model and effort used for each lens/);
 });
 
 test("codex-review securityTier changes only security, with fast applying only to Astra", async () => {
+  // An explicit securityTier keeps its own default effort; the other lenses stay on the pass-1 default (terra@max).
   for (const [securityTier, model, effort] of [["light", "gpt-6.1-terra", "xhigh"], ["daily", "gpt-6.1-sol", "xhigh"], ["final", "gpt-6-astra", "max"]]) {
     for (const fast of [false, true]) {
       const requests = [];
@@ -873,18 +876,19 @@ test("codex-review securityTier changes only security, with fast applying only t
       };
       const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "domain", "security"], securityTier, fast } });
       assert.equal(result.status, "complete");
-      assert.equal(result.tier, "daily", "securityTier does not change the base tier");
+      assert.equal(result.tier, "light", "securityTier does not change the base tier");
+      assert.equal(result.effort, "max", "securityTier does not change the base effort");
       assert.deepEqual(requests.map(r => [r.label, r.model, r.effort, r.serviceTier]).sort(), [
-        ["codex:code", "gpt-6.1-sol", "xhigh", null],
-        ["codex:domain", "gpt-6.1-sol", "xhigh", null],
+        ["codex:code", "gpt-6.1-terra", "max", null],
+        ["codex:domain", "gpt-6.1-terra", "max", null],
         ["codex:security", model, effort, fast && securityTier === "final" ? "priority" : null],
       ]);
-      assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [
-        ["code", "daily", "gpt-6.1-sol"],
-        ["domain", "daily", "gpt-6.1-sol"],
-        ["security", securityTier, model],
+      assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model, l.effort]), [
+        ["code", "light", "gpt-6.1-terra", "max"],
+        ["domain", "light", "gpt-6.1-terra", "max"],
+        ["security", securityTier, model, effort],
       ]);
-      assert.ok(reportPrompt.includes(JSON.stringify({ lens: "security", tier: securityTier, model }).slice(0, -1)));
+      assert.ok(reportPrompt.includes(JSON.stringify({ lens: "security", tier: securityTier, model, effort }).slice(0, -1)));
     }
   }
 });
@@ -903,12 +907,13 @@ test("codex-review ignores invalid securityTier values", async () => {
     const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "security"], securityTier, fast: true } });
     assert.equal(result.status, "complete");
     assert.equal(requests.length, 2);
-    assert.deepEqual(requests.map(r => [r.model, r.effort, r.serviceTier]), Array(2).fill(["gpt-6.1-sol", "xhigh", null]));
-    assert.deepEqual(result.lenses.map(l => [l.tier, l.model]), Array(2).fill(["daily", "gpt-6.1-sol"]));
+    assert.deepEqual(requests.map(r => [r.model, r.effort, r.serviceTier]), Array(2).fill(["gpt-6.1-terra", "max", null]));
+    assert.deepEqual(result.lenses.map(l => [l.tier, l.model, l.effort]), Array(2).fill(["light", "gpt-6.1-terra", "max"]));
   }
 });
 
 test("codex-review: an explicit tier sets every lens, an explicit securityTier always sets the security lens", async () => {
+  // An explicit tier keeps its own default effort (light and daily xhigh, final max), also on pass 1.
   const MODEL = { light: ["gpt-6.1-terra", "xhigh"], daily: ["gpt-6.1-sol", "xhigh"], final: ["gpt-6-astra", "max"] };
   for (const tier of ["daily", "light", "final"]) {
     for (const securityTier of [undefined, "light", "daily", "final"]) {
@@ -925,15 +930,16 @@ test("codex-review: an explicit tier sets every lens, an explicit securityTier a
       const securityLensTier = securityTier ?? tier;
       assert.equal(result.status, "complete");
       assert.equal(result.tier, tier, "securityTier does not change the base tier");
+      assert.equal(result.effort, MODEL[tier][1]);
       assert.deepEqual(requests.map(r => [r.label, r.model, r.effort, r.serviceTier]).sort(), [
         ["codex:code", ...MODEL[tier], tier === "final" ? "priority" : null],
         ["codex:domain", ...MODEL[tier], tier === "final" ? "priority" : null],
         ["codex:security", ...MODEL[securityLensTier], securityLensTier === "final" ? "priority" : null],
       ]);
-      assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [
-        ["code", tier, MODEL[tier][0]],
-        ["domain", tier, MODEL[tier][0]],
-        ["security", securityLensTier, MODEL[securityLensTier][0]],
+      assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model, l.effort]), [
+        ["code", tier, ...MODEL[tier]],
+        ["domain", tier, ...MODEL[tier]],
+        ["security", securityLensTier, ...MODEL[securityLensTier]],
       ]);
     }
   }
@@ -955,30 +961,51 @@ async function reviewTiers(args, expectedRequests = 3) {
   return { result, requests };
 }
 
-test("codex-review pass 1 without tier reviews every lens on daily (Sol)", async () => {
+test("codex-review pass 1 without tier reviews every lens on light at max effort (Terra@max)", async () => {
   for (const args of [{}, { pass: 1 }]) {
     const { result, requests } = await reviewTiers(args);
-    assert.equal(result.tier, "daily");
-    assert.deepEqual(requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6.1-sol", "xhigh"]));
-    assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [["code", "daily", "gpt-6.1-sol"], ["domain", "daily", "gpt-6.1-sol"], ["security", "daily", "gpt-6.1-sol"]]);
+    assert.equal(result.tier, "light");
+    assert.equal(result.effort, "max");
+    assert.deepEqual(requests.map(r => [r.model, r.effort, r.tier]), Array(3).fill(["gpt-6.1-terra", "max", "light"]));
+    assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model, l.effort]), [["code", "light", "gpt-6.1-terra", "max"], ["domain", "light", "gpt-6.1-terra", "max"], ["security", "light", "gpt-6.1-terra", "max"]]);
   }
 });
 
-test("codex-review pass 2 and later without tier review every lens on light (Terra)", async () => {
-  for (const args of [{ pass: 2 }, { pass: 3 }, { pass: 4, ownerApproved: true }]) {
+test("codex-review pass 1 ignores an invalid tier and keeps the Terra@max default", async () => {
+  for (const tier of ["astra", "DAILY", "", null, false, 1, {}]) {
+    const { result, requests } = await reviewTiers({ tier });
+    assert.equal(result.tier, "light");
+    assert.equal(result.effort, "max");
+    assert.deepEqual(requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6.1-terra", "max"]));
+  }
+});
+
+test("codex-review pass 2 without tier reviews every lens on light at its default effort (Terra@xhigh); a pass above 2 needs the owner's OK", async () => {
+  for (const args of [{ pass: 2 }, { pass: 3, ownerApproved: true }, { pass: 4, ownerApproved: true }]) {
     const { result, requests } = await reviewTiers(args);
     assert.equal(result.tier, "light");
+    assert.equal(result.effort, "xhigh");
     assert.deepEqual(requests.map(r => [r.model, r.effort, r.tier]), Array(3).fill(["gpt-6.1-terra", "xhigh", "light"]));
-    assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [["code", "light", "gpt-6.1-terra"], ["domain", "light", "gpt-6.1-terra"], ["security", "light", "gpt-6.1-terra"]]);
+    assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model, l.effort]), [["code", "light", "gpt-6.1-terra", "xhigh"], ["domain", "light", "gpt-6.1-terra", "xhigh"], ["security", "light", "gpt-6.1-terra", "xhigh"]]);
   }
 });
 
-test("codex-review priorFindings without pass is pass 2 and reviews on light", async () => {
+test("codex-review priorFindings without pass is pass 2 and reviews on light at xhigh", async () => {
   const { result, requests } = await reviewTiers({ priorFindings: "code:1 fixed by validating the caller" });
   assert.equal(result.rereview.pass, 2);
   assert.equal(result.tier, "light");
   assert.deepEqual(requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6.1-terra", "xhigh"]));
-  assert.deepEqual(result.lenses.map(l => [l.tier, l.model]), Array(3).fill(["light", "gpt-6.1-terra"]));
+  assert.deepEqual(result.lenses.map(l => [l.tier, l.model, l.effort]), Array(3).fill(["light", "gpt-6.1-terra", "xhigh"]));
+});
+
+test("codex-review: an explicit tier on pass 1 keeps its own default effort (light is the quick Terra@xhigh pass)", async () => {
+  for (const [tier, model, effort] of [["light", "gpt-6.1-terra", "xhigh"], ["daily", "gpt-6.1-sol", "xhigh"], ["final", "gpt-6-astra", "max"]]) {
+    const { result, requests } = await reviewTiers({ tier });
+    assert.equal(result.tier, tier);
+    assert.equal(result.effort, effort);
+    assert.deepEqual(requests.map(r => [r.model, r.effort]), Array(3).fill([model, effort]));
+    assert.deepEqual(result.lenses.map(l => [l.tier, l.model, l.effort]), Array(3).fill([tier, model, effort]));
+  }
 });
 
 test("codex-review pass 2 with an explicit tier keeps that tier on every lens", async () => {
@@ -986,7 +1013,7 @@ test("codex-review pass 2 with an explicit tier keeps that tier on every lens", 
     const { result, requests } = await reviewTiers({ pass: 2, tier });
     assert.equal(result.tier, tier);
     assert.deepEqual(requests.map(r => [r.model, r.effort]), Array(3).fill([model, effort]));
-    assert.deepEqual(result.lenses.map(l => [l.tier, l.model]), Array(3).fill([tier, model]));
+    assert.deepEqual(result.lenses.map(l => [l.tier, l.model, l.effort]), Array(3).fill([tier, model, effort]));
   }
 });
 
@@ -997,7 +1024,7 @@ test("codex-review pass 2 with tier daily and securityTier final: other lenses o
     ["codex:code", "gpt-6.1-sol", "xhigh"],
     ["codex:security", "gpt-6-astra", "max"],
   ]);
-  assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [["code", "daily", "gpt-6.1-sol"], ["security", "final", "gpt-6-astra"]]);
+  assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model, l.effort]), [["code", "daily", "gpt-6.1-sol", "xhigh"], ["security", "final", "gpt-6-astra", "max"]]);
   assert.equal(result.rereview.securityTier, "final");
 });
 
@@ -1005,7 +1032,7 @@ test("codex-review pass 2 ignores an invalid tier and falls back to light", asyn
   for (const tier of ["astra", "DAILY", "", null, false, 1, {}]) {
     const { result } = await reviewTiers({ pass: 2, tier });
     assert.equal(result.tier, "light");
-    assert.deepEqual(result.lenses.map(l => [l.tier, l.model]), Array(3).fill(["light", "gpt-6.1-terra"]));
+    assert.deepEqual(result.lenses.map(l => [l.tier, l.model, l.effort]), Array(3).fill(["light", "gpt-6.1-terra", "xhigh"]));
   }
 });
 
@@ -1018,12 +1045,64 @@ test("codex-review pass 2 without tier: securityTier still sets only the securit
       ["codex:domain", "gpt-6.1-terra", "xhigh"],
       ["codex:security", model, effort],
     ]);
-    assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model]), [
-      ["code", "light", "gpt-6.1-terra"],
-      ["domain", "light", "gpt-6.1-terra"],
-      ["security", securityTier, model],
+    assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model, l.effort]), [
+      ["code", "light", "gpt-6.1-terra", "xhigh"],
+      ["domain", "light", "gpt-6.1-terra", "xhigh"],
+      ["security", securityTier, model, effort],
     ]);
   }
+});
+
+test("codex-review effort: sets every lens that is not on tier final, never changes Astra, invalid values are ignored", async () => {
+  // no tier, pass 1: the effort replaces the Terra@max default on every lens, security included
+  for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
+    const { result, requests } = await reviewTiers({ effort });
+    assert.equal(result.tier, "light");
+    assert.equal(result.effort, effort);
+    assert.deepEqual(requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6.1-terra", effort]));
+    assert.deepEqual(result.lenses.map(l => [l.tier, l.model, l.effort]), Array(3).fill(["light", "gpt-6.1-terra", effort]));
+  }
+  // pass 2 without tier: light at the given effort
+  const pass2 = await reviewTiers({ pass: 2, effort: "high" });
+  assert.deepEqual(pass2.requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6.1-terra", "high"]));
+  // an explicit tier: the effort applies to it, Sol too
+  const daily = await reviewTiers({ tier: "daily", effort: "max" });
+  assert.deepEqual(daily.requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6.1-sol", "max"]));
+  assert.equal(daily.result.effort, "max");
+  // a lens that an explicit securityTier sets takes the effort too, unless it is on final
+  const split = await reviewTiers({ securityTier: "daily", effort: "high", lenses: ["code", "security"] }, 2);
+  assert.deepEqual(split.requests.map(r => [r.label, r.model, r.effort]).sort(), [["codex:code", "gpt-6.1-terra", "high"], ["codex:security", "gpt-6.1-sol", "high"]]);
+  // astra never takes the effort: tier final and securityTier final stay at max
+  const final = await reviewTiers({ tier: "final", effort: "low" });
+  assert.deepEqual(final.requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6-astra", "max"]));
+  assert.equal(final.result.effort, "max");
+  const securityFinal = await reviewTiers({ securityTier: "final", effort: "low", lenses: ["code", "security"] }, 2);
+  assert.deepEqual(securityFinal.requests.map(r => [r.label, r.model, r.effort]).sort(), [["codex:code", "gpt-6.1-terra", "low"], ["codex:security", "gpt-6-astra", "max"]]);
+  assert.deepEqual(securityFinal.result.lenses.map(l => [l.lens, l.model, l.effort]), [["code", "gpt-6.1-terra", "low"], ["security", "gpt-6-astra", "max"]]);
+  // invalid values are ignored like the other args: the pass default stays (max on pass 1, xhigh on pass 2)
+  for (const effort of ["ultra", "MAX", "", null, false, 1, {}, ["max"]]) {
+    const one = await reviewTiers({ effort });
+    assert.deepEqual(one.requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6.1-terra", "max"]), `effort ${JSON.stringify(effort)} on pass 1`);
+    const two = await reviewTiers({ pass: 2, effort });
+    assert.deepEqual(two.requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6.1-terra", "xhigh"]), `effort ${JSON.stringify(effort)} on pass 2`);
+  }
+});
+
+test("a terra@max review lens keeps the runner's 45-minute deadline and is accepted by the runner policy", async () => {
+  const seen = [];
+  const agent = async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      seen.push(request);
+      return okEnvelope(request, { verdict: "approve", summary: "clean", findings: [] });
+    }
+    return opts.label === "report" ? "FINAL" : null;
+  };
+  await runWorkflow("codex-review", { agent, args: { lenses: ["code"] } });
+  assert.equal(seen.length, 1);
+  assert.deepEqual([seen[0].model, seen[0].effort, seen[0].kind], ["gpt-6.1-terra", "max", "review"]);
+  assert.equal(seen[0].timeoutSec, 2700, "max has effort factor 1 like xhigh, and Terra has model factor 1");
+  assert.equal(seen[0].maxAttempts, 2);
 });
 
 for (const securityTier of [undefined, "final"]) test(`codex-review escalates only non-Astra findings (securityTier: ${securityTier ?? "default"})`, async () => {
@@ -1043,22 +1122,22 @@ for (const securityTier of [undefined, "final"]) test(`codex-review escalates on
     if (opts.label?.startsWith("triage:")) return { verdict: "refuted", reasoning: "guarded" };
     return opts.label === "report" ? "FINAL" : null;
   };
-  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "security"], securityTier } });
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "security"], securityTier, escalate: true } });
   assert.equal(result.status, "complete");
   assert.equal(requests.length, 3, "two reviews and one narrow tiebreak");
   assert.deepEqual(requests.map(r => [r.label, r.model]).sort(), [
-    ["codex:code", "gpt-6.1-sol"],
+    ["codex:code", "gpt-6.1-terra"],
     ["codex:escalate", "gpt-6-astra"],
-    ["codex:security", securityTier === "final" ? "gpt-6-astra" : "gpt-6.1-sol"],
+    ["codex:security", securityTier === "final" ? "gpt-6-astra" : "gpt-6.1-terra"],
   ]);
   const expected = securityTier === "final" ? ["code:1"] : ["code:1", "security:1"];
-  assert.deepEqual(escalated.map(f => f.id), expected, "Sol security findings escalate; Astra security findings are excluded");
+  assert.deepEqual(escalated.map(f => f.id), expected, "Terra security findings escalate; Astra security findings are excluded");
   assert.deepEqual(result.disputed.map(f => f.id), expected);
   assert.deepEqual(result.refuted.map(f => f.id), securityTier === "final" ? ["security:1"] : []);
   assert.deepEqual(result.escalation, { ran: true, checked: expected.length, upheld: expected.length, settled: 0, failed: 0 });
 });
 
-test("a failed default security lens keeps its Sol routing and reports incomplete", async () => {
+test("a failed default security lens keeps its Terra@max routing and reports incomplete", async () => {
   const requests = [];
   const agent = async (prompt, opts) => {
     if (opts.agentType === RELAY) {
@@ -1070,9 +1149,10 @@ test("a failed default security lens keeps its Sol routing and reports incomplet
   };
   const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["security"] } });
   assert.equal(result.status, "incomplete");
-  assert.deepEqual(requests.map(r => [r.model, r.effort]), [["gpt-6.1-sol", "xhigh"]]);
-  assert.deepEqual(result.lenses, [{ lens: "security", tier: "daily", model: "gpt-6.1-sol", verdict: null, error: "timeout" }]);
-  assert.deepEqual(result.escalation, { ran: false, checked: 0, upheld: 0, settled: 0, failed: 0 }, "no findings to escalate from a failed lens");
+  assert.deepEqual(requests.map(r => [r.model, r.effort]), [["gpt-6.1-terra", "max"]]);
+  assert.deepEqual(result.lenses, [{ lens: "security", tier: "light", model: "gpt-6.1-terra", effort: "max", verdict: null, error: "timeout" }]);
+  assert.equal(result.escalation, null, "the astra tiebreak is off by default");
+  assert.deepEqual(result.notCrossChecked, [], "no findings from a failed lens");
 });
 
 test("codex-review triages on Haiku at high effort by default, and the owner can change it", async () => {
@@ -1146,7 +1226,7 @@ test("a failed escalation leaves contested findings unresolved and the review in
     if (opts.label === "report") return "FINAL";
     return null;
   };
-  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"] } });
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"], escalate: true } });
   assert.equal(result.status, "incomplete");
   assert.deepEqual(result.needsInfo.map((f) => [f.id, f.escalation.error]), [["code:1", "auth"]]);
   assert.deepEqual(result.refuted.map((f) => f.id), ["code:2"], "only the uncontested low finding stays refuted");
@@ -1203,7 +1283,7 @@ test("codex-review escalates high/critical disagreements to astra in one run: up
           ],
         });
       }
-      assert.equal(request.model, "gpt-6.1-sol");
+      assert.equal(request.model, "gpt-6.1-terra");
       // two findings share Codex's id "dup": positional ids keep both
       const f = (id, severity) => ({ id, severity, category: "c", title: "t-" + severity, file: "x.rs", line: 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.7 });
       return okEnvelope(request, { verdict: "request_changes", summary: "sum", findings: [f("dup", "critical"), f("dup", "high"), f("z", "low"), f("y", "high")] });
@@ -1215,13 +1295,14 @@ test("codex-review escalates high/critical disagreements to astra in one run: up
     if (opts.label === "report") return "FINAL";
     return null;
   };
-  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"] } });
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"], escalate: true } });
   assert.deepEqual(escalated.map((item) => item.id), ["code:1", "code:2"], "only contested high/critical findings go to astra");
   assert.equal(escalated[0].claude_triage, "Claude: cannot happen", "astra sees why Claude doubted it");
   assert.deepEqual(result.confirmed.map((f) => f.id), ["code:4"]);
   assert.deepEqual(result.disputed.map((f) => f.id), ["code:1"]);
   assert.deepEqual(result.refuted.map((f) => [f.id, f.why]), [["code:2", "gpt-6-astra: validated upstream"], ["code:3", "Claude: low and wrong"]]);
   assert.deepEqual(result.escalation, { ran: true, checked: 2, upheld: 1, settled: 1, failed: 0 });
+  assert.deepEqual(result.notCrossChecked, [], "with the tiebreak on, every contested finding was cross-checked");
   assert.equal(result.status, "complete");
 });
 
@@ -1250,7 +1331,7 @@ test("codex-review ranks by Claude's own severity, keeps Codex's beside it, and 
     }
     return null;
   };
-  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"] } });
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"], escalate: true } });
   assert.deepEqual(result.confirmed.map((f) => [f.id, f.severity, f.codexSeverity]), [["code:2", "high", "low"], ["code:1", "medium", "high"]], "ranked by Claude's rating, Codex's kept beside it");
   assert.deepEqual(result.severityChanges.map((c) => [c.id, c.codex, c.claude, c.why]), [
     ["code:2", "low", "high", "any caller can trigger it"],
@@ -1282,20 +1363,22 @@ for (const c of [
   { name: "untriaged low", args: { triage: false }, findings: [["low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
   { name: "untriaged medium", args: { triage: false }, findings: [["medium"]], worst: "medium", recommendation: "delta", tier: "light", nextPass: 2 },
   { name: "untriaged highest severity", args: { triage: false }, findings: [["low"], ["high"], ["medium"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
-  { name: "pass 2 medium", args: { pass: 2 }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "delta", tier: "light", nextPass: 3 },
-  { name: "pass 2 high", args: { pass: 2 }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 3 },
-  { name: "pass 2 critical after an explicit daily pass", args: { pass: 2, tier: "daily" }, findings: [["critical", "confirmed", "critical"]], worst: "critical", recommendation: "delta", tier: "light", nextPass: 3 },
-  { name: "pass 2 high after a final pass keeps final", args: { pass: 2, tier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "final", nextPass: 3 },
-  { name: "pass 3 low", args: { pass: 3 }, findings: [["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
-  { name: "pass 3 medium stops", args: { pass: 3 }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "none", tier: null, nextPass: null },
-  { name: "pass 3 high needs owner", args: { pass: 3 }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "owner", tier: null, nextPass: null },
-  { name: "pass 3 critical needs owner", args: { pass: 3 }, findings: [["critical", "confirmed", "critical"]], worst: "critical", recommendation: "owner", tier: null, nextPass: null },
-  { name: "approved pass 4 low stops", args: { pass: 4, ownerApproved: true }, findings: [["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
-  { name: "approved pass 4 medium stops", args: { pass: 4, ownerApproved: true }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "none", tier: null, nextPass: null },
-  { name: "approved pass 4 high still needs owner", args: { pass: 4, ownerApproved: true }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "owner", tier: null, nextPass: null },
+  { name: "pass 2 medium stops at the cap", args: { pass: 2 }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "none", tier: null, nextPass: null },
+  { name: "pass 2 high needs the owner", args: { pass: 2 }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "owner", tier: null, nextPass: null },
+  { name: "pass 2 critical after an explicit daily pass needs the owner", args: { pass: 2, tier: "daily" }, findings: [["critical", "confirmed", "critical"]], worst: "critical", recommendation: "owner", tier: null, nextPass: null },
+  { name: "pass 2 high after a final pass needs the owner", args: { pass: 2, tier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "owner", tier: null, nextPass: null },
+  { name: "pass 2 low", args: { pass: 2 }, findings: [["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
+  { name: "pass 1 refuted high that is not cross-checked does not count", findings: [["high", "refuted", "high"]], worst: "none", recommendation: "none", tier: null, nextPass: null },
+  { name: "pass 2 refuted high that is not cross-checked does not count", args: { pass: 2 }, findings: [["high", "refuted", "high"]], worst: "none", recommendation: "none", tier: null, nextPass: null },
+  { name: "pass 2 medium after a final pass stops", args: { pass: 2, tier: "final" }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "none", tier: null, nextPass: null },
+  { name: "pass 2 needs-info high counts as unresolved and needs the owner", args: { pass: 2 }, findings: [["high", "needs_info", "low"]], worst: "high", recommendation: "owner", tier: null, nextPass: null },
+  { name: "pass 2 disputed critical needs the owner", args: { pass: 2, escalate: true }, findings: [["critical", "refuted", "low"]], worst: "critical", recommendation: "owner", tier: null, nextPass: null },
+  { name: "approved pass 3 low stops", args: { pass: 3, ownerApproved: true }, findings: [["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, nextPass: null },
+  { name: "approved pass 3 medium stops", args: { pass: 3, ownerApproved: true }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "none", tier: null, nextPass: null },
+  { name: "approved pass 3 high still needs owner", args: { pass: 3, ownerApproved: true }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "owner", tier: null, nextPass: null },
   { name: "securityTier final is echoed for the next pass (high)", args: { lenses: ["code", "security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
   { name: "securityTier final is echoed for the next pass (medium)", args: { lenses: ["code", "security"], securityTier: "final" }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
-  { name: "securityTier final is echoed on pass 2", args: { pass: 2, lenses: ["code", "security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 3 },
+  { name: "securityTier final is echoed on pass 2 (owner decides)", args: { pass: 2, lenses: ["code", "security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "owner", tier: null, securityTier: "final", nextPass: null },
   { name: "securityTier daily is echoed for the next pass", args: { lenses: ["code", "security"], securityTier: "daily" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "daily", nextPass: 2 },
   { name: "securityTier is echoed by a run without a security lens", args: { lenses: ["code", "domain"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
   { name: "securityTier is echoed by a security-only run", args: { lenses: ["security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", securityTier: "final", nextPass: 2 },
@@ -1306,8 +1389,8 @@ for (const c of [
   { name: "an invalid securityTier is null", args: { lenses: ["code", "security"], securityTier: "astra" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "delta", tier: "light", nextPass: 2 },
   { name: "securityTier is echoed when the review is clean", args: { lenses: ["code", "security"], securityTier: "final" }, findings: [], worst: "none", recommendation: "none", tier: null, securityTier: "final", nextPass: null },
   { name: "securityTier is echoed when only low findings remain", args: { lenses: ["code", "security"], securityTier: "final" }, findings: [["low", "confirmed", "low"]], worst: "low", recommendation: "none", tier: null, securityTier: "final", nextPass: null },
-  { name: "securityTier is echoed at the pass cap with a medium", args: { pass: 3, lenses: ["code", "security"], securityTier: "final" }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "none", tier: null, securityTier: "final", nextPass: null },
-  { name: "securityTier is echoed when the owner decides", args: { pass: 3, lenses: ["code", "security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "owner", tier: null, securityTier: "final", nextPass: null },
+  { name: "securityTier is echoed at the pass cap with a medium", args: { pass: 2, lenses: ["code", "security"], securityTier: "final" }, findings: [["medium", "confirmed", "medium"]], worst: "medium", recommendation: "none", tier: null, securityTier: "final", nextPass: null },
+  { name: "securityTier is echoed when the owner decides", args: { pass: 2, lenses: ["code", "security"], securityTier: "final" }, findings: [["high", "confirmed", "high"]], worst: "high", recommendation: "owner", tier: null, securityTier: "final", nextPass: null },
 ]) test(`codex-review re-review: ${c.name}`, async () => {
   let reportPrompt = null;
   const agent = async (prompt, opts) => {
@@ -1340,16 +1423,20 @@ for (const c of [
   if (c.worst === "low" || c.worst === "none") {
     assert.match(reason, /No re-review; fix only low findings that take a few lines and are obviously correct; list the rest as follow-ups/);
   } else if (c.recommendation === "none") {
-    assert.match(reason, /cap of 3.*fix and verify without another pass.*known limits/);
+    assert.match(reason, /cap of 2.*fix and verify \(tests, diff\) without another pass.*known limits/);
   } else if (c.recommendation === "owner") {
-    assert.match(reason, /cap of 3.*do not ship.*owner.*ownerApproved: true/);
+    assert.match(reason, /cap of 2.*do not ship.*owner.*ownerApproved: true/);
+    assert.match(reason, args.pass === 2 ? /decides about a third pass/ : /decides about another pass/);
   } else {
+    assert.equal(c.nextPass, 2, "only pass 1 asks for a delta pass; the cap of 2 stops every later pass");
+    assert.equal(args.pass ?? 1, 1);
     assert.match(reason, /Fix and verify.*only the fix delta.*base = the commit this pass reviewed.*priorFindings/);
     assert.ok(reason.includes("at tier " + c.tier + " with priorFindings"));
     if (c.tier === "light") {
-      assert.match(reason, /daily instead of light.*50 changed lines.*3 files.*fix changed the design.*full re-review only for a large or design-changing fix/);
+      assert.match(reason, /Pass effort: 'max' \(the tier stays light\).*50 changed lines.*3 files.*fix changed the design.*full re-review only for a large or design-changing fix/);
+      assert.doesNotMatch(reason, /daily instead|use daily|move to daily/i, "a large delta after a non-final pass stays on light with effort max, never on daily");
     } else {
-      assert.doesNotMatch(reason, /instead of light|50 changed lines|3 files/);
+      assert.doesNotMatch(reason, /effort: 'max'|50 changed lines|3 files/);
       assert.match(reason, /full re-review only when the fix was large or changed the design/);
     }
   }
@@ -1363,12 +1450,167 @@ for (const c of [
     ? `delta (pass ${c.nextPass}, tier ${c.tier}${c.securityTier ? `, securityTier ${c.securityTier}` : ""}, base = the commit this pass reviewed)`
     : c.recommendation === "owner" ? "owner decides" : "none";
   const line = `Re-review: ${advice} — ${reason}`;
-  assert.match(reportPrompt, /Do not write a Re-review: line; the workflow adds it/);
+  assert.match(reportPrompt, /Do not write a Re-review: line or a Not cross-checked: line; the workflow adds them/);
   assert.doesNotMatch(reportPrompt, /^Re-review:/m);
   assert.match(reportPrompt, /Merge findings that describe the same defect.*same root cause.*list all their ids/);
   assert.match(reportPrompt, /low findings as optional.*few lines.*obviously correct.*follow-ups/);
-  assert.equal(result.report, "FINAL\n\n" + line);
+  // a high/critical finding (by Codex's rating) that Claude refuted or left open, with no astra tiebreak, is listed
+  const contested = c.findings.map(([severity, verdict], i) => ({ severity, verdict, id: "code:" + (i + 1) }))
+    .filter(f => ["critical", "high"].includes(f.severity) && ["refuted", "needs_info"].includes(f.verdict));
+  const listed = args.escalate === true || args.triage === false ? [] : contested;
+  assert.deepEqual(result.notCrossChecked.map(f => f.id), listed.map(f => f.id));
+  const them = listed.length === 1 ? "it" : "them";
+  const notChecked = listed.length
+    ? "Not cross-checked (escalate is off): " + listed.map(f => f.id + " (" + (f.verdict === "needs_info" ? "needs-info" : "refuted") + ")").join(", ")
+      + " — Codex rated " + them + " high or critical, the Claude triage refuted or could not settle " + them + ", and no astra tiebreak ran. Check " + them + " in the code, or ask the owner for an astra run.\n\n"
+    : "";
+  assert.equal(result.report, "FINAL\n\n" + notChecked + line);
+  assert.equal(result.escalation, args.escalate === true ? result.escalation : null, "no astra tiebreak without escalate: true");
   if (c.name.startsWith("disputed")) assert.equal(result.disputed.length, 1);
+});
+
+// Stub for the escalation tests: one lens review with the given Codex findings; Claude's triage verdicts come from `triage`.
+function escalationStub({ findings, triage, requests = [], prompts = {}, astra = null }) {
+  return async (prompt, opts) => {
+    if (opts.agentType === RELAY) {
+      const { request } = receive(prompt);
+      requests.push(request);
+      if (request.label === "codex:escalate") {
+        const items = JSON.parse(request.task.slice(request.task.indexOf("INPUT ITEMS (JSON):") + "INPUT ITEMS (JSON):".length));
+        return okEnvelope(request, { results: items.map(f => ({ id: f.id, refuted: astra === "refute", confidence: 0.9, reasoning: "astra read the code" })) });
+      }
+      const list = request.label === "codex:security" ? [{ severity: "high", verdict: "refuted" }] : findings;
+      return okEnvelope(request, {
+        verdict: "request_changes", summary: "sum",
+        findings: list.map(({ severity }, i) => ({ id: "f" + i, severity, category: "c", title: "defect " + (i + 1), file: "x.rs", line: i + 1, evidence: "e", failure_scenario: "s", recommendation: "r", confidence: 0.7 })),
+      });
+    }
+    if (opts.label?.startsWith("triage:")) {
+      const lens = opts.label.split(":")[1];
+      const index = Number(opts.label.split(":")[2]) - 1;
+      const entry = lens === "security" ? { verdict: "refuted", severity: "high" } : triage[index];
+      return { verdict: entry.verdict, severity: entry.claudeSeverity ?? entry.severity, severityReason: "", reasoning: "Claude: " + entry.verdict + " " + (index + 1) };
+    }
+    if (opts.label === "report") { prompts.report = prompt; return "OVERALL: see below"; }
+    return null;
+  };
+}
+
+test("codex-review runs no astra tiebreak by default and lists the high/critical findings Claude doubted as not cross-checked", async () => {
+  const requests = [];
+  const prompts = {};
+  const findings = [
+    { severity: "high", verdict: "refuted" },
+    { severity: "critical", verdict: "needs_info", claudeSeverity: "medium" },
+    { severity: "high", verdict: "confirmed" },
+    { severity: "medium", verdict: "refuted" },
+    { severity: "low", verdict: "needs_info" },
+  ];
+  const agent = escalationStub({ findings, triage: findings, requests, prompts });
+  const run = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "security"], securityTier: "final" } });
+  const { result } = run;
+  assert.equal(result.status, "complete");
+  assert.deepEqual(requests.map(r => r.label).sort(), ["codex:code", "codex:security"], "no codex:escalate request");
+  assert.equal(result.escalation, null);
+  assert.equal(run.phases.includes("Escalate"), false, "the Escalate phase does not start");
+  // only the high/critical (by Codex) findings of a non-Astra lens that Claude refuted or left open
+  assert.deepEqual(result.notCrossChecked.map(f => [f.id, f.codexSeverity, f.claudeVerdict, f.claudeSeverity, f.why, f.triageFailed]), [
+    ["code:1", "high", "refuted", "high", "Claude: refuted 1", false],
+    ["code:2", "critical", "needs_info", "medium", "Claude: needs_info 2", false],
+  ]);
+  assert.deepEqual(result.notCrossChecked.map(f => [f.title, f.file, f.line]), [["defect 1", "x.rs", 1], ["defect 2", "x.rs", 2]]);
+  // they stay in refuted / needsInfo as before, and the Astra security finding is not listed (Astra found it)
+  assert.deepEqual(result.refuted.map(f => f.id), ["code:1", "code:4", "security:1"]);
+  assert.deepEqual(result.needsInfo.map(f => f.id), ["code:2", "code:5"]);
+  assert.deepEqual(result.disputed, []);
+  // a needs-info high/critical finding still counts as unresolved: worst is critical (Codex's rating), carried for the next pass
+  assert.equal(result.rereview.worst, "critical");
+  assert.deepEqual(result.rereview.carry.map(f => [f.id, f.status, f.severity]), [["code:3", "confirmed", "high"], ["code:2", "needs_info", "critical"], ["code:5", "needs_info", "low"]]);
+  // the report prompt names them once, in their own section, and keeps the verdict rule for needs-info
+  assert.match(prompts.report, /NOT CROSS-CHECKED high\/critical findings/);
+  assert.match(prompts.report, /no second model family looked at them/);
+  assert.match(prompts.report, /ask the owner for an astra run/);
+  assert.match(prompts.report, /left out of the REFUTED and NEEDS-INFO lists below/);
+  const refutedSection = prompts.report.slice(prompts.report.indexOf("REFUTED findings (one line each"));
+  assert.ok(!refutedSection.includes('"code:1"') && refutedSection.includes('"code:4"') && refutedSection.includes('"security:1"'));
+  const needsSection = prompts.report.slice(prompts.report.indexOf("NEEDS-INFO findings"), prompts.report.indexOf("REFUTED findings (one line each"));
+  assert.ok(!needsSection.includes('"code:2"') && needsSection.includes('"code:5"'));
+  assert.match(prompts.report, /still counts as unresolved in the verdict/);
+  // the workflow adds the line itself, before the re-review line
+  const line = "Not cross-checked (escalate is off): code:1 (refuted), code:2 (needs-info) — Codex rated them high or critical, the Claude triage refuted or could not settle them, and no astra tiebreak ran. Check them in the code, or ask the owner for an astra run.";
+  assert.equal(result.report, "OVERALL: see below\n\n" + line + "\n\n" + "Re-review: delta (pass 2, tier light, securityTier final, base = the commit this pass reviewed) — " + result.rereview.reason);
+  assert.ok(run.logs.some(message => /2 high\/critical finding\(s\) NOT cross-checked/.test(message)));
+});
+
+test("codex-review escalate is opt-in: only the boolean true runs the astra tiebreak", async () => {
+  const findings = [{ severity: "high", verdict: "refuted" }];
+  for (const escalate of [undefined, false, null, "true", 1, {}, ["true"]]) {
+    const requests = [];
+    const { result } = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings, requests }), args: { lenses: ["code"], escalate } });
+    assert.deepEqual(requests.map(r => r.label), ["codex:code"], `escalate ${JSON.stringify(escalate)} does not escalate`);
+    assert.equal(result.escalation, null);
+    assert.deepEqual(result.notCrossChecked.map(f => f.id), ["code:1"]);
+    assert.deepEqual(result.refuted.map(f => f.id), ["code:1"]);
+  }
+  for (const astra of ["uphold", "refute"]) {
+    const requests = [];
+    const { result } = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings, requests, astra }), args: { lenses: ["code"], escalate: true } });
+    assert.deepEqual(requests.map(r => [r.label, r.model, r.effort]).sort(), [["codex:code", "gpt-6.1-terra", "max"], ["codex:escalate", "gpt-6-astra", "max"]]);
+    assert.deepEqual(result.escalation, { ran: true, checked: 1, upheld: astra === "uphold" ? 1 : 0, settled: astra === "refute" ? 1 : 0, failed: 0 });
+    assert.deepEqual(result.notCrossChecked, [], "nothing is left unchecked when the tiebreak ran");
+    assert.deepEqual(result.disputed.map(f => f.id), astra === "uphold" ? ["code:1"] : []);
+    assert.ok(!/Not cross-checked/.test(result.report));
+  }
+});
+
+test("codex-review not cross-checked: only Codex high/critical findings of non-Astra lenses with a refuted or open triage, a failed triage included", async () => {
+  // triage off: nothing was judged, so nothing is listed (the findings are reported as untriaged)
+  const findings = [{ severity: "high", verdict: "refuted" }, { severity: "low", verdict: "refuted" }, { severity: "medium", verdict: "needs_info" }];
+  const off = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings }), args: { lenses: ["code"], triage: false } });
+  assert.deepEqual(off.result.notCrossChecked, []);
+  assert.deepEqual(off.result.untriaged.map(f => f.id), ["code:1", "code:2", "code:3"]);
+  assert.ok(!/Not cross-checked/.test(off.result.report));
+  // every lens on Astra: Astra found them, no second look can come from an astra tiebreak
+  const final = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings }), args: { lenses: ["code"], tier: "final" } });
+  assert.deepEqual(final.result.notCrossChecked, []);
+  // a triage that failed leaves the finding needs-info: listed, and marked
+  const base = escalationStub({ findings, triage: findings });
+  const failing = async (prompt, opts) => {
+    if (opts.label === "triage:code:1") throw new Error("triage agent died");
+    return base(prompt, opts);
+  };
+  const failed = await runWorkflow("codex-review", { agent: failing, args: { lenses: ["code"] } });
+  assert.equal(failed.result.status, "incomplete");
+  assert.deepEqual(failed.result.notCrossChecked.map(f => [f.id, f.claudeVerdict, f.triageFailed]), [["code:1", "needs_info", true]]);
+  assert.equal(failed.result.rereview.worst, "high");
+});
+
+test("codex-review replaces a stale Not cross-checked line written by the report agent", async () => {
+  const findings = [{ severity: "critical", verdict: "refuted" }];
+  const base = escalationStub({ findings, triage: findings });
+  const agent = async (prompt, opts) => opts.label === "report" ? "OVERALL: ship\n\nNot cross-checked: made up\nRe-review: wrong\n\n" : base(prompt, opts);
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"] } });
+  assert.equal(result.report.split("\n").filter(line => line.startsWith("Not cross-checked")).length, 1);
+  assert.equal(result.report.split("\n").filter(line => line.startsWith("Re-review:")).length, 1);
+  assert.match(result.report, /^OVERALL: ship\n\nNot cross-checked \(escalate is off\): code:1 \(refuted\) — Codex rated it high or critical, the Claude triage refuted or could not settle it, and no astra tiebreak ran\. Check it in the code, or ask the owner for an astra run\.\n\nRe-review: none — /);
+});
+
+test("codex-review at the cap of 2: pass 2 with a high finding open goes to the owner, an approved pass 3 is still allowed to run", async () => {
+  const findings = [{ severity: "high", verdict: "confirmed" }];
+  const pass2 = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings }), args: { lenses: ["code"], pass: 2 } });
+  assert.equal(pass2.result.rereview.recommendation, "owner");
+  assert.equal(pass2.result.rereview.nextPass, null);
+  assert.match(pass2.result.rereview.reason, /^The cap of 2 review passes is reached with a high or critical finding open; do not ship\. The owner decides about a third pass with ownerApproved: true\.$/);
+  assert.match(pass2.result.report, /Re-review: owner decides — The cap of 2 review passes/);
+  const medium = [{ severity: "medium", verdict: "confirmed" }];
+  const pass2Medium = await runWorkflow("codex-review", { agent: escalationStub({ findings: medium, triage: medium }), args: { lenses: ["code"], pass: 2 } });
+  assert.equal(pass2Medium.result.rereview.recommendation, "none");
+  assert.equal(pass2Medium.result.rereview.reason, "The cap of 2 review passes is reached; fix and verify (tests, diff) without another pass, or document the findings as known limits.");
+  const pass3 = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings }), args: { lenses: ["code"], pass: 3, ownerApproved: true } });
+  assert.equal(pass3.result.status, "complete");
+  assert.equal(pass3.result.rereview.pass, 3);
+  assert.equal(pass3.result.rereview.recommendation, "owner");
+  assert.match(pass3.result.rereview.reason, /decides about another pass/);
 });
 
 test("codex-review carries confirmed, disputed and needs-info findings in stable order, excluding refuted ones", async () => {
@@ -1395,7 +1637,7 @@ test("codex-review carries confirmed, disputed and needs-info findings in stable
     }
     return opts.label === "report" ? "FINAL" : null;
   };
-  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"] } });
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"], escalate: true } });
   assert.deepEqual(result.rereview.carry, [
     { id: "code:5", status: "confirmed", severity: "high", title: "finding e", file: "a.ts", line: 5 },
     { id: "code:1", status: "confirmed", severity: "low", title: "finding a", file: "a.ts", line: 1 },
@@ -1459,15 +1701,15 @@ test("codex-review preserves empty and non-string reports without crashing", asy
   }
 });
 
-test("codex-review refuses a pass above 3 without the owner's boolean approval before any agent call", async () => {
+test("codex-review refuses a pass above 2 without the owner's boolean approval before any agent call", async () => {
   const body = workflowSource("codex-review").replace(/^export const meta =/m, "const meta =");
   const fn = new AsyncFunction("agent", "args", body);
   let calls = 0;
   const agent = async () => { calls++; return null; };
-  for (const pass of [4, 5]) {
+  for (const pass of [3, 4, 5]) {
     for (const ownerApproved of [undefined, false, "true", 1, {}]) {
       await assert.rejects(fn(agent, { pass, ownerApproved }), {
-        message: `codex-review: pass ${pass} exceeds the cap of 3 review passes per change; a further pass needs the owner's OK (args.ownerApproved: true)`,
+        message: `codex-review: pass ${pass} exceeds the cap of 2 review passes per change; a further pass needs the owner's OK (args.ownerApproved: true)`,
       });
     }
   }
@@ -1501,11 +1743,11 @@ test("codex-review re-runs only failed lenses on the same scope and pass before 
     if (opts.label?.startsWith("triage:")) return { verdict: "confirmed", severity: "medium", severityReason: "", reasoning: "seen" };
     return opts.label === "report" ? "FINAL" : null;
   };
-  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "domain", "security"], pass: 2, base: "reviewed-commit" } });
+  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code", "domain", "security"], pass: 1, base: "reviewed-commit" } });
   assert.equal(result.status, "incomplete");
   assert.deepEqual(result.rereview.rerunLenses, ["domain", "security"]);
-  assert.equal(result.rereview.pass, 2);
-  assert.equal(result.rereview.nextPass, 3);
+  assert.equal(result.rereview.pass, 1);
+  assert.equal(result.rereview.nextPass, 2);
   assert.equal(result.rereview.recommendation, "delta");
   assert.ok(result.rereview.reason.startsWith("Re-run only these lenses on the same scope with the same pass number first — that is not a new pass."));
   assert.match(result.rereview.reason, /Failed lenses: domain, security/);
@@ -1513,6 +1755,32 @@ test("codex-review re-runs only failed lenses on the same scope and pass before 
   assert.match(result.rereview.reason, /Keep the first result.*combine the findings of both runs.*stricter of the two rereview objects/);
   assert.match(result.rereview.reason, /worse worst, recommendation owner > delta > none, tier final > daily > light\./);
   assert.doesNotMatch(result.rereview.reason, /keep a securityTier that either run sets/);
+});
+
+test("codex-review a large or design-changing delta after a non-final pass stays on light and asks for effort max; after a final pass the tiers are unchanged", async () => {
+  const finding = [{ severity: "high", verdict: "confirmed" }];
+  const hint = "Pass effort: 'max' (the tier stays light) when the delta is more than about 50 changed lines or more than 3 files, or when the fix changed the design; a full re-review only for a large or design-changing fix.";
+  for (const args of [{}, { tier: "light" }, { tier: "daily" }]) {
+    const { result } = await runWorkflow("codex-review", { agent: escalationStub({ findings: finding, triage: finding }), args: { lenses: ["code"], ...args } });
+    const { reason, tier, nextPass, recommendation } = result.rereview;
+    assert.deepEqual([recommendation, tier, nextPass], ["delta", "light", 2]);
+    assert.ok(reason.includes(hint), JSON.stringify(args));
+    assert.ok(!/daily/.test(reason), "no move to daily");
+    assert.ok(Object.keys(result.rereview).every(key => key !== "effort"), "no new rereview field: the hint is in reason");
+    assert.ok(result.report.endsWith("Re-review: delta (pass 2, tier light, base = the commit this pass reviewed) — " + reason));
+    // the caller follows the hint: the same tier plus effort max runs the delta on Terra at max
+    const next = await reviewTiers({ pass: 2, tier: result.rereview.tier, effort: "max", lenses: ["code", "security"] }, 2);
+    assert.deepEqual(next.requests.map(r => [r.model, r.effort]), Array(2).fill(["gpt-6.1-terra", "max"]));
+    assert.equal(next.result.rereview.pass, 2);
+  }
+  // after a final pass: medium → daily, high/critical → final, no effort hint
+  for (const [severity, tier] of [["medium", "daily"], ["high", "final"]]) {
+    const one = [{ severity, verdict: "confirmed" }];
+    const { result } = await runWorkflow("codex-review", { agent: escalationStub({ findings: one, triage: one }), args: { lenses: ["code"], tier: "final" } });
+    assert.equal(result.rereview.tier, tier);
+    assert.ok(!result.rereview.reason.includes("effort: 'max'"));
+    assert.match(result.rereview.reason, /A full re-review only when the fix was large or changed the design\./);
+  }
 });
 
 test("codex-review reason with securityTier final: the normal light advice plus a request to pass securityTier again", async () => {
@@ -1530,7 +1798,7 @@ test("codex-review reason with securityTier final: the normal light advice plus 
   assert.equal(result.rereview.securityTier, "final");
   assert.equal(result.rereview.reason,
     "Fix and verify, then review only the fix delta (base = the commit this pass reviewed) at tier light with priorFindings."
-    + " Use daily instead of light when the delta is more than about 50 changed lines or more than 3 files, or when the fix changed the design; a full re-review only for a large or design-changing fix."
+    + " Pass effort: 'max' (the tier stays light) when the delta is more than about 50 changed lines or more than 3 files, or when the fix changed the design; a full re-review only for a large or design-changing fix."
     + " Pass securityTier: final again on the next pass.");
   assert.doesNotMatch(result.rereview.reason, /split|leave tier out|Keep securityTier/);
   assert.ok(result.report.endsWith("Re-review: delta (pass 2, tier light, securityTier final, base = the commit this pass reviewed) — " + result.rereview.reason));
@@ -1655,8 +1923,8 @@ test("codex-review marks a failed lens as incomplete and routes findings through
   const { result } = await runWorkflow("codex-review", { agent, args: { tier: "final", base: "main" } });
   assert.equal(result.status, "incomplete");
   assert.deepEqual(result.lenses, [
-    { lens: "code", tier: "final", model: "gpt-6-astra", verdict: "request_changes", error: null },
-    { lens: "domain", tier: "final", model: "gpt-6-astra", verdict: null, error: "timeout" },
+    { lens: "code", tier: "final", model: "gpt-6-astra", effort: "max", verdict: "request_changes", error: null },
+    { lens: "domain", tier: "final", model: "gpt-6-astra", effort: "max", verdict: null, error: "timeout" },
   ]);
   assert.deepEqual(result.confirmed.map((f) => f.id), ["code:1"]);
   assert.deepEqual(result.refuted.map((f) => f.id), ["code:2"]);

@@ -247,6 +247,11 @@ test("the light tier resolves to gpt-6.1-terra@xhigh for every kind", () => {
   }
   assert.equal(resolvePolicy({ tier: "light", kind: "verify" }).timeoutSec, 1500);
   assert.equal(resolvePolicy({ tier: "light", kind: "verify", effort: "max" }).effort, "max", "an explicit effort override is kept on Terra");
+  // codex-review pass 1 asks for Terra@max on a review lens: the deadline is the same 45 minutes as at xhigh (effort factor 1),
+  // about six times the 453 s median measured for terra@max, and the tier stays light.
+  const reviewMax = resolvePolicy({ tier: "light", kind: "review", effort: "max" });
+  assert.deepEqual([reviewMax.tier, reviewMax.model, reviewMax.effort, reviewMax.timeoutSec, reviewMax.weight], ["light", "gpt-6.1-terra", "max", 2700, 1]);
+  assert.equal(computeDeadlineSec("gpt-6.1-terra", "max", "review"), computeDeadlineSec("gpt-6.1-terra", "xhigh", "review"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-light-"));
   try {
     for (const kind of ["verify", "ask", "review"]) {

@@ -38,6 +38,7 @@ routine changes. Use Astra for the final review only for critical work: security
 (auth, keys, crypto, payments, personal data), data migrations, irreversible production steps,
 or the last gate before a production release, unless the owner chose another model. In
 `codex-review`, use `securityTier: 'final'` for security only or `tier: 'final'` for every lens.
+Code review itself runs on Terra at `max` by default (Sol implements, Terra reviews).
 
 Keep Sol at `xhigh`, including long implementations. Set `"effort": "max"` only for an
 exceptional unresolved problem after an `xhigh` attempt or when the owner requests it;
@@ -167,8 +168,9 @@ a follow-up is then a new run with `"resume": { "sessionId": "<provenance.thread
   (the runner restates the sandbox on every resume — `codex exec resume` alone runs read-only — so a follow-up that
   must write says `"sandbox": "workspace-write"`).
 - **Adversarial review of the result**: the `codex-review` skill (or the
-  `ultracodex:codex-review` workflow) on the worktree branch. Sol implements → Sol reviews
-  routine changes, including security lenses. For the critical categories in section 1,
+  `ultracodex:codex-review` workflow) on the worktree branch. Sol implements → Terra reviews
+  routine changes (the `codex-review` defaults), including security lenses; a small, low-risk
+  change needs no Codex review (see the `codex-review` skill). For the critical categories in section 1,
   use `securityTier: 'final'` for an Astra security review or `tier: 'final'` for every lens.
   Or use `ultracodex:cross-review` so Claude finds and Codex verifies.
 - **Review fixes go to the same session.** Send the confirmed findings from `codex-review`, with
@@ -177,7 +179,7 @@ a follow-up is then a new run with `"resume": { "sessionId": "<provenance.thread
   session is closed or failed. Then use the one-shot fallback above with its `provenance.threadId`,
   so Codex keeps its context. Do not start a fresh session for fixes.
 - Re-verify the fixes (section 5), then follow the `codex-review` skill's fixes and re-review policy:
-  no new pass after low-only findings; otherwise review only the fix delta; at most 3 passes.
+  no new pass after low-only findings; otherwise review only the fix delta; at most 2 passes.
 
 ## 7. Keep the session, hand over, then close
 

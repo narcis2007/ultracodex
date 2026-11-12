@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.6.7 — 2026-11-12 (codex-review defaults: terra@max, 2 passes, opt-in astra tiebreak)
+
+- `codex-review`: with no valid `tier`, pass 1 runs every lens, including `security`, on `light`
+  (`gpt-6.1-terra`) at effort `max` (before: `daily`, `gpt-6.1-sol@xhigh`). A pass above 1 with no
+  valid `tier` still runs `light` at its default effort (`xhigh`). An explicit `tier` keeps its own
+  default effort: `light` is `terra@xhigh` (the quick pass), `daily` is `sol@xhigh`, `final` is
+  `astra@max`. An explicit `securityTier` still sets the security lens, with that tier's own default
+  effort; with no `securityTier` the security lens follows the other lenses. The tier policy of the
+  runner is unchanged; the workflow passes `effort: 'max'` on the request.
+- New optional arg `effort` (`low|medium|high|xhigh|max`; other values are ignored): it sets the
+  effort of every lens that is not on tier `final`. It never changes the astra runs. The result now
+  has a top-level `effort` and `lenses[].effort` (what really ran); the report prompt asks for the
+  model and effort of each lens.
+- The cap is 2 review passes per change (before: 3). A pass above 2 is refused unless
+  `ownerApproved: true`. `rereview` after pass 1 is unchanged (`delta` for medium and for
+  high/critical). After pass 2: `none` for medium as the worst (fix and verify with the tests and the
+  diff, or document known limits) and `owner` for a high/critical finding still open (do not ship;
+  the owner decides about a third pass). Re-running a failed lens is still not a new pass.
+- A large or design-changing fix delta (more than about 50 changed lines or more than 3 files, or a
+  changed design) after a non-final pass no longer moves to `daily`. `rereview.tier` stays `light`
+  and `rereview.reason` says: pass `effort: 'max'` (the tier stays light), so the delta runs on
+  terra@max. The hint is in `reason`, and so in the `Re-review:` line; there is no new result field.
+  After a `final` pass the rule is unchanged (medium → `daily`, high/critical → `final`). Reason: the
+  benchmark found terra@max at least as good as sol@xhigh in 8 of 8 comparable cases.
+- The astra tiebreak is opt-in: it runs only with `escalate: true` (before: on unless
+  `escalate: false`; any value other than the boolean `true` leaves it off). Without it, the
+  high/critical findings (by Codex's rating) that the triage refuted or left needs-info are listed as
+  **not cross-checked**: in the new result field `notCrossChecked`, in a section of the report and in
+  a `Not cross-checked:` line that the workflow adds before the `Re-review:` line. A needs-info
+  high/critical finding still counts as unresolved for the verdict and for `rereview`; `disputed`
+  works as before when `escalate: true` is passed. `escalation` is `null` when the tiebreak is off.
+- `skills/codex-review`: section 1 now chooses by risk. A small, low-risk change (about 50 changed
+  lines or fewer in at most 3 files, or mechanical, and no money, authentication, permissions,
+  personal data, migrations or external effects) needs no Codex review; a normal change gets `code` +
+  `domain`; `security` is added for authentication, permissions or tenant isolation, personal data,
+  money, secrets and outside input; critical work gets all three, then astra@max as the last gate
+  (astra uses much more quota, so ask the owner first when the owner's rules say so). The `tests`
+  lens stays available but is not a default. The by-hand example uses `"tier": "light", "effort": "max"`.
+  The model policy, READMEs and the `codex-workflow` and `codex-implement` skills say the same.
+- Deadline check for terra@max: the runner deadline for a review lens is `2700 s` (45 min) for
+  Terra at `max`, the same as at `xhigh` (effort factor 1, model factor 1); the benchmark median was
+  about 450 s. The relay already waits in 10-minute rounds until the run ends, so no runner change
+  is needed. A unit test pins the 45 minutes.
+- Why: on 10 replayed review jobs, terra@max found 10 of 12 must-find defects and sol@xhigh 4 of 12 at
+  the same cost per run; a pass after a low-only pass found nothing medium or worse (0 of 12); Codex
+  usage is scarce, and astra uses 5 to 7 times more of the weekly quota than sol. Sol stays the model
+  for plan checks, second opinions and implementation; only code review moved to Terra. The helper and
+  the runner only change their version (0.6.7).
+- Add offline tests for the default tier and effort per pass, the `effort` arg, explicit tiers, the cap
+  of 2 with and without `ownerApproved`, the opt-in tiebreak, the `not cross-checked` listing and the
+  re-review table at the cap.
+
 ## 0.6.6 — 2026-11-06 (configurable worktree locations)
 
 - Add runner commands `worktree path` and `worktree add`. Choose an exact path or root, read

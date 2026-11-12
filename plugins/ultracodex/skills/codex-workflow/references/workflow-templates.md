@@ -7,7 +7,7 @@ Two ways to use Codex nodes in a Workflow:
    | Workflow | What it does | Key args |
    | --- | --- | --- |
    | `ultracodex:cross-review` | Claude finders per dimension → Codex (sol@xhigh, batched) refutes each finding against the code → one astra@max run re-checks the confirmed high/critical ones → Claude report | `target`, `cwd`, `dimensions`, `verifyTier: 'daily'\|'final'`, `finalGate` (default on), `fast`, `context`, `lessons`, `batch` |
-   | `ultracodex:codex-review` | Codex reviews through lenses (code, domain, security, tests, performance) → Claude checks each finding in the code → high/critical disagreements go to astra@max in one run → report | `cwd`, `base` \| `commit` \| `uncommitted`, `lenses`, `tier: 'light'\|'daily'\|'final'`, `escalate` (default on), `fast`, `context`, `lessons`, `triage` |
+   | `ultracodex:codex-review` | Codex reviews through lenses (code, domain, security, tests, performance), terra@max on pass 1 → Claude checks each finding in the code → report; with `escalate: true`, high/critical disagreements go to astra@max in one run | `cwd`, `base` \| `commit` \| `uncommitted`, `lenses`, `tier: 'light'\|'daily'\|'final'`, `effort`, `escalate` (default off), `pass` (at most 2), `fast`, `context`, `lessons`, `triage` |
    | `ultracodex:crosscheck` | one Codex attempt to refute one load-bearing claim (astra@max) | `claim`, `evidence`, `cwd`, `tier`, `fast` |
    | `ultracodex:judge-panel` | Claude angles + a Codex candidate, Claude+Codex jury, cross-family ranking, synthesis | `problem`, `angles`, `cwd`, `codexCandidate` |
 
@@ -64,7 +64,7 @@ stage works in the session's directory, not in the workflow's `cwd`.
 // model/effort only to override with a reason (gpt-6-luna is an explicit override only; its default effort is max).
 // Concurrency is capped intrinsically: 4 Codex jobs per workflow, an astra job counting as 2 — do not wrap calls in
 // another gate.
-const UCX_VERSION = '0.6.6'
+const UCX_VERSION = '0.6.7'
 const UCX_RELAY = 'ultracodex:codex-relay'
 const UCX_TIER_MODEL = { light: 'gpt-6.1-terra', daily: 'gpt-6.1-sol', final: 'gpt-6-astra' }
 const UCX_TIER_EFFORT = { light: 'xhigh', daily: 'xhigh', final: 'max' }
@@ -774,8 +774,8 @@ const gate = blocking.length
 return { ..., codexUsage: ucxUsage() }
 ```
 
-The shipped `ultracodex:cross-review` (`finalGate`) and `ultracodex:codex-review` (`escalate`)
-already do this.
+The shipped `ultracodex:cross-review` (`finalGate`) and `ultracodex:codex-review` (`escalate: true`,
+opt-in) already do this.
 
 ## Picking tier & effort
 
@@ -785,7 +785,8 @@ Policy (enforced by the runner; override per node only with a reason):
 | --- | --- | --- |
 | wide fan-out of small checks, triage, dedupe | `light` / `verify` | gpt-6.1-terra @ xhigh |
 | everyday adversarial verify, jurors | `daily` / `verify` | gpt-6.1-sol @ xhigh |
-| a second opinion, one lens of a review | `daily` / `ask` or `review` | gpt-6.1-sol @ xhigh |
+| a second opinion | `daily` / `ask` | gpt-6.1-sol @ xhigh |
+| one lens of a code review | `light` / `review` with `effort: 'max'` (the `codex-review` pass-1 default) | gpt-6.1-terra @ max |
 | final critical gate, load-bearing single verdict, unresolved issue escalated from Sol | `final` / any | gpt-6-astra @ max |
 
 `ultra` is never implicit: pass `effort: 'ultra'` on at most one decisive astra/sol node per run

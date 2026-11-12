@@ -1,12 +1,12 @@
 export const meta = {
   name: 'codex-review',
-  description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude (Haiku 5.5 @high by default); high/critical disagreements go to astra@max. Pass-1 lenses default to 6.1-sol@xhigh, including security; fix-delta passes (pass > 1) default to 6.1-terra@xhigh. For critical work, securityTier: final selects astra@max for security only; an explicit tier sets every lens; an explicit securityTier always sets the security lens. Fails closed.',
-  whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: light (6.1-terra@xhigh)|daily (6.1-sol@xhigh)|final (astra@max), securityTier: light|daily|final, context, lessons, triage, triageModel: haiku|sonnet|opus|inherit, triageEffort, escalate, fast, pass: positive integer (default 2 with priorFindings, else 1), priorFindings: previous findings and fixes (string, array or object), ownerApproved: true to allow pass > 3 }. With no tier, pass 1 uses daily and pass > 1 uses light. Pass > 1 reviews only the fix delta and prior findings.',
+  description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude (Haiku 5.5 @high by default). Pass-1 lenses default to 6.1-terra@max, including security; fix-delta passes (pass > 1) default to 6.1-terra@xhigh. For critical work, securityTier: final selects astra@max for security only; an explicit tier sets every lens with its own default effort; an explicit securityTier always sets the security lens. The astra tiebreak for high/critical findings that Claude refuted or could not settle runs only with escalate: true; without it they are listed as not cross-checked. At most 2 review passes per change. Fails closed.',
+  whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: light (6.1-terra@xhigh)|daily (6.1-sol@xhigh)|final (astra@max), securityTier: light|daily|final, effort: low|medium|high|xhigh|max (every lens not on final), context, lessons, triage, triageModel: haiku|sonnet|opus|inherit, triageEffort, escalate: true (opt-in astra tiebreak), fast, pass: positive integer (default 2 with priorFindings, else 1), priorFindings: previous findings and fixes (string, array or object), ownerApproved: true to allow pass > 2 }. With no tier, pass 1 uses light at max effort (terra@max) and pass > 1 uses light at its default effort (terra@xhigh). Pass > 1 reviews only the fix delta and prior findings.',
   phases: [
     { title: 'Review', detail: 'one Codex review per lens (read-only, hermetic)' },
     { title: 'Triage', detail: 'Claude (Haiku 5.5 @high unless triageModel says otherwise) checks each Codex finding against the code' },
-    { title: 'Escalate', detail: 'astra@max settles the high/critical findings Claude refuted or could not settle, in one run' },
-    { title: 'Report', detail: 'confirmed / disputed / refuted / needs-info / unverified' },
+    { title: 'Escalate', detail: 'only with escalate: true — astra@max settles the high/critical findings Claude refuted or could not settle, in one run' },
+    { title: 'Report', detail: 'confirmed / disputed / refuted / needs-info / not cross-checked / unverified' },
   ],
 }
 
@@ -33,7 +33,7 @@ export const meta = {
 // model/effort only to override with a reason (gpt-6-luna is an explicit override only; its default effort is max).
 // Concurrency is capped intrinsically: 4 Codex jobs per workflow, an astra job counting as 2 — do not wrap calls in
 // another gate.
-const UCX_VERSION = '0.6.6'
+const UCX_VERSION = '0.6.7'
 const UCX_RELAY = 'ultracodex:codex-relay'
 const UCX_TIER_MODEL = { light: 'gpt-6.1-terra', daily: 'gpt-6.1-sol', final: 'gpt-6-astra' }
 const UCX_TIER_EFFORT = { light: 'xhigh', daily: 'xhigh', final: 'max' }
@@ -579,13 +579,19 @@ function ucxPartition(items, verdictOf = x => x.verdict) {
 const A = args || {}
 const PRIOR_FINDINGS = A.priorFindings == null ? null : typeof A.priorFindings === 'string' ? A.priorFindings : JSON.stringify(A.priorFindings)
 const PASS = Number.isInteger(A.pass) && A.pass > 0 ? A.pass : PRIOR_FINDINGS !== null ? 2 : 1
-if (PASS > 3 && A.ownerApproved !== true) throw new Error('codex-review: pass ' + PASS + " exceeds the cap of 3 review passes per change; a further pass needs the owner's OK (args.ownerApproved: true)")
+// At most 2 review passes per change (pass 1 and one fix-delta pass); a further pass needs the owner's OK.
+const PASS_CAP = 2
+if (PASS > PASS_CAP && A.ownerApproved !== true) throw new Error('codex-review: pass ' + PASS + " exceeds the cap of " + PASS_CAP + " review passes per change; a further pass needs the owner's OK (args.ownerApproved: true)")
 const CWD = A.cwd || null
 const EXPLICIT_TIER = ['light', 'daily', 'final'].includes(A.tier)
-// With no valid tier: pass 1 reviews on daily, a fix-delta pass (pass > 1) on light.
-const TIER = EXPLICIT_TIER ? A.tier : PASS > 1 ? 'light' : 'daily'
+// With no valid tier every lens runs on light (terra): pass 1 at effort max, a fix-delta pass (pass > 1) at light's default effort (xhigh).
+const TIER = EXPLICIT_TIER ? A.tier : 'light'
 // A valid securityTier always sets the security lens, also when tier is explicit. Otherwise the security lens follows TIER.
 const SECURITY_TIER = ['light', 'daily', 'final'].includes(A.securityTier) ? A.securityTier : null
+// Optional effort for every lens that is not on tier final (astra always runs at its own default, max). Invalid values are ignored.
+const EFFORT = ['low', 'medium', 'high', 'xhigh', 'max'].includes(A.effort) ? A.effort : null
+// Only a pass 1 with no valid tier raises the effort by itself; an explicit tier keeps its own default effort.
+const DEFAULT_MAX = !EXPLICIT_TIER && PASS === 1
 const TRIAGE = A.triage !== false
 // Triage runs on Haiku 5.5 at high effort unless the owner names another model. Measured on
 // 249 recorded triage cases replayed at their reviewed commits, disagreements judged blind by
@@ -623,10 +629,16 @@ const LENSES = {
 }
 const lensKeys = (Array.isArray(A.lenses) && A.lenses.length ? A.lenses : ['code', 'domain']).filter(k => LENSES[k])
 if (!lensKeys.length) throw new Error('codex-review: no known lens in args.lenses (use code, domain, security, tests, performance)')
-// Every lens uses TIER (an explicit tier, else daily on pass 1 and light on a fix-delta pass); the security lens uses securityTier when one is given.
+// Every lens uses TIER (an explicit tier, else light); the security lens uses securityTier when one is given.
 const lensTier = key => key === 'security' && SECURITY_TIER ? SECURITY_TIER : TIER
-// Only findings from non-Astra lenses can need an Astra tiebreak.
-const ESCALATE = TRIAGE && A.escalate !== false && lensKeys.some(key => lensTier(key) !== 'final')
+// The effort passed to a lens, or null for the runner's default of its tier. Astra is never changed. A lens that
+// an explicit securityTier sets keeps that tier's own default effort, unless the caller passes effort.
+const lensEffort = key => lensTier(key) === 'final' ? null
+  : EFFORT || (DEFAULT_MAX && !(key === 'security' && SECURITY_TIER) ? 'max' : null)
+// The effort a lens really runs at (the runner's tier default when none is passed).
+const effortOf = key => lensEffort(key) || UCX_TIER_EFFORT[lensTier(key)]
+// The astra tiebreak is opt-in, and only findings from non-Astra lenses can need one.
+const ESCALATE = TRIAGE && A.escalate === true && lensKeys.some(key => lensTier(key) !== 'final')
 
 const lensTask = key => `You are reviewing ${SCOPE} in your working directory. Be adversarial and concrete.
 ${LENSES[key]}
@@ -650,14 +662,14 @@ const TRIAGE_SEVERITY = `Then rate its severity yourself (critical / high / medi
 phase('Review')
 const lensResults = await pipeline(
   lensKeys,
-  key => codexNode(lensTask(key), { schemaPreset: 'review', tier: lensTier(key), kind: 'review', cwd: CWD || undefined, label: 'codex:' + key, phase: 'Review', ...(lensTier(key) === 'final' ? FAST : {}) }),
+  key => codexNode(lensTask(key), { schemaPreset: 'review', tier: lensTier(key), ...(lensEffort(key) ? { effort: lensEffort(key) } : {}), kind: 'review', cwd: CWD || undefined, label: 'codex:' + key, phase: 'Review', ...(lensTier(key) === 'final' ? FAST : {}) }),
   async (review, key) => {
-    const tier = lensTier(key)
-    if (isCodexError(review)) return { lens: key, tier, error: review, findings: [] }
+    const tier = lensTier(key), effort = effortOf(key)
+    if (isCodexError(review)) return { lens: key, tier, effort, error: review, findings: [] }
     // Positional ids: Codex-chosen ids can collide or be empty, and must never cost a
     // finding (or break the escalation batch). Codex's own id is kept as sourceId.
     const findings = (review.findings || []).map((f, i) => ({ ...f, sourceId: f.id, id: key + ':' + (i + 1), lens: key }))
-    if (!TRIAGE) return { lens: key, tier, verdict: review.verdict, summary: review.summary, findings }
+    if (!TRIAGE) return { lens: key, tier, effort, verdict: review.verdict, summary: review.summary, findings }
     // A triage that fails keeps its finding, as needs_info — it is never dropped.
     const failedTriage = reason => ({ verdict: 'needs_info', reasoning: 'Claude triage failed (' + reason + ') — check this finding by hand', failed: true })
     const triaged = await parallel(findings.map(f => () =>
@@ -666,26 +678,28 @@ Decide: "confirmed" (the defect is real and the failure scenario is reachable), 
 ${TRIAGE_SEVERITY}
 FINDING (JSON): ${JSON.stringify(f)}`, { label: 'triage:' + f.id, phase: 'Triage', schema: TRIAGE_SCHEMA, agentType: UCX_READER, ...TRIAGE_OPTS })
         .then(t => ({ ...f, triage: t || failedTriage('no answer') }), e => ({ ...f, triage: failedTriage(String((e && e.message) || e)) }))))
-    return { lens: key, tier, verdict: review.verdict, summary: review.summary, findings: findings.map((f, i) => triaged[i] || { ...f, triage: failedTriage('stage failed') }) }
+    return { lens: key, tier, effort, verdict: review.verdict, summary: review.summary, findings: findings.map((f, i) => triaged[i] || { ...f, triage: failedTriage('stage failed') }) }
   },
 )
 
 // Every requested lens is accounted for: a lens whose stage died is a failed lens.
-const lenses = lensKeys.map((key, i) => lensResults[i] || { lens: key, tier: lensTier(key), error: ucxError('stage_failed', 'the review stage for this lens failed'), findings: [] })
+const lenses = lensKeys.map((key, i) => lensResults[i] || { lens: key, tier: lensTier(key), effort: effortOf(key), error: ucxError('stage_failed', 'the review stage for this lens failed'), findings: [] })
 const failedLenses = lenses.filter(l => l.error)
 const findings = lenses.flatMap(l => l.findings)
 const failedTriages = findings.filter(f => f.triage && f.triage.failed)
 if (failedLenses.length) log('⚠ ' + failedLenses.length + '/' + lensKeys.length + ' Codex lenses failed — the review is INCOMPLETE')
 
 // A high/critical Codex finding that Claude refuted or could not settle is where the two
-// families disagree on something that matters: gpt-6-astra reads the code and decides, in
-// one run. astra refuting it settles it; astra upholding it makes it DISPUTED (the owner
-// decides — never silently dropped); a failed escalation leaves it unresolved (needs-info)
-// and the review incomplete.
+// families disagree on something that matters. With escalate: true, gpt-6-astra reads the code
+// and decides, in one run: astra refuting it settles it; astra upholding it makes it DISPUTED
+// (the owner decides — never silently dropped); a failed escalation leaves it unresolved
+// (needs-info) and the review incomplete. Without escalate (the default: astra uses much more
+// quota than the lenses) nothing is dropped silently either: these findings are listed as NOT
+// CROSS-CHECKED, so the caller can check them in the code or ask the owner for an astra run.
+// A needs-info one still counts as unresolved in the verdict and in rereview.
 const escalation = { ran: false, checked: 0, upheld: 0, settled: 0, failed: 0 }
-const contested = ESCALATE
-  ? lenses.filter(l => l.tier !== 'final').flatMap(l => l.findings).filter(f => ['critical', 'high'].includes(f.severity) && f.triage && ['refuted', 'needs_info'].includes(f.triage.verdict))
-  : []
+const contestable = lenses.filter(l => l.tier !== 'final').flatMap(l => l.findings).filter(f => ['critical', 'high'].includes(f.severity) && f.triage && ['refuted', 'needs_info'].includes(f.triage.verdict))
+const contested = ESCALATE ? contestable : []
 if (contested.length) {
   phase('Escalate')
   escalation.ran = true
@@ -722,6 +736,14 @@ const bucketOf = f => {
 const by = v => (TRIAGE ? findings.filter(f => f.triage && bucketOf(f) === v) : [])
 const confirmed = by('confirmed'), refuted = by('refuted'), needsInfo = by('needs_info'), disputed = by('disputed')
 const untriaged = TRIAGE ? [] : findings
+// The contested findings that no astra tiebreak looked at (escalate is off). They are also in refuted or needsInfo.
+const notCrossChecked = ESCALATE ? [] : contestable.map(f => ({
+  id: f.id, title: f.title, file: f.file, line: f.line, codexSeverity: f.severity,
+  claudeVerdict: f.triage.verdict, claudeSeverity: SEVERITIES.includes(f.triage.severity) ? f.triage.severity : null,
+  why: f.triage.reasoning, triageFailed: f.triage.failed === true,
+}))
+const notCrossCheckedIds = new Set(notCrossChecked.map(f => f.id))
+if (notCrossChecked.length) log('⚠ ' + notCrossChecked.length + ' high/critical finding(s) NOT cross-checked (escalate is off): Claude refuted them or could not settle them — check them in the code, or ask the owner for an astra run')
 const whyRefuted = f => (f.escalation && !f.escalation.error ? 'gpt-6-astra: ' + f.escalation.reasoning : f.triage.reasoning)
 // Confirmed findings carry Claude's own severity from triage; Codex's stays as codexSeverity
 // and every change is listed. (The escalation above still keys on Codex's severity: a
@@ -755,11 +777,11 @@ const worst = SEVERITIES.find(severity => carry.some(f => f.severity === severit
 const rereview = { pass: PASS, worst, recommendation: 'none', tier: null, securityTier: SECURITY_TIER, nextPass: null, rerunLenses: failedLenses.map(l => l.lens), carry, reason: '' }
 if (worst === 'low' || worst === 'none') {
   rereview.reason = 'No re-review; fix only low findings that take a few lines and are obviously correct; list the rest as follow-ups.'
-} else if (worst === 'medium' && PASS >= 3) {
-  rereview.reason = 'The cap of 3 review passes is reached; fix and verify without another pass, or document the findings as known limits.'
-} else if (PASS >= 3) {
+} else if (worst === 'medium' && PASS >= PASS_CAP) {
+  rereview.reason = 'The cap of ' + PASS_CAP + ' review passes is reached; fix and verify (tests, diff) without another pass, or document the findings as known limits.'
+} else if (PASS >= PASS_CAP) {
   rereview.recommendation = 'owner'
-  rereview.reason = 'The cap of 3 review passes is reached with a high or critical finding open; do not ship. The owner decides about another pass with ownerApproved: true.'
+  rereview.reason = 'The cap of ' + PASS_CAP + ' review passes is reached with a high or critical finding open; do not ship. The owner decides about ' + (PASS === PASS_CAP ? 'a third' : 'another') + ' pass with ownerApproved: true.'
 } else {
   rereview.recommendation = 'delta'
   // After a final pass: medium → daily, high/critical → final. After any other pass: light for every severity.
@@ -767,11 +789,15 @@ if (worst === 'low' || worst === 'none') {
   rereview.nextPass = PASS + 1
   rereview.reason = 'Fix and verify, then review only the fix delta (base = the commit this pass reviewed) at tier ' + rereview.tier + ' with priorFindings.'
     + (rereview.tier === 'light'
-      ? ' Use daily instead of light when the delta is more than about 50 changed lines or more than 3 files, or when the fix changed the design; a full re-review only for a large or design-changing fix.'
+      ? " Pass effort: 'max' (the tier stays light) when the delta is more than about 50 changed lines or more than 3 files, or when the fix changed the design; a full re-review only for a large or design-changing fix."
       : ' A full re-review only when the fix was large or changed the design.')
     + (rereview.securityTier ? ' Pass securityTier: ' + rereview.securityTier + ' again on the next pass.' : '')
 }
 if (rereview.rerunLenses.length) rereview.reason = 'Re-run only these lenses on the same scope with the same pass number first — that is not a new pass. Failed lenses: ' + rereview.rerunLenses.join(', ') + '. This decision covers only the lenses that ran. Keep the first result; after the re-run, combine the findings of both runs and follow the stricter of the two rereview objects: worse worst, recommendation owner > delta > none, tier final > daily > light. ' + rereview.reason
+// Added by the workflow, not written by the report agent: a high/critical finding without a second look is never dropped silently.
+const notCrossCheckedLine = 'Not cross-checked (escalate is off): ' + notCrossChecked.map(f => f.id + ' (' + (f.claudeVerdict === 'needs_info' ? 'needs-info' : 'refuted') + ')').join(', ')
+  + ' — Codex rated ' + (notCrossChecked.length === 1 ? 'it' : 'them') + ' high or critical, the Claude triage refuted or could not settle ' + (notCrossChecked.length === 1 ? 'it' : 'them')
+  + ', and no astra tiebreak ran. Check ' + (notCrossChecked.length === 1 ? 'it' : 'them') + ' in the code, or ask the owner for an astra run.'
 const rereviewLine = 'Re-review: ' + (rereview.recommendation === 'delta'
   ? 'delta (pass ' + rereview.nextPass + ', tier ' + rereview.tier + (rereview.securityTier ? ', securityTier ' + rereview.securityTier : '') + ', base = the commit this pass reviewed)'
   : rereview.recommendation === 'owner' ? 'owner decides' : 'none') + ' — ' + rereview.reason
@@ -779,21 +805,22 @@ const rereviewLine = 'Re-review: ' + (rereview.recommendation === 'delta'
 phase('Report')
 let report = await agent(`Write the final review report for ${SCOPE}${CWD ? ' in ' + CWD : ''}.${ucxWhere(CWD)}
 ${failedLenses.length ? 'At the very top, state that these lenses FAILED and were not reviewed: ' + JSON.stringify(failedLenses.map(l => ({ lens: l.lens, error: l.error.kind, message: l.error.message }))) : ''}
-Per-lens Codex verdicts (include the model used for each lens): ${JSON.stringify(lenses.filter(l => !l.error).map(l => ({ lens: l.lens, tier: l.tier, model: UCX_TIER_MODEL[l.tier], verdict: l.verdict, summary: l.summary })))}
+Per-lens Codex verdicts (include the model and effort used for each lens): ${JSON.stringify(lenses.filter(l => !l.error).map(l => ({ lens: l.lens, tier: l.tier, model: UCX_TIER_MODEL[l.tier], effort: l.effort, verdict: l.verdict, summary: l.summary })))}
 CONFIRMED findings, ranked by "severity" — Claude's own rating after checking the code; "codexSeverity" is what Codex said. Where they differ, show "Codex: <codexSeverity> → <severity>" with the severityReason. For each: file:line, failure scenario, fix: ${JSON.stringify(confirmedRated)}
 ${disputed.length ? 'DISPUTED findings (Claude doubted them, the gpt-6-astra escalation upheld them — present both sides and say the owner must decide): ' + JSON.stringify(disputed.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, severity: f.severity, claude: f.triage.reasoning, astra: f.escalation.reasoning }))) : ''}
+${notCrossChecked.length ? 'NOT CROSS-CHECKED high/critical findings (Codex rated them high or critical; the Claude triage refuted them or could not settle them; the astra tiebreak is off, so no second model family looked at them — list each one here with the Claude reason, say plainly that nothing else checked it, and say the caller can check it in the code or ask the owner for an astra run; they are left out of the REFUTED and NEEDS-INFO lists below): ' + JSON.stringify(notCrossChecked) : ''}
 ${untriaged.length ? 'UNTRIAGED Codex findings (triage was off — present them as unverified claims, not as confirmed defects): ' + JSON.stringify(untriaged) : ''}
-NEEDS-INFO findings (say what must be checked; those with an "escalation.error" are high/critical findings Claude doubted whose gpt-6-astra tiebreak FAILED — say so plainly, they are unresolved): ${JSON.stringify(needsInfo)}
-REFUTED findings (one line each, with the reason): ${JSON.stringify(refuted.map(f => ({ id: f.id, title: f.title, why: whyRefuted(f) })))}
+NEEDS-INFO findings (say what must be checked; those with an "escalation.error" are high/critical findings Claude doubted whose gpt-6-astra tiebreak FAILED — say so plainly, they are unresolved; a needs-info finding rated high or critical still counts as unresolved in the verdict, also when it is listed as not cross-checked above): ${JSON.stringify(needsInfo.filter(f => !notCrossCheckedIds.has(f.id)))}
+REFUTED findings (one line each, with the reason): ${JSON.stringify(refuted.filter(f => !notCrossCheckedIds.has(f.id)).map(f => ({ id: f.id, title: f.title, why: whyRefuted(f) })))}
 Merge findings that describe the same defect (same root cause, often reported by more than one lens) into one item and list all their ids.
 Present low findings as optional: fix now only those that take a few lines and are obviously correct; list the rest as follow-ups.
 Give a one-line overall verdict that follows these ratings: "do not ship" when a confirmed or disputed finding is critical/high, or a critical/high one is still unresolved (needs-info); "ship after fixes" when the worst is medium; "ship" when only low ones remain.
-Do not write a Re-review: line; the workflow adds it.`, { label: 'report', phase: 'Report', agentType: UCX_READER })
+Do not write a Re-review: line or a Not cross-checked: line; the workflow adds them.`, { label: 'report', phase: 'Report', agentType: UCX_READER })
 
 if (typeof report === 'string' && report.trim()) {
   const lines = report.split(/\r?\n/)
-  while (lines.length && (!lines[lines.length - 1].trim() || lines[lines.length - 1].startsWith('Re-review:'))) lines.pop()
-  report = (lines.length ? lines.join('\n') + '\n\n' : '') + rereviewLine
+  while (lines.length && (!lines[lines.length - 1].trim() || /^(Re-review|Not cross-checked):/.test(lines[lines.length - 1]))) lines.pop()
+  report = (lines.length ? lines.join('\n') + '\n\n' : '') + (notCrossChecked.length ? notCrossCheckedLine + '\n\n' : '') + rereviewLine
 }
 
 if (failedTriages.length) log('⚠ ' + failedTriages.length + ' findings could not be triaged — kept as needs-info')
@@ -802,11 +829,13 @@ return {
   // an enabled escalation that could not settle every contested finding leaves the review incomplete
   status: failedLenses.length || failedTriages.length || escalation.failed ? 'incomplete' : 'complete',
   tier: TIER,
+  // the effort of the lenses on the base tier (a securityTier lens is listed in lenses with its own)
+  effort: TIER === 'final' ? UCX_TIER_EFFORT.final : EFFORT || (DEFAULT_MAX ? 'max' : UCX_TIER_EFFORT[TIER]),
   report,
   rereview,
-  lenses: lenses.map(l => ({ lens: l.lens, tier: l.tier, model: UCX_TIER_MODEL[l.tier], verdict: l.verdict || null, error: l.error ? l.error.kind : null })),
+  lenses: lenses.map(l => ({ lens: l.lens, tier: l.tier, model: UCX_TIER_MODEL[l.tier], effort: l.effort, verdict: l.verdict || null, error: l.error ? l.error.kind : null })),
   triage: TRIAGE ? { model: TRIAGE_MODEL, effort: TRIAGE_EFFORT } : null,
-  confirmed: confirmedRated, severityChanges, disputed, needsInfo, untriaged,
+  confirmed: confirmedRated, severityChanges, disputed, needsInfo, notCrossChecked, untriaged,
   refuted: refuted.map(f => ({ id: f.id, title: f.title, why: whyRefuted(f) })),
   escalation: ESCALATE ? escalation : null,
   codexUsage: ucxUsage(),
