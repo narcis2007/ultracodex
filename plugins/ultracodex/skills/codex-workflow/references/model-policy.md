@@ -45,8 +45,8 @@ Rules of thumb:
   (auth, keys, crypto, payments, personal data), data migrations, irreversible production steps
   and the last gate before a production release. Routine asks use Sol at `xhigh`. Routine reviews
   use Terra (pass 1 at `max`), including the security lens.
-- **Prefer `xhigh` on Sol 6.1.** Verification, analysis, review and implementation all use
-  `xhigh`, including complex modules and long tasks. This is the owner's cost/quality
+- **Prefer `xhigh` on Sol 6.1.** Verification, analysis and implementation all use
+  `xhigh`, including complex modules and long tasks. Code review runs on Terra. This is the owner's cost/quality
   preference (2026-10-01); an exact cost ratio is workload-dependent.
 - **Sol `max` is exceptional and explicit.** Set `effort: 'max'` only when a concrete,
   consequential problem remains unresolved after an `xhigh` attempt and extra reasoning
@@ -85,9 +85,10 @@ Rules of thumb:
   actual routing. Findings already reviewed by Astra do not get another Astra tiebreak.
 - **Escalate high/critical disagreements only on request.** When Claude and a Codex reviewer disagree on
   such a finding, `codex-review` can send it to astra in one run (`escalate: true`, off by default:
-  astra costs much more quota). Without it, the report and the result list those findings as
-  "not cross-checked" (`notCrossChecked`) so the caller can check them or ask the owner for an astra run.
-  Do not re-run the lens instead.
+  astra costs much more quota). A doubted high/critical finding that no tiebreak looked at is listed
+  as "not cross-checked" (`notCrossChecked`, with a `reason`): all of them without `escalate`, and the
+  ones from an astra lens also with it. The caller checks them in the code; for the ones the tiebreak
+  skipped because it was off, the owner can also ask for an astra run. Do not re-run the lens instead.
 - **`ultra` is opt-in, once.** `effort: 'ultra'` (astra/sol/terra — luna has none; the runner
   refuses it) adds automatic sub-agent delegation and runs long. Use it for at most one decisive
   node per run.

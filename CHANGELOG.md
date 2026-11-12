@@ -25,20 +25,41 @@
   After a `final` pass the rule is unchanged (medium → `daily`, high/critical → `final`). Reason: the
   benchmark found terra@max at least as good as sol@xhigh in 8 of 8 comparable cases.
 - The astra tiebreak is opt-in: it runs only with `escalate: true` (before: on unless
-  `escalate: false`; any value other than the boolean `true` leaves it off). Without it, the
-  high/critical findings (by Codex's rating) that the triage refuted or left needs-info are listed as
-  **not cross-checked**: in the new result field `notCrossChecked`, in a section of the report and in
-  a `Not cross-checked:` line that the workflow adds before the `Re-review:` line. A needs-info
-  high/critical finding still counts as unresolved for the verdict and for `rereview`; `disputed`
-  works as before when `escalate: true` is passed. `escalation` is `null` when the tiebreak is off.
+  `escalate: false`; any value other than the boolean `true` leaves it off). Nothing is dropped
+  silently. Every high/critical finding (by Codex's rating) that the triage refuted or left
+  needs-info and that no tiebreak looked at is listed as **not cross-checked**: all of them when
+  `escalate` is off (`reason: 'escalate_off'`), and the ones from an astra lens (tier `final`) also
+  when it is on (`reason: 'astra_lens'`: astra wrote the finding, so no astra tiebreak applies and
+  the caller checks it in the code). The list is the new result field `notCrossChecked`; each entry
+  keeps Codex's own claim (`evidence`, `failure_scenario`, `recommendation`) next to `lens`, the
+  Claude verdict and severity and `why`, so the finding can be checked from the output alone. The
+  report prompt has a section for them, and the workflow adds a `Not cross-checked:` line before the
+  `Re-review:` line (it names each id with its verdict and reason, and suggests an astra run only for
+  the `escalate off` ones). A needs-info high/critical finding still counts as unresolved for the
+  verdict and for `rereview`; `disputed` works as before when `escalate: true` is passed.
+  `escalation` is `null` when the tiebreak is off.
+- `codex-review` fixes found in review: a repeated lens name (`lenses: ['code', 'code']`) runs once
+  (first occurrence wins), so two findings never share an id. The workflow drops a stale trailing
+  `Re-review:` or `Not cross-checked:` line (also `Not cross-checked (…):`) of the report agent before
+  it adds its own. When the report stage returns no text (empty or not a string), the report is a
+  short fallback sentence that points to the result fields, then the `Not cross-checked:` line (when
+  there is one) and the `Re-review:` line; `status` is not changed by it.
 - `skills/codex-review`: section 1 now chooses by risk. A small, low-risk change (about 50 changed
-  lines or fewer in at most 3 files, or mechanical, and no money, authentication, permissions,
-  personal data, migrations or external effects) needs no Codex review; a normal change gets `code` +
-  `domain`; `security` is added for authentication, permissions or tenant isolation, personal data,
-  money, secrets and outside input; critical work gets all three, then astra@max as the last gate
-  (astra uses much more quota, so ask the owner first when the owner's rules say so). The `tests`
-  lens stays available but is not a default. The by-hand example uses `"tier": "light", "effort": "max"`.
-  The model policy, READMEs and the `codex-workflow` and `codex-implement` skills say the same.
+  lines or fewer in at most 3 files, or mechanical, and none of money, authentication, permissions,
+  personal data, secrets, outside input, migrations or external effects; these risk categories win
+  over the size shortcut) needs no Codex review; a normal change gets `code` + `domain`; `security`
+  is added for authentication, permissions or tenant isolation, personal data, money, secrets and
+  outside input. The size measure also counts untracked files for the `uncommitted` scope. Critical
+  work gets all three lenses; the Terra passes come first (pass 1 and at most one fix delta), then one
+  astra@max gate runs on the revision meant to ship. The gate is one extra run on top of the cap of 2
+  (pass 2, or pass 3 with `ownerApproved: true` after a delta pass); it needs the owner's OK anyway,
+  because astra uses much more quota. After the gate a medium finding is verified with the tests and
+  the diff and a high/critical one goes to the owner. The `tests` lens stays available but is not a
+  default. The by-hand example uses `"tier": "light", "effort": "max"`. A failed-lens re-run uses the
+  same arguments as the first call (a returned `tier: 'light'` passed on a default pass 1 would run
+  terra@xhigh). A not-cross-checked finding that the caller's own check confirms becomes a confirmed
+  finding at the caller's severity, and the verdict and the re-review decision follow it. The model
+  policy, READMEs and the `codex-workflow` and `codex-implement` skills say the same.
 - Deadline check for terra@max: the runner deadline for a review lens is `2700 s` (45 min) for
   Terra at `max`, the same as at `xhigh` (effort factor 1, model factor 1); the benchmark median was
   about 450 s. The relay already waits in 10-minute rounds until the run ends, so no runner change
@@ -49,8 +70,14 @@
   for plan checks, second opinions and implementation; only code review moved to Terra. The helper and
   the runner only change their version (0.6.7).
 - Add offline tests for the default tier and effort per pass, the `effort` arg, explicit tiers, the cap
-  of 2 with and without `ownerApproved`, the opt-in tiebreak, the `not cross-checked` listing and the
-  re-review table at the cap.
+  of 2 with and without `ownerApproved`, the opt-in tiebreak, the `not cross-checked` listing (both
+  reasons, Codex's claim in each entry), repeated lenses, the stale-line strip, the fallback report and
+  the re-review table at the cap.
+- Known limits (intended): the overall verdict that the report agent writes is not validated in code;
+  `result.tier` and `result.effort` describe the base tier even when only a `securityTier` lens ran
+  (`lenses[]` shows what each lens ran); an explicit `securityTier: 'light'` on pass 1 keeps terra@xhigh;
+  `rereview.tier` follows the base tier. On a pass above 1 the lens text calls the scope a fix delta,
+  also for an astra gate that reviews the whole change.
 
 ## 0.6.6 — 2026-11-06 (configurable worktree locations)
 

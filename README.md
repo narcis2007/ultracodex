@@ -70,8 +70,9 @@ explicit request, once per run. Details:
 [model-policy.md](plugins/ultracodex/skills/codex-workflow/references/model-policy.md).
 
 Cost, in short: ask directly (`codex-ask`) when one answer is enough; batch small items into
-one run; let sol verify broadly and astra re-check only what would block a merge (the shipped
-reviews do this by default and report any astra disagreement as *disputed*); every shipped
+one run; let sol verify broadly and astra re-check only what would block a merge (`cross-review`
+does this by default and reports any astra disagreement as *disputed*; `codex-review` reviews on
+terra and sends findings to astra only with `escalate: true`); every shipped
 workflow returns `codexUsage` — runs and tokens per model.
 
 ## Requirements

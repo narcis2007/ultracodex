@@ -33,12 +33,12 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" preflight
 - `light` → gpt-6.1-terra@xhigh: mechanical work (renames, boilerplate, docs, test scaffolding).
   For high-volume mechanical edits where cost matters most, name `model: "gpt-6-luna", effort: "max"`.
 
-Complexity alone does not switch the implementer to Astra. Use Sol to implement and review
-routine changes. Use Astra for the final review only for critical work: security-sensitive code
+Complexity alone does not switch the implementer to Astra. Use Sol to implement routine
+changes; their code review runs on Terra (the `codex-review` defaults). Use Astra for the final
+review only for critical work: security-sensitive code
 (auth, keys, crypto, payments, personal data), data migrations, irreversible production steps,
 or the last gate before a production release, unless the owner chose another model. In
 `codex-review`, use `securityTier: 'final'` for security only or `tier: 'final'` for every lens.
-Code review itself runs on Terra at `max` by default (Sol implements, Terra reviews).
 
 Keep Sol at `xhigh`, including long implementations. Set `"effort": "max"` only for an
 exceptional unresolved problem after an `xhigh` attempt or when the owner requests it;

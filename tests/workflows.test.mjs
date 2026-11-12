@@ -1457,17 +1457,24 @@ for (const c of [
   // a high/critical finding (by Codex's rating) that Claude refuted or left open, with no astra tiebreak, is listed
   const contested = c.findings.map(([severity, verdict], i) => ({ severity, verdict, id: "code:" + (i + 1) }))
     .filter(f => ["critical", "high"].includes(f.severity) && ["refuted", "needs_info"].includes(f.verdict));
-  const listed = args.escalate === true || args.triage === false ? [] : contested;
+  const astraLens = args.tier === "final";
+  const listed = args.triage === false || (args.escalate === true && !astraLens) ? [] : contested;
   assert.deepEqual(result.notCrossChecked.map(f => f.id), listed.map(f => f.id));
-  const them = listed.length === 1 ? "it" : "them";
+  assert.ok(result.notCrossChecked.every(f => f.reason === (astraLens ? "astra_lens" : "escalate_off")));
   const notChecked = listed.length
-    ? "Not cross-checked (escalate is off): " + listed.map(f => f.id + " (" + (f.verdict === "needs_info" ? "needs-info" : "refuted") + ")").join(", ")
-      + " — Codex rated " + them + " high or critical, the Claude triage refuted or could not settle " + them + ", and no astra tiebreak ran. Check " + them + " in the code, or ask the owner for an astra run.\n\n"
+    ? notCrossCheckedLineFor(listed.map(f => [f.id, f.verdict === "needs_info" ? "needs-info" : "refuted", astraLens ? "astra_lens" : "escalate_off"])) + "\n\n"
     : "";
   assert.equal(result.report, "FINAL\n\n" + notChecked + line);
   assert.equal(result.escalation, args.escalate === true ? result.escalation : null, "no astra tiebreak without escalate: true");
   if (c.name.startsWith("disputed")) assert.equal(result.disputed.length, 1);
 });
+
+// The fixed "Not cross-checked:" line the workflow writes, built from [id, "refuted"|"needs-info", "escalate_off"|"astra_lens"] entries.
+function notCrossCheckedLineFor(entries) {
+  return "Not cross-checked: " + entries.map(([id, verdict, reason]) => id + " (" + verdict + ", " + (reason === "astra_lens" ? "astra lens" : "escalate off") + ")").join(", ")
+    + " — Codex rated each of them high or critical, the Claude triage refuted it or could not settle it, and no astra tiebreak ran for it. Check each one in the code."
+    + (entries.some(([, , reason]) => reason === "escalate_off") ? " For those marked escalate off, the owner can also ask for an astra run." : "");
+}
 
 // Stub for the escalation tests: one lens review with the given Codex findings; Claude's triage verdicts come from `triage`.
 function escalationStub({ findings, triage, requests = [], prompts = {}, astra = null }) {
@@ -1513,13 +1520,17 @@ test("codex-review runs no astra tiebreak by default and lists the high/critical
   assert.deepEqual(requests.map(r => r.label).sort(), ["codex:code", "codex:security"], "no codex:escalate request");
   assert.equal(result.escalation, null);
   assert.equal(run.phases.includes("Escalate"), false, "the Escalate phase does not start");
-  // only the high/critical (by Codex) findings of a non-Astra lens that Claude refuted or left open
-  assert.deepEqual(result.notCrossChecked.map(f => [f.id, f.codexSeverity, f.claudeVerdict, f.claudeSeverity, f.why, f.triageFailed]), [
-    ["code:1", "high", "refuted", "high", "Claude: refuted 1", false],
-    ["code:2", "critical", "needs_info", "medium", "Claude: needs_info 2", false],
+  // every high/critical (by Codex) finding that Claude refuted or left open and no tiebreak looked at: the two of the
+  // Terra lens (escalate is off) and the one of the Astra security lens (astra wrote it)
+  assert.deepEqual(result.notCrossChecked.map(f => [f.id, f.lens, f.codexSeverity, f.claudeVerdict, f.claudeSeverity, f.why, f.triageFailed, f.reason]), [
+    ["code:1", "code", "high", "refuted", "high", "Claude: refuted 1", false, "escalate_off"],
+    ["code:2", "code", "critical", "needs_info", "medium", "Claude: needs_info 2", false, "escalate_off"],
+    ["security:1", "security", "high", "refuted", "high", "Claude: refuted 1", false, "astra_lens"],
   ]);
-  assert.deepEqual(result.notCrossChecked.map(f => [f.title, f.file, f.line]), [["defect 1", "x.rs", 1], ["defect 2", "x.rs", 2]]);
-  // they stay in refuted / needsInfo as before, and the Astra security finding is not listed (Astra found it)
+  assert.deepEqual(result.notCrossChecked.map(f => [f.title, f.file, f.line]), [["defect 1", "x.rs", 1], ["defect 2", "x.rs", 2], ["defect 1", "x.rs", 1]]);
+  // Codex's own claim travels with each entry, so the finding can be checked from the output alone
+  for (const entry of result.notCrossChecked) assert.deepEqual([entry.evidence, entry.failure_scenario, entry.recommendation], ["e", "s", "r"]);
+  // they stay in refuted / needsInfo as before
   assert.deepEqual(result.refuted.map(f => f.id), ["code:1", "code:4", "security:1"]);
   assert.deepEqual(result.needsInfo.map(f => f.id), ["code:2", "code:5"]);
   assert.deepEqual(result.disputed, []);
@@ -1528,18 +1539,20 @@ test("codex-review runs no astra tiebreak by default and lists the high/critical
   assert.deepEqual(result.rereview.carry.map(f => [f.id, f.status, f.severity]), [["code:3", "confirmed", "high"], ["code:2", "needs_info", "critical"], ["code:5", "needs_info", "low"]]);
   // the report prompt names them once, in their own section, and keeps the verdict rule for needs-info
   assert.match(prompts.report, /NOT CROSS-CHECKED high\/critical findings/);
-  assert.match(prompts.report, /no second model family looked at them/);
-  assert.match(prompts.report, /ask the owner for an astra run/);
+  assert.match(prompts.report, /no astra tiebreak looked at them/);
+  assert.match(prompts.report, /Codex's claim \(evidence, failure scenario\)/);
+  assert.match(prompts.report, /for reason "escalate_off" the owner can also ask for an astra run, for reason "astra_lens" the finding was written by astra, so do not suggest an astra run/);
   assert.match(prompts.report, /left out of the REFUTED and NEEDS-INFO lists below/);
+  assert.ok(prompts.report.includes('"evidence":"e","failure_scenario":"s","recommendation":"r"'), "the report agent sees Codex's claim");
   const refutedSection = prompts.report.slice(prompts.report.indexOf("REFUTED findings (one line each"));
-  assert.ok(!refutedSection.includes('"code:1"') && refutedSection.includes('"code:4"') && refutedSection.includes('"security:1"'));
+  assert.ok(!refutedSection.includes('"code:1"') && !refutedSection.includes('"security:1"') && refutedSection.includes('"code:4"'));
   const needsSection = prompts.report.slice(prompts.report.indexOf("NEEDS-INFO findings"), prompts.report.indexOf("REFUTED findings (one line each"));
   assert.ok(!needsSection.includes('"code:2"') && needsSection.includes('"code:5"'));
   assert.match(prompts.report, /still counts as unresolved in the verdict/);
   // the workflow adds the line itself, before the re-review line
-  const line = "Not cross-checked (escalate is off): code:1 (refuted), code:2 (needs-info) — Codex rated them high or critical, the Claude triage refuted or could not settle them, and no astra tiebreak ran. Check them in the code, or ask the owner for an astra run.";
+  const line = notCrossCheckedLineFor([["code:1", "refuted", "escalate_off"], ["code:2", "needs-info", "escalate_off"], ["security:1", "refuted", "astra_lens"]]);
   assert.equal(result.report, "OVERALL: see below\n\n" + line + "\n\n" + "Re-review: delta (pass 2, tier light, securityTier final, base = the commit this pass reviewed) — " + result.rereview.reason);
-  assert.ok(run.logs.some(message => /2 high\/critical finding\(s\) NOT cross-checked/.test(message)));
+  assert.ok(run.logs.some(message => /3 high\/critical finding\(s\) NOT cross-checked \(escalate_off, astra_lens\)/.test(message)));
 });
 
 test("codex-review escalate is opt-in: only the boolean true runs the astra tiebreak", async () => {
@@ -1563,16 +1576,60 @@ test("codex-review escalate is opt-in: only the boolean true runs the astra tieb
   }
 });
 
-test("codex-review not cross-checked: only Codex high/critical findings of non-Astra lenses with a refuted or open triage, a failed triage included", async () => {
+test("codex-review with escalate: true still lists the doubted findings of an Astra lens as not cross-checked (no tiebreak is possible for them)", async () => {
+  const findings = [{ severity: "high", verdict: "refuted" }, { severity: "critical", verdict: "needs_info" }, { severity: "low", verdict: "refuted" }];
+  // code on Terra (tiebreak runs), security on Astra (not eligible): security:1 is the stub's refuted high finding
+  const requests = [];
+  const prompts = {};
+  const run = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings, requests, prompts, astra: "refute" }), args: { lenses: ["code", "security"], securityTier: "final", escalate: true } });
+  const { result } = run;
+  assert.deepEqual(requests.map(r => r.label).sort(), ["codex:code", "codex:escalate", "codex:security"]);
+  const escalated = requests.find(r => r.label === "codex:escalate");
+  assert.deepEqual(JSON.parse(escalated.task.slice(escalated.task.indexOf("INPUT ITEMS (JSON):") + "INPUT ITEMS (JSON):".length)).map(f => f.id), ["code:1", "code:2"], "only the Terra lens is escalated");
+  assert.deepEqual(result.escalation, { ran: true, checked: 2, upheld: 0, settled: 2, failed: 0 });
+  assert.deepEqual(result.notCrossChecked.map(f => [f.id, f.reason]), [["security:1", "astra_lens"]]);
+  assert.equal(result.notCrossChecked[0].evidence, "e");
+  assert.equal(result.report, "OVERALL: see below\n\n" + notCrossCheckedLineFor([["security:1", "refuted", "astra_lens"]]) + "\n\nRe-review: " + (result.rereview.recommendation === "delta" ? "delta (pass 2, tier light, securityTier final, base = the commit this pass reviewed)" : result.rereview.recommendation === "owner" ? "owner decides" : "none") + " — " + result.rereview.reason);
+  assert.ok(!/ask for an astra run/.test(result.report.split("\n\nRe-review:")[0].split("\n\n").pop()), "no astra run is suggested for an astra-lens finding");
+  assert.match(prompts.report, /NOT CROSS-CHECKED high\/critical findings/);
+  // every lens on Astra, with and without escalate: the same, and no tiebreak request at all
+  for (const escalate of [false, true]) {
+    const reqs = [];
+    const all = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings, requests: reqs }), args: { lenses: ["code"], tier: "final", escalate } });
+    assert.deepEqual(reqs.map(r => r.label), ["codex:code"]);
+    assert.equal(all.result.escalation, null);
+    assert.deepEqual(all.result.notCrossChecked.map(f => [f.id, f.reason]), [["code:1", "astra_lens"], ["code:2", "astra_lens"]]);
+    assert.ok(all.result.report.includes("(refuted, astra lens), code:2 (needs-info, astra lens)"));
+    assert.ok(!all.result.report.includes("escalate off"));
+    assert.ok(!all.result.report.includes("ask for an astra run"));
+    assert.equal(all.result.rereview.worst, "critical", "the needs-info critical finding still counts as unresolved");
+  }
+});
+
+test("codex-review repeated lens names run once, keep the first order and give every finding a unique id", async () => {
+  const findings = [{ severity: "high", verdict: "refuted" }, { severity: "medium", verdict: "confirmed" }];
+  const requests = [];
+  const prompts = {};
+  const { result } = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings, requests, prompts }), args: { lenses: ["domain", "code", "domain", "bogus", "code", "domain"] } });
+  assert.deepEqual(requests.map(r => r.label).sort(), ["codex:code", "codex:domain"]);
+  assert.deepEqual(result.lenses.map(l => l.lens), ["domain", "code"]);
+  assert.deepEqual([...result.confirmed, ...result.refuted].map(f => f.id).sort(), ["code:1", "code:2", "domain:1", "domain:2"]);
+  assert.deepEqual(result.notCrossChecked.map(f => f.id), ["domain:1", "code:1"], "no id is shared by two findings, so the id filter cannot hide an unrelated one");
+  const refutedSection = prompts.report.slice(prompts.report.indexOf("REFUTED findings (one line each"));
+  assert.ok(!refutedSection.includes('"domain:1"') && !refutedSection.includes('"code:1"'));
+  assert.match(result.report, /Not cross-checked: domain:1 \(refuted, escalate off\), code:1 \(refuted, escalate off\)/);
+});
+
+test("codex-review not cross-checked: only Codex high/critical findings with a refuted or open triage that no tiebreak looked at, a failed triage included", async () => {
   // triage off: nothing was judged, so nothing is listed (the findings are reported as untriaged)
   const findings = [{ severity: "high", verdict: "refuted" }, { severity: "low", verdict: "refuted" }, { severity: "medium", verdict: "needs_info" }];
   const off = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings }), args: { lenses: ["code"], triage: false } });
   assert.deepEqual(off.result.notCrossChecked, []);
   assert.deepEqual(off.result.untriaged.map(f => f.id), ["code:1", "code:2", "code:3"]);
   assert.ok(!/Not cross-checked/.test(off.result.report));
-  // every lens on Astra: Astra found them, no second look can come from an astra tiebreak
+  // every lens on Astra: Astra found them, so no tiebreak is possible; they are still listed (reason astra_lens)
   const final = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings }), args: { lenses: ["code"], tier: "final" } });
-  assert.deepEqual(final.result.notCrossChecked, []);
+  assert.deepEqual(final.result.notCrossChecked.map(f => [f.id, f.reason]), [["code:1", "astra_lens"]]);
   // a triage that failed leaves the finding needs-info: listed, and marked
   const base = escalationStub({ findings, triage: findings });
   const failing = async (prompt, opts) => {
@@ -1585,14 +1642,28 @@ test("codex-review not cross-checked: only Codex high/critical findings of non-A
   assert.equal(failed.result.rereview.worst, "high");
 });
 
-test("codex-review replaces a stale Not cross-checked line written by the report agent", async () => {
+test("codex-review replaces stale Not cross-checked and Re-review lines written by the report agent, also the exact line the workflow writes", async () => {
   const findings = [{ severity: "critical", verdict: "refuted" }];
   const base = escalationStub({ findings, triage: findings });
-  const agent = async (prompt, opts) => opts.label === "report" ? "OVERALL: ship\n\nNot cross-checked: made up\nRe-review: wrong\n\n" : base(prompt, opts);
-  const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"] } });
-  assert.equal(result.report.split("\n").filter(line => line.startsWith("Not cross-checked")).length, 1);
-  assert.equal(result.report.split("\n").filter(line => line.startsWith("Re-review:")).length, 1);
-  assert.match(result.report, /^OVERALL: ship\n\nNot cross-checked \(escalate is off\): code:1 \(refuted\) — Codex rated it high or critical, the Claude triage refuted or could not settle it, and no astra tiebreak ran\. Check it in the code, or ask the owner for an astra run\.\n\nRe-review: none — /);
+  const exact = notCrossCheckedLineFor([["code:1", "refuted", "escalate_off"]]);
+  const stale = [
+    "Not cross-checked: made up\nRe-review: wrong\n\n",
+    "Not cross-checked (escalate is off): code:1 (refuted) — old wording\n\nRe-review: wrong",
+    exact + "\n\nRe-review: none — copied from an earlier run\n",
+    exact + "\r\n\r\nRe-review: wrong\r\n",
+    "Not cross-checked (a, b): x\nNot cross-checked: y\nRe-review: z",
+  ];
+  for (const tail of stale) {
+    const agent = async (prompt, opts) => opts.label === "report" ? "OVERALL: ship\n\n" + tail : base(prompt, opts);
+    const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"] } });
+    assert.equal(result.report.split("\n").filter(line => line.startsWith("Not cross-checked")).length, 1, JSON.stringify(tail));
+    assert.equal(result.report.split("\n").filter(line => line.startsWith("Re-review:")).length, 1, JSON.stringify(tail));
+    assert.equal(result.report, "OVERALL: ship\n\n" + exact + "\n\nRe-review: none — " + result.rereview.reason, JSON.stringify(tail));
+  }
+  // a line of the report agent that only starts with those words in the middle of the text is kept
+  const kept = async (prompt, opts) => opts.label === "report" ? "Not cross-checked: kept in the middle\nOVERALL: ship" : base(prompt, opts);
+  const { result } = await runWorkflow("codex-review", { agent: kept, args: { lenses: ["code"] } });
+  assert.ok(result.report.startsWith("Not cross-checked: kept in the middle\nOVERALL: ship\n\n" + exact));
 });
 
 test("codex-review at the cap of 2: pass 2 with a high finding open goes to the owner, an approved pass 3 is still allowed to run", async () => {
@@ -1687,18 +1758,34 @@ test("codex-review appends its footer when missing and replaces trailing stale f
   }
 });
 
-test("codex-review preserves empty and non-string reports without crashing", async () => {
+test("codex-review builds a fallback report when the report stage returns no text, so the fixed lines are not lost", async () => {
+  const sentence = "The report stage returned no text; the findings are in the result fields (confirmed, disputed, notCrossChecked, needsInfo, refuted, untriaged, lenses).";
   for (const report of ["", " \n\t ", null, undefined, false, 0, { text: "no string report" }, []]) {
-    const agent = async (prompt, opts) => {
+    // clean review: the sentence and the Re-review line
+    const clean = async (prompt, opts) => {
       if (opts.agentType === RELAY) {
         const { request } = receive(prompt);
         return okEnvelope(request, { verdict: "approve", summary: "clean", findings: [] });
       }
       return opts.label === "report" ? report : null;
     };
-    const { result } = await runWorkflow("codex-review", { agent, args: { lenses: ["code"] } });
-    assert.equal(result.report, report);
+    const one = await runWorkflow("codex-review", { agent: clean, args: { lenses: ["code"] } });
+    assert.equal(one.result.status, "complete", "the fallback does not change status");
+    assert.equal(one.result.report, sentence + "\n\nRe-review: none — " + one.result.rereview.reason);
+    // a doubted high finding: the sentence, the Not cross-checked line and the Re-review line
+    const findings = [{ severity: "high", verdict: "refuted" }];
+    const base = escalationStub({ findings, triage: findings });
+    const two = await runWorkflow("codex-review", { agent: async (prompt, opts) => opts.label === "report" ? report : base(prompt, opts), args: { lenses: ["code"] } });
+    assert.equal(two.result.report, sentence + "\n\n" + notCrossCheckedLineFor([["code:1", "refuted", "escalate_off"]]) + "\n\nRe-review: none — " + two.result.rereview.reason);
+    assert.deepEqual(two.result.notCrossChecked.map(f => f.id), ["code:1"]);
   }
+  // a failed lens still makes the result incomplete, with the fallback report
+  const failing = async (prompt, opts) => opts.agentType === RELAY
+    ? JSON.stringify({ ultracodex: 1, ok: false, state: "timeout", runId: RUN_ID, error: { kind: "timeout", message: "deadline" } })
+    : (opts.label === "report" ? "" : null);
+  const failed = await runWorkflow("codex-review", { agent: failing, args: { lenses: ["code"] } });
+  assert.equal(failed.result.status, "incomplete");
+  assert.ok(failed.result.report.startsWith(sentence + "\n\nRe-review: "));
 });
 
 test("codex-review refuses a pass above 2 without the owner's boolean approval before any agent call", async () => {
