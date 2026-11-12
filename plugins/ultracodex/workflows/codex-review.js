@@ -697,10 +697,11 @@ if (failedLenses.length) log('⚠ ' + failedLenses.length + '/' + lensKeys.lengt
 // (needs-info) and the review incomplete. Two ideas are kept apart:
 //  - eligible for the tiebreak: such a finding from a lens that is not on tier final, and only with
 //    escalate: true (astra uses much more quota than the lenses, so it is opt-in);
-//  - listed as NOT CROSS-CHECKED: such a finding that no tiebreak looked at, so that nothing is dropped
-//    silently — all of them when escalate is off (reason escalate_off), and the ones from an astra lens
+//  - listed as NOT CROSS-CHECKED: such a finding that no tiebreak gave a verdict on, so that nothing is
+//    dropped silently — all of them when escalate is off (reason escalate_off), the ones from an astra lens
 //    also when it is on (reason astra_lens: astra wrote the finding, a tiebreak by astra would be the
-//    same model, so the caller checks it in the code).
+//    same model, so the caller checks it in the code), and the ones whose tiebreak failed (reason
+//    tiebreak_failed: an error, an ambiguous answer or no answer in the batch; the finding is needs-info).
 // A needs-info one still counts as unresolved in the verdict and in rereview.
 const escalation = { ran: false, checked: 0, upheld: 0, settled: 0, failed: 0 }
 const doubted = lenses.flatMap(l => l.findings.map(f => ({ f, astraLens: l.tier === 'final' })))
@@ -742,18 +743,21 @@ const bucketOf = f => {
 const by = v => (TRIAGE ? findings.filter(f => f.triage && bucketOf(f) === v) : [])
 const confirmed = by('confirmed'), refuted = by('refuted'), needsInfo = by('needs_info'), disputed = by('disputed')
 const untriaged = TRIAGE ? [] : findings
-// The doubted high/critical findings that no astra tiebreak looked at. They are also in refuted or needsInfo.
+// The doubted high/critical findings that no astra tiebreak gave a verdict on. They are also in refuted or needsInfo
+// (a failed tiebreak makes the finding needs-info, whatever the triage verdict was).
 // Each entry keeps Codex's own claim (evidence, failure_scenario, recommendation), so the finding can be
 // checked from this list alone.
-const notCrossChecked = doubted.filter(d => d.astraLens || !ESCALATE).map(({ f, astraLens }) => ({
+const tiebreakFailed = f => Boolean(f.escalation && f.escalation.error)
+const notCrossChecked = doubted.filter(d => d.astraLens || !ESCALATE || tiebreakFailed(d.f)).map(({ f, astraLens }) => ({
   id: f.id, lens: f.lens, title: f.title, file: f.file, line: f.line, codexSeverity: f.severity,
   evidence: f.evidence, failure_scenario: f.failure_scenario, recommendation: f.recommendation,
   claudeVerdict: f.triage.verdict, claudeSeverity: SEVERITIES.includes(f.triage.severity) ? f.triage.severity : null,
   why: f.triage.reasoning, triageFailed: f.triage.failed === true,
-  reason: astraLens ? 'astra_lens' : 'escalate_off',
+  reason: astraLens ? 'astra_lens' : !ESCALATE ? 'escalate_off' : 'tiebreak_failed',
+  ...(tiebreakFailed(f) ? { tiebreakError: f.escalation.error } : {}),
 }))
 const notCrossCheckedIds = new Set(notCrossChecked.map(f => f.id))
-if (notCrossChecked.length) log('⚠ ' + notCrossChecked.length + ' high/critical finding(s) NOT cross-checked (' + [...new Set(notCrossChecked.map(f => f.reason))].join(', ') + '): Claude refuted them or could not settle them and no astra tiebreak looked at them — check them in the code')
+if (notCrossChecked.length) log('⚠ ' + notCrossChecked.length + ' high/critical finding(s) NOT cross-checked (' + [...new Set(notCrossChecked.map(f => f.reason))].join(', ') + '): Claude refuted them or could not settle them and no astra tiebreak gave a verdict on them — check them in the code')
 const whyRefuted = f => (f.escalation && !f.escalation.error ? 'gpt-6-astra: ' + f.escalation.reasoning : f.triage.reasoning)
 // Confirmed findings carry Claude's own severity from triage; Codex's stays as codexSeverity
 // and every change is listed. (The escalation above still keys on Codex's severity: a
@@ -805,9 +809,11 @@ if (worst === 'low' || worst === 'none') {
 }
 if (rereview.rerunLenses.length) rereview.reason = 'Re-run only these lenses on the same scope with the same pass number first — that is not a new pass. Failed lenses: ' + rereview.rerunLenses.join(', ') + '. This decision covers only the lenses that ran. Keep the first result; after the re-run, combine the findings of both runs and follow the stricter of the two rereview objects: worse worst, recommendation owner > delta > none, tier final > daily > light. ' + rereview.reason
 // Added by the workflow, not written by the report agent: a high/critical finding without a second look is never dropped silently.
-const notCrossCheckedLine = 'Not cross-checked: ' + notCrossChecked.map(f => f.id + ' (' + (f.claudeVerdict === 'needs_info' ? 'needs-info' : 'refuted') + ', ' + (f.reason === 'astra_lens' ? 'astra lens' : 'escalate off') + ')').join(', ')
-  + ' — Codex rated each of them high or critical, the Claude triage refuted it or could not settle it, and no astra tiebreak ran for it. Check each one in the code.'
+const NCC_LABEL = { astra_lens: 'astra lens', escalate_off: 'escalate off', tiebreak_failed: 'tiebreak failed' }
+const notCrossCheckedLine = 'Not cross-checked: ' + notCrossChecked.map(f => f.id + ' (' + (f.reason === 'tiebreak_failed' || f.claudeVerdict === 'needs_info' ? 'needs-info' : 'refuted') + ', ' + NCC_LABEL[f.reason] + ')').join(', ')
+  + ' — Codex rated each of them high or critical, the Claude triage refuted it or could not settle it, and no astra tiebreak gave a verdict on it. Check each one in the code.'
   + (notCrossChecked.some(f => f.reason === 'escalate_off') ? ' For those marked escalate off, the owner can also ask for an astra run.' : '')
+  + (notCrossChecked.some(f => f.reason === 'tiebreak_failed') ? ' Those marked tiebreak failed are unresolved (the astra tiebreak failed): it can be re-run on just those findings.' : '')
 const rereviewLine = 'Re-review: ' + (rereview.recommendation === 'delta'
   ? 'delta (pass ' + rereview.nextPass + ', tier ' + rereview.tier + (rereview.securityTier ? ', securityTier ' + rereview.securityTier : '') + ', base = the commit this pass reviewed)'
   : rereview.recommendation === 'owner' ? 'owner decides' : 'none') + ' — ' + rereview.reason
@@ -818,9 +824,9 @@ ${failedLenses.length ? 'At the very top, state that these lenses FAILED and wer
 Per-lens Codex verdicts (include the model and effort used for each lens): ${JSON.stringify(lenses.filter(l => !l.error).map(l => ({ lens: l.lens, tier: l.tier, model: UCX_TIER_MODEL[l.tier], effort: l.effort, verdict: l.verdict, summary: l.summary })))}
 CONFIRMED findings, ranked by "severity" — Claude's own rating after checking the code; "codexSeverity" is what Codex said. Where they differ, show "Codex: <codexSeverity> → <severity>" with the severityReason. For each: file:line, failure scenario, fix: ${JSON.stringify(confirmedRated)}
 ${disputed.length ? 'DISPUTED findings (Claude doubted them, the gpt-6-astra escalation upheld them — present both sides and say the owner must decide): ' + JSON.stringify(disputed.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, severity: f.severity, claude: f.triage.reasoning, astra: f.escalation.reasoning }))) : ''}
-${notCrossChecked.length ? 'NOT CROSS-CHECKED high/critical findings (Codex rated them high or critical; the Claude triage refuted them or could not settle them; no astra tiebreak looked at them — list each one here with Codex\'s claim (evidence, failure scenario) and the Claude reason, say plainly that nothing else checked it, and say the caller must check it in the code; for reason "escalate_off" the owner can also ask for an astra run, for reason "astra_lens" the finding was written by astra, so do not suggest an astra run; they are left out of the REFUTED and NEEDS-INFO lists below): ' + JSON.stringify(notCrossChecked) : ''}
+${notCrossChecked.length ? 'NOT CROSS-CHECKED high/critical findings (Codex rated them high or critical; the Claude triage refuted them or could not settle them; no astra tiebreak gave a verdict on them — list each one here with Codex\'s claim (evidence, failure scenario) and the Claude reason, say plainly that nothing else checked it, and say the caller must check it in the code; for reason "escalate_off" the owner can also ask for an astra run, for reason "astra_lens" the finding was written by astra, so do not suggest an astra run, for reason "tiebreak_failed" the gpt-6-astra tiebreak FAILED (see tiebreakError): say so plainly, the finding is unresolved (needs-info), the review is incomplete, and the tiebreak can be re-run on just that finding; they are left out of the REFUTED and NEEDS-INFO lists below): ' + JSON.stringify(notCrossChecked) : ''}
 ${untriaged.length ? 'UNTRIAGED Codex findings (triage was off — present them as unverified claims, not as confirmed defects): ' + JSON.stringify(untriaged) : ''}
-NEEDS-INFO findings (say what must be checked; those with an "escalation.error" are high/critical findings Claude doubted whose gpt-6-astra tiebreak FAILED — say so plainly, they are unresolved; a needs-info finding rated high or critical still counts as unresolved in the verdict, also when it is listed as not cross-checked above): ${JSON.stringify(needsInfo.filter(f => !notCrossCheckedIds.has(f.id)))}
+NEEDS-INFO findings (say what must be checked; a needs-info finding rated high or critical still counts as unresolved in the verdict, also when it is listed as not cross-checked above, and so does one whose gpt-6-astra tiebreak failed): ${JSON.stringify(needsInfo.filter(f => !notCrossCheckedIds.has(f.id)))}
 REFUTED findings (one line each, with the reason): ${JSON.stringify(refuted.filter(f => !notCrossCheckedIds.has(f.id)).map(f => ({ id: f.id, title: f.title, why: whyRefuted(f) })))}
 Merge findings that describe the same defect (same root cause, often reported by more than one lens) into one item and list all their ids.
 Present low findings as optional: fix now only those that take a few lines and are obviously correct; list the rest as follow-ups.

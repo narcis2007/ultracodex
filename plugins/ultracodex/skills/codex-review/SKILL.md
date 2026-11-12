@@ -128,15 +128,17 @@ Claude's rating, with every change listed (`severityChanges`). Then it writes th
 The **astra tiebreak is opt-in**. With `escalate: true`, the workflow sends the high/critical
 findings (by Codex's rating) that Claude refuted or could not settle to gpt-6-astra in one run,
 for findings from non-Astra lenses; Astra findings are not sent to Astra again. Nothing is dropped
-silently: a high/critical finding that Claude doubted and no tiebreak looked at is listed as
+silently: a high/critical finding that Claude doubted and no tiebreak gave a verdict on is listed as
 **not cross-checked**, in `notCrossChecked` (with Codex's evidence and failure scenario, and a
 `reason`), in the report and in a `Not cross-checked:` line before the `Re-review:` line. That is
-every such finding when `escalate` is off (`reason: 'escalate_off'`), and the ones from an astra
-lens also when it is on (`reason: 'astra_lens'`). Check each one yourself in the code. For
-`escalate_off` ones you can also ask the owner for an astra run on just those findings (`codex-ask`
-with `tier: 'final'`, or `ultracodex:crosscheck`); an `astra_lens` finding was written by astra, so
-no astra run applies. A needs-info finding rated high/critical still counts as unresolved in the
-verdict and in `rereview`. Re-running the whole review with `escalate: true` costs all lenses
+every such finding when `escalate` is off (`reason: 'escalate_off'`), the ones from an astra lens
+also when it is on (`reason: 'astra_lens'`), and the ones whose tiebreak failed (an error, an
+ambiguous answer or no answer: `reason: 'tiebreak_failed'`, the finding is needs-info and the
+review `incomplete`). Check each one yourself in the code. For `escalate_off` ones you can also ask
+the owner for an astra run on just those findings (`codex-ask` with `tier: 'final'`, or
+`ultracodex:crosscheck`), and a `tiebreak_failed` one can be re-run the same way; an `astra_lens`
+finding was written by astra, so no astra run applies. A needs-info finding rated high/critical
+still counts as unresolved in the verdict and in `rereview`. Re-running the whole review with `escalate: true` costs all lenses
 again: do it only when the owner wants that.
 
 A lens that failed makes the result `incomplete` — say which lens and why. **Disputed** findings

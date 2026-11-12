@@ -1471,12 +1471,15 @@ for (const c of [
 
 // The fixed "Not cross-checked:" line the workflow writes, built from [id, "refuted"|"needs-info", "escalate_off"|"astra_lens"] entries.
 function notCrossCheckedLineFor(entries) {
-  return "Not cross-checked: " + entries.map(([id, verdict, reason]) => id + " (" + verdict + ", " + (reason === "astra_lens" ? "astra lens" : "escalate off") + ")").join(", ")
-    + " — Codex rated each of them high or critical, the Claude triage refuted it or could not settle it, and no astra tiebreak ran for it. Check each one in the code."
-    + (entries.some(([, , reason]) => reason === "escalate_off") ? " For those marked escalate off, the owner can also ask for an astra run." : "");
+  const label = { astra_lens: "astra lens", escalate_off: "escalate off", tiebreak_failed: "tiebreak failed" };
+  return "Not cross-checked: " + entries.map(([id, verdict, reason]) => id + " (" + verdict + ", " + label[reason] + ")").join(", ")
+    + " — Codex rated each of them high or critical, the Claude triage refuted it or could not settle it, and no astra tiebreak gave a verdict on it. Check each one in the code."
+    + (entries.some(([, , reason]) => reason === "escalate_off") ? " For those marked escalate off, the owner can also ask for an astra run." : "")
+    + (entries.some(([, , reason]) => reason === "tiebreak_failed") ? " Those marked tiebreak failed are unresolved (the astra tiebreak failed): it can be re-run on just those findings." : "");
 }
 
 // Stub for the escalation tests: one lens review with the given Codex findings; Claude's triage verdicts come from `triage`.
+// astra: "uphold" (default) | "refute" | "fail" (the batch fails) | "ambiguous" (the first id twice) | "missing" (the first id left out).
 function escalationStub({ findings, triage, requests = [], prompts = {}, astra = null }) {
   return async (prompt, opts) => {
     if (opts.agentType === RELAY) {
@@ -1484,7 +1487,11 @@ function escalationStub({ findings, triage, requests = [], prompts = {}, astra =
       requests.push(request);
       if (request.label === "codex:escalate") {
         const items = JSON.parse(request.task.slice(request.task.indexOf("INPUT ITEMS (JSON):") + "INPUT ITEMS (JSON):".length));
-        return okEnvelope(request, { results: items.map(f => ({ id: f.id, refuted: astra === "refute", confidence: 0.9, reasoning: "astra read the code" })) });
+        if (astra === "fail") return JSON.stringify({ ultracodex: 1, ok: false, state: "failed", runId: RUN_ID, error: { kind: "auth", message: "login" } });
+        const verdict = (id, refuted) => ({ id, refuted, confidence: 0.9, reasoning: "astra read the code" });
+        if (astra === "ambiguous") return okEnvelope(request, { results: [verdict(items[0].id, false), verdict(items[0].id, true), ...items.slice(1).map(f => verdict(f.id, true))] });
+        if (astra === "missing") return okEnvelope(request, { results: items.slice(1).map(f => verdict(f.id, false)) });
+        return okEnvelope(request, { results: items.map(f => verdict(f.id, astra === "refute")) });
       }
       const list = request.label === "codex:security" ? [{ severity: "high", verdict: "refuted" }] : findings;
       return okEnvelope(request, {
@@ -1539,7 +1546,8 @@ test("codex-review runs no astra tiebreak by default and lists the high/critical
   assert.deepEqual(result.rereview.carry.map(f => [f.id, f.status, f.severity]), [["code:3", "confirmed", "high"], ["code:2", "needs_info", "critical"], ["code:5", "needs_info", "low"]]);
   // the report prompt names them once, in their own section, and keeps the verdict rule for needs-info
   assert.match(prompts.report, /NOT CROSS-CHECKED high\/critical findings/);
-  assert.match(prompts.report, /no astra tiebreak looked at them/);
+  assert.match(prompts.report, /no astra tiebreak gave a verdict on them/);
+  assert.match(prompts.report, /for reason "tiebreak_failed" the gpt-6-astra tiebreak FAILED \(see tiebreakError\): say so plainly, the finding is unresolved \(needs-info\), the review is incomplete, and the tiebreak can be re-run on just that finding/);
   assert.match(prompts.report, /Codex's claim \(evidence, failure scenario\)/);
   assert.match(prompts.report, /for reason "escalate_off" the owner can also ask for an astra run, for reason "astra_lens" the finding was written by astra, so do not suggest an astra run/);
   assert.match(prompts.report, /left out of the REFUTED and NEEDS-INFO lists below/);
@@ -1604,6 +1612,56 @@ test("codex-review with escalate: true still lists the doubted findings of an As
     assert.ok(!all.result.report.includes("ask for an astra run"));
     assert.equal(all.result.rereview.worst, "critical", "the needs-info critical finding still counts as unresolved");
   }
+});
+
+test("codex-review lists a finding whose astra tiebreak failed as not cross-checked (tiebreak_failed), and keeps it needs-info, carried, incomplete", async () => {
+  const findings = [{ severity: "high", verdict: "refuted" }, { severity: "critical", verdict: "needs_info", claudeSeverity: "medium" }, { severity: "medium", verdict: "confirmed" }];
+  const cases = [
+    // [astra mode, ids whose tiebreak failed, error kinds, ids that got a verdict and where they go]
+    ["fail", ["code:1", "code:2"], ["auth", "auth"], { settled: 0, upheld: 0, failed: 2 }],
+    ["ambiguous", ["code:1"], ["ambiguous_verdict"], { settled: 1, upheld: 0, failed: 1 }],
+    ["missing", ["code:1"], ["missing_from_batch"], { settled: 0, upheld: 1, failed: 1 }],
+  ];
+  for (const [astra, ids, kinds, counts] of cases) {
+    const prompts = {};
+    const requests = [];
+    const { result } = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings, requests, prompts, astra }), args: { lenses: ["code"], escalate: true } });
+    assert.equal(result.status, "incomplete", astra);
+    assert.deepEqual(result.escalation, { ran: true, checked: 2, ...counts }, astra);
+    // listed once each, with the reason and the error kind; Codex's claim travels with the entry
+    assert.deepEqual(result.notCrossChecked.map(f => [f.id, f.reason, f.tiebreakError]), ids.map((id, i) => [id, "tiebreak_failed", kinds[i]]), astra);
+    for (const entry of result.notCrossChecked) assert.deepEqual([entry.evidence, entry.failure_scenario, entry.recommendation, entry.codexSeverity], ["e", "s", "r", entry.id === "code:1" ? "high" : "critical"]);
+    // the finding stays needs-info (whatever the triage said), is carried and still counts for the verdict
+    for (const id of ids) {
+      assert.ok(result.needsInfo.some(f => f.id === id && f.escalation.error), astra + " " + id + " in needsInfo");
+      assert.ok(!result.refuted.some(f => f.id === id), astra + " " + id + " not refuted");
+    }
+    assert.deepEqual(result.rereview.carry.filter(f => f.status === "needs_info").map(f => [f.id, f.severity]), ids.map(id => [id, id === "code:1" ? "high" : "critical"]), astra);
+    assert.equal(result.rereview.worst, ids.includes("code:2") ? "critical" : astra === "missing" ? "critical" : "high", astra);
+    // the fixed line: needs-info whatever the triage verdict was, the right label, the re-run hint, no astra-run suggestion
+    const line = notCrossCheckedLineFor(ids.map(id => [id, "needs-info", "tiebreak_failed"]));
+    assert.equal(result.report, "OVERALL: see below\n\n" + line + "\n\nRe-review: " + (result.rereview.recommendation === "delta" ? "delta (pass 2, tier light, base = the commit this pass reviewed)" : result.rereview.recommendation === "owner" ? "owner decides" : "none") + " — " + result.rereview.reason, astra);
+    assert.ok(!line.includes("escalate off") && !line.includes("ask for an astra run"));
+    // the report prompt tells the report agent: not cross-checked section, with the failed tiebreak, and the failed ids are out of the NEEDS-INFO list
+    assert.match(prompts.report, /"reason":"tiebreak_failed","tiebreakError":"/);
+    assert.match(prompts.report, /the gpt-6-astra tiebreak FAILED/);
+    const needsSection = prompts.report.slice(prompts.report.indexOf("NEEDS-INFO findings"), prompts.report.indexOf("REFUTED findings (one line each"));
+    for (const id of ids) assert.ok(!needsSection.includes('"' + id + '"'), astra + " " + id + " listed once, in the not-cross-checked section");
+    assert.match(needsSection, /so does one whose gpt-6-astra tiebreak failed/);
+  }
+  // a tiebreak that gave a verdict is not listed: settled (refuted) and upheld (disputed) findings
+  const missing = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings, astra: "missing" }), args: { lenses: ["code"], escalate: true } });
+  assert.deepEqual(missing.result.disputed.map(f => f.id), ["code:2"]);
+  assert.ok(!missing.result.notCrossChecked.some(f => f.id === "code:2"));
+  // all three reasons in one line: Terra lens with a failed tiebreak, an Astra security lens, escalate on
+  const mixed = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings, astra: "fail" }), args: { lenses: ["code", "security"], securityTier: "final", escalate: true } });
+  assert.deepEqual(mixed.result.notCrossChecked.map(f => [f.id, f.reason]), [["code:1", "tiebreak_failed"], ["code:2", "tiebreak_failed"], ["security:1", "astra_lens"]]);
+  assert.ok(mixed.result.report.includes(notCrossCheckedLineFor([["code:1", "needs-info", "tiebreak_failed"], ["code:2", "needs-info", "tiebreak_failed"], ["security:1", "refuted", "astra_lens"]])));
+  assert.equal(mixed.result.status, "incomplete");
+  // with escalate off the same findings are escalate_off, not tiebreak_failed
+  const off = await runWorkflow("codex-review", { agent: escalationStub({ findings, triage: findings, astra: "fail" }), args: { lenses: ["code"] } });
+  assert.deepEqual(off.result.notCrossChecked.map(f => [f.id, f.reason, f.tiebreakError]), [["code:1", "escalate_off", undefined], ["code:2", "escalate_off", undefined]]);
+  assert.equal(off.result.status, "complete");
 });
 
 test("codex-review repeated lens names run once, keep the first order and give every finding a unique id", async () => {

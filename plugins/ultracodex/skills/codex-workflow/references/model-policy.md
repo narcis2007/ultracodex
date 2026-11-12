@@ -85,10 +85,10 @@ Rules of thumb:
   actual routing. Findings already reviewed by Astra do not get another Astra tiebreak.
 - **Escalate high/critical disagreements only on request.** When Claude and a Codex reviewer disagree on
   such a finding, `codex-review` can send it to astra in one run (`escalate: true`, off by default:
-  astra costs much more quota). A doubted high/critical finding that no tiebreak looked at is listed
-  as "not cross-checked" (`notCrossChecked`, with a `reason`): all of them without `escalate`, and the
-  ones from an astra lens also with it. The caller checks them in the code; for the ones the tiebreak
-  skipped because it was off, the owner can also ask for an astra run. Do not re-run the lens instead.
+  astra costs much more quota). A doubted high/critical finding that no tiebreak gave a verdict on is
+  listed as "not cross-checked" (`notCrossChecked`, with a `reason`): all of them without `escalate`, and
+  with it the ones from an astra lens and the ones whose tiebreak failed. The caller checks them in the
+  code; for the ones the tiebreak skipped or failed on, the owner can also ask for an astra run. Do not re-run the lens instead.
 - **`ultra` is opt-in, once.** `effort: 'ultra'` (astra/sol/terra — luna has none; the runner
   refuses it) adds automatic sub-agent delegation and runs long. Use it for at most one decisive
   node per run.

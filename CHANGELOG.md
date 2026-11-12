@@ -27,15 +27,20 @@
 - The astra tiebreak is opt-in: it runs only with `escalate: true` (before: on unless
   `escalate: false`; any value other than the boolean `true` leaves it off). Nothing is dropped
   silently. Every high/critical finding (by Codex's rating) that the triage refuted or left
-  needs-info and that no tiebreak looked at is listed as **not cross-checked**: all of them when
-  `escalate` is off (`reason: 'escalate_off'`), and the ones from an astra lens (tier `final`) also
+  needs-info and that no tiebreak gave a verdict on is listed as **not cross-checked**: all of them
+  when `escalate` is off (`reason: 'escalate_off'`), the ones from an astra lens (tier `final`) also
   when it is on (`reason: 'astra_lens'`: astra wrote the finding, so no astra tiebreak applies and
-  the caller checks it in the code). The list is the new result field `notCrossChecked`; each entry
+  the caller checks it in the code), and the ones whose tiebreak failed (an error, an ambiguous id or
+  an id missing from the batch: `reason: 'tiebreak_failed'` with `tiebreakError`; the finding stays
+  needs-info, the review stays `incomplete`, and `needsInfo`, `carry` and `rereview` are unchanged). The list is the new result field `notCrossChecked`; each entry
   keeps Codex's own claim (`evidence`, `failure_scenario`, `recommendation`) next to `lens`, the
   Claude verdict and severity and `why`, so the finding can be checked from the output alone. The
   report prompt has a section for them, and the workflow adds a `Not cross-checked:` line before the
-  `Re-review:` line (it names each id with its verdict and reason, and suggests an astra run only for
-  the `escalate off` ones). A needs-info high/critical finding still counts as unresolved for the
+  `Re-review:` line (it names each id with its verdict and reason, says no tiebreak gave a verdict on
+  it, suggests an astra run only for the `escalate off` ones, and says a `tiebreak failed` one is
+  unresolved and its tiebreak can be re-run). A failed-tiebreak finding is left out of the NEEDS-INFO
+  list of the report prompt, like the other listed ones; its section tells the report agent that the
+  tiebreak failed. A needs-info high/critical finding still counts as unresolved for the
   verdict and for `rereview`; `disputed` works as before when `escalate: true` is passed.
   `escalation` is `null` when the tiebreak is off.
 - `codex-review` fixes found in review: a repeated lens name (`lenses: ['code', 'code']`) runs once
