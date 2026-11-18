@@ -6,7 +6,7 @@ description: >-
   merged — optionally followed by a Codex or cross-model review and Codex follow-up fixes in
   the same session. Use when the user asks to have Codex implement / build / fix / refactor /
   migrate something, "give this to codex", "let codex write it", "use codex as the
-  implementer or subagent", or any implement-then-review combination. Tiers: gpt-6.1-sol@xhigh by
+  implementer or subagent", or any implement-then-review combination. Tiers: gpt-6.2-sol@xhigh by
   default, including complex code; gpt-6-astra@max for an explicit escalation or final critical
   review, gpt-6.1-terra@xhigh for mechanical changes (gpt-6-luna@max only as an explicit override).
 ---
@@ -26,7 +26,7 @@ have checked it yourself, and nothing is merged without the owner's OK.
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" preflight
 ```
 
-- `daily` → gpt-6.1-sol@xhigh: features, fixes, debugging, refactors and cross-module designs
+- `daily` → gpt-6.2-sol@xhigh: features, fixes, debugging, refactors and cross-module designs
   from a clear brief, including complex implementation;
 - `final` → gpt-6-astra@max: implementation only when the owner explicitly requests Astra,
   or when a concrete unresolved issue justifies escalation after a Sol attempt;

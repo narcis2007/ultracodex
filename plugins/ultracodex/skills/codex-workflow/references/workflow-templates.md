@@ -59,16 +59,19 @@ stage works in the session's directory, not in the workflow's `cwd`.
 // codex_send / codex_interrupt — can steer or stop it while it runs, find it by its label and watch its events.
 // Same request, same result, same signatures; if the runner cannot run it that way it runs it on codex exec, and
 // steerable: false (or ULTRACODEX_NODE_BACKEND=exec in the runner's environment) always does.
-// Routing (runner policy): tier 'light' → gpt-6.1-terra@xhigh · 'daily' → gpt-6.1-sol@xhigh
+// Routing (runner policy): tier 'light' → gpt-6.1-terra@xhigh · 'daily' → gpt-6.2-sol@xhigh
 // for every kind · 'final' → gpt-6-astra@max for exceptional critical work. Pin
-// model/effort only to override with a reason (gpt-6-luna is an explicit override only; its default effort is max).
+// model/effort only to override with a reason (gpt-6-luna is an explicit override only; its default effort is max;
+// gpt-6.1-sol is a daily-tier model only when named explicitly: no tier selects it any more, its default effort is xhigh).
+// Why 6.2 sol (owner's benchmark 2026-11-18, 9 replayed review cases, 11 known medium+ bugs): 6.2 sol@xhigh found 9,
+// 6.1 sol@xhigh 2, 6.1 terra@max 9 at about 20 % lower cost; same list price as 6.1 sol.
 // Concurrency is capped intrinsically: 4 Codex jobs per workflow, an astra job counting as 2 — do not wrap calls in
 // another gate.
-const UCX_VERSION = '0.6.7'
+const UCX_VERSION = '0.6.8'
 const UCX_RELAY = 'ultracodex:codex-relay'
-const UCX_TIER_MODEL = { light: 'gpt-6.1-terra', daily: 'gpt-6.1-sol', final: 'gpt-6-astra' }
+const UCX_TIER_MODEL = { light: 'gpt-6.1-terra', daily: 'gpt-6.2-sol', final: 'gpt-6-astra' }
 const UCX_TIER_EFFORT = { light: 'xhigh', daily: 'xhigh', final: 'max' }
-const UCX_MODEL_EFFORT = { 'gpt-6-luna': 'max' }   // no tier selects luna; an explicit luna keeps its own default effort (as the runner does)
+const UCX_MODEL_EFFORT = { 'gpt-6-luna': 'max', 'gpt-6.1-sol': 'xhigh' }   // no tier selects these; an explicit luna or 6.1 sol keeps its own default effort (as the runner does)
 const UCX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
 const UCX_KINDS = ['verify', 'ask', 'review']
 const UCX_PRESETS = ['verdict', 'score', 'review', 'implement']
@@ -784,9 +787,10 @@ Policy (enforced by the runner; override per node only with a reason):
 | Node | tier / kind | Runs as |
 | --- | --- | --- |
 | wide fan-out of small checks, triage, dedupe | `light` / `verify` | gpt-6.1-terra @ xhigh |
-| everyday adversarial verify, jurors | `daily` / `verify` | gpt-6.1-sol @ xhigh |
-| a second opinion | `daily` / `ask` | gpt-6.1-sol @ xhigh |
+| everyday adversarial verify, jurors | `daily` / `verify` | gpt-6.2-sol @ xhigh |
+| a second opinion | `daily` / `ask` | gpt-6.2-sol @ xhigh |
 | one lens of a code review | `light` / `review` with `effort: 'max'` (the `codex-review` pass-1 default) | gpt-6.1-terra @ max |
+| last gate for critical work (owner's rule, only when really necessary) | `daily` / `review` with `effort: 'max'` (one `codex-review` pass) | gpt-6.2-sol @ max |
 | final critical gate, load-bearing single verdict, unresolved issue escalated from Sol | `final` / any | gpt-6-astra @ max |
 
 `ultra` is never implicit: pass `effort: 'ultra'` on at most one decisive astra/sol node per run

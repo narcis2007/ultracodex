@@ -37,11 +37,11 @@ see [CHANGELOG.md](CHANGELOG.md) for what changed.
 | Tier | Model | For | Effort |
 | --- | --- | --- | --- |
 | `light` | gpt-6.1-terra | code review lenses (`codex-review` pass 1 asks for `max`), quick review or verification passes, triage, dedupe, wide fan-outs of small checks | `xhigh` for every workload |
-| `daily` | gpt-6.1-sol | implementation including complex code, debugging, architecture analysis, verification, jurors, plan checks, second opinions | `xhigh` for every workload |
+| `daily` | gpt-6.2-sol | implementation including complex code, debugging, architecture analysis, verification, jurors, plan checks, second opinions | `xhigh` for every workload |
 | `final` | gpt-6-astra | critical security work, data migrations, irreversible production steps, production release gates, high/critical issues escalated from Sol | `max` |
 
-Sol 6.1 is the default for implementation, including complex modules, and for plan checks and
-asks. Code review runs on Terra: in `codex-review`, omitting `tier` uses Terra at `max` on every
+Sol 6.2 is the default for implementation, including complex modules, and for plan checks and
+asks (since 0.6.8; before that 6.1 Sol, which stays usable as an explicit `model: 'gpt-6.1-sol'`: a daily-tier model at `xhigh`). Code review runs on Terra: in `codex-review`, omitting `tier` uses Terra at `max` on every
 lens of pass 1, including `security`, and Terra at `xhigh` (`light`) on every lens of a fix-delta
 pass (pass above 1). At most 2 passes per change; a pass above 2 needs `ownerApproved: true`.
 An explicit `tier` keeps its own default effort (`light` is terra@xhigh, `daily` is sol@xhigh);
@@ -58,9 +58,13 @@ findings are listed as "not cross-checked" in the report and in `notCrossChecked
 are never sent to Astra again. Choose the review by risk: a small, low-risk change needs no Codex
 review (see the `codex-review` skill).
 
-Prefer Sol 6.1 at `xhigh`, including complex and long tasks. Use Sol at `max` only with an
+Prefer Sol 6.2 at `xhigh`, including complex and long tasks. Use Sol at `max` only with an
 explicit effort override for an exceptional unresolved problem or at the owner's request;
-state the reason. Astra at `max` remains reserved for critical work.
+state the reason. The last gate for critical work is one `codex-review` pass with
+`tier: 'daily', effort: 'max'` (6.2 Sol at `max`) when really necessary. Astra at `max` remains opt-in and reserved for critical work.
+Why 6.2 Sol (0.6.8, owner's benchmark 2026-11-18, 9 replayed review cases with 11 known medium-or-worse bugs):
+6.2 Sol@xhigh found 9, 6.1 Sol@xhigh 2, 6.1 Terra@max 9 at about 20 % lower cost; 6.2 Sol has the same list price as 6.1 Sol.
+A 4-case probe found 6.2 Sol@max catching bugs that Terra@max missed.
 The light tier moved from luna@max to terra@xhigh on 2026-10-27: on 10 replayed review jobs with 12
 known medium-or-worse defects, luna@max found 2, terra@xhigh 5 ($0.12 a run, ~80 s), terra@max 10
 ($0.49, ~7.5 min, as costly as sol@xhigh, which found 4). Small sample, noisy. Since 0.6.7 the

@@ -216,7 +216,7 @@ test("a run without a schema returns text", async (t) => {
   assert.equal(final.text, "plain words");
   assert.equal(final.result, undefined);
   assert.equal(final.resultHash, fnv1a("plain words"), "text results carry a hash for the return trip too");
-  assert.equal(final.provenance.model, "gpt-6.1-sol");
+  assert.equal(final.provenance.model, "gpt-6.2-sol");
   assert.equal(final.provenance.effort, "xhigh");
   const { argv } = JSON.parse(fs.readFileSync(argvLog, "utf8").trim());
   assert.ok(argv.includes('model_reasoning_effort="xhigh"'), "the CLI receives an explicit xhigh setting");
@@ -227,7 +227,7 @@ test("an explicit exceptional Sol max override reaches the CLI and provenance", 
   const argvLog = path.join(home, "argv.jsonl");
   const { started, final } = await startAndWait(fastEnv(home, { FAKE_CODEX_ARGV_LOG: argvLog }),
     { task: "exceptional unresolved analysis", tier: "daily", kind: "ask", effort: "max" }, { home });
-  assert.equal(started.json.model, "gpt-6.1-sol");
+  assert.equal(started.json.model, "gpt-6.2-sol");
   assert.equal(started.json.effort, "max");
   assert.equal(final.ok, true);
   assert.equal(final.provenance.effort, "max");
@@ -445,7 +445,7 @@ test("a framed request from the relay runs; a corrupted copy is rejected before 
   await announce(env, header, schema, task);
   const ok = await runCli(["run", "--framed", "-", "--max-wait", "20"], { env, input: frame(header, schema, task) });
   assert.equal(ok.json.state, "done");
-  assert.equal(ok.json.provenance.model, "gpt-6.1-sol");
+  assert.equal(ok.json.provenance.model, "gpt-6.2-sol");
   assert.equal(ok.json.provenance.effort, "xhigh");
 
   const before = fs.readdirSync(path.join(home, "runs")).length;
@@ -675,7 +675,7 @@ test("preflight checks CLI, auth and catalog without a model call", async (t) =>
   assert.equal(result.code, 0, result.stdout);
   assert.equal(result.json.ok, true);
   assert.equal(result.json.modelCallMade, false);
-  assert.ok(result.json.catalog.some((model) => model.slug === "gpt-6.1-sol"));
+  assert.ok(result.json.catalog.some((model) => model.slug === "gpt-6.2-sol"));
   assert.deepEqual(result.json.missingPolicyModels, []);
   const loggedOut = await runCli(["preflight"], { env: fastEnv(home, { FAKE_CODEX_LOGGED_OUT: "1" }) });
   assert.equal(loggedOut.json.ok, false);

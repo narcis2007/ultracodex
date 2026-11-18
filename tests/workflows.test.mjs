@@ -53,6 +53,7 @@ const withKey = (agent) => async (prompt, opts) => {
 const CATALOG = {
   models: [
     { slug: "gpt-6-astra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { slug: "gpt-6.2-sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { slug: "gpt-6.1-sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { slug: "gpt-6.1-terra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { slug: "gpt-6-luna", efforts: ["low", "medium", "high", "xhigh", "max"] },
@@ -238,12 +239,14 @@ test("codexNode frames hostile text byte-exactly through parts the runner accept
 test("relay labels match runner effort defaults and explicit model/effort overrides", async () => {
   const routes = [
     ...["verify", "ask", "review"].flatMap(kind => [
-      [{ tier: "daily", kind }, "gpt-6.1-sol", "xhigh", "6.1-sol"],
+      [{ tier: "daily", kind }, "gpt-6.2-sol", "xhigh", "6.2-sol"],
       [{ tier: "light", kind }, "gpt-6.1-terra", "xhigh", "6.1-terra"],
       [{ tier: "final", kind }, "gpt-6-astra", "max", "astra"],
     ]),
-    [{ tier: "daily", kind: "ask", effort: "max" }, "gpt-6.1-sol", "max", "6.1-sol"],
+    [{ tier: "daily", kind: "ask", effort: "max" }, "gpt-6.2-sol", "max", "6.2-sol"],
+    [{ tier: "final", model: "gpt-6.2-sol", kind: "review" }, "gpt-6.2-sol", "xhigh", "6.2-sol"],
     [{ tier: "final", model: "gpt-6.1-sol", kind: "review" }, "gpt-6.1-sol", "xhigh", "6.1-sol"],
+    [{ tier: "light", model: "gpt-6.1-sol", kind: "ask" }, "gpt-6.1-sol", "xhigh", "6.1-sol"],
     [{ tier: "daily", model: "gpt-6-astra", kind: "ask" }, "gpt-6-astra", "max", "astra"],
     [{ tier: "daily", model: "gpt-6-luna", kind: "verify" }, "gpt-6-luna", "max", "luna"],
     [{ tier: "light", model: "gpt-6-luna", effort: "max", kind: "verify" }, "gpt-6-luna", "max", "luna"],
@@ -650,7 +653,7 @@ test("batch nodes declare their size, workflow nodes get a 15-minute orphan wind
   assert.equal(single.workItems, 1);
   assert.ok(batch.timeoutSec > validateRequest({ task: "x", kind: "verify", tier: "daily" }, { catalog: CATALOG }).timeoutSec, "a batch gets a longer deadline");
   assert.equal(batch.orphanAfterSec, 900);
-  assert.deepEqual(usage["gpt-6.1-sol"], { runs: 1, failed: 0, input_tokens: 100, cached_input_tokens: 0, output_tokens: 7, reasoning_output_tokens: 0 });
+  assert.deepEqual(usage["gpt-6.2-sol"], { runs: 1, failed: 0, input_tokens: 100, cached_input_tokens: 0, output_tokens: 7, reasoning_output_tokens: 0 });
   assert.deepEqual([usage["gpt-6-astra"].runs, usage["gpt-6-astra"].failed, usage["gpt-6-astra"].output_tokens], [2, 1, 7], "a run killed mid-turn counts, with no tokens");
   assert.deepEqual(usage["gpt-6-luna"], { runs: 1, failed: 1, input_tokens: 50, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0 });
 });
@@ -739,7 +742,7 @@ test("cross-review partitions fail-closed and keeps unverified findings visible"
         assert.equal(request.effort, "max");
         return okEnvelope(request, { results: [{ id: "correctness:1", refuted: false, confidence: 0.95, reasoning: "astra agrees" }] });
       }
-      assert.equal(request.model, "gpt-6.1-sol");
+      assert.equal(request.model, "gpt-6.2-sol");
       assert.equal(request.effort, "xhigh");
       return okEnvelope(request, {
         results: [
@@ -762,7 +765,7 @@ test("cross-review partitions fail-closed and keeps unverified findings visible"
   assert.deepEqual(result.unverified.map((f) => [f.id, f.error]), [["security:1", "rate_limit"]]);
   assert.ok(logs.some((line) => line.includes("UNVERIFIED")));
   assert.deepEqual(result.finalGate, { ran: true, checked: 1, upheld: 1, disputed: 0, failed: 0 });
-  assert.equal(result.codexUsage["gpt-6.1-sol"].runs, 1, "the failed security batch reported no usage");
+  assert.equal(result.codexUsage["gpt-6.2-sol"].runs, 1, "the failed security batch reported no usage");
   assert.equal(result.codexUsage["gpt-6-astra"].runs, 1);
 });
 
@@ -861,7 +864,7 @@ test("codex-review pass 1 defaults every lens including security to Terra at max
 
 test("codex-review securityTier changes only security, with fast applying only to Astra", async () => {
   // An explicit securityTier keeps its own default effort; the other lenses stay on the pass-1 default (terra@max).
-  for (const [securityTier, model, effort] of [["light", "gpt-6.1-terra", "xhigh"], ["daily", "gpt-6.1-sol", "xhigh"], ["final", "gpt-6-astra", "max"]]) {
+  for (const [securityTier, model, effort] of [["light", "gpt-6.1-terra", "xhigh"], ["daily", "gpt-6.2-sol", "xhigh"], ["final", "gpt-6-astra", "max"]]) {
     for (const fast of [false, true]) {
       const requests = [];
       let reportPrompt = null;
@@ -914,7 +917,7 @@ test("codex-review ignores invalid securityTier values", async () => {
 
 test("codex-review: an explicit tier sets every lens, an explicit securityTier always sets the security lens", async () => {
   // An explicit tier keeps its own default effort (light and daily xhigh, final max), also on pass 1.
-  const MODEL = { light: ["gpt-6.1-terra", "xhigh"], daily: ["gpt-6.1-sol", "xhigh"], final: ["gpt-6-astra", "max"] };
+  const MODEL = { light: ["gpt-6.1-terra", "xhigh"], daily: ["gpt-6.2-sol", "xhigh"], final: ["gpt-6-astra", "max"] };
   for (const tier of ["daily", "light", "final"]) {
     for (const securityTier of [undefined, "light", "daily", "final"]) {
       const requests = [];
@@ -999,7 +1002,7 @@ test("codex-review priorFindings without pass is pass 2 and reviews on light at 
 });
 
 test("codex-review: an explicit tier on pass 1 keeps its own default effort (light is the quick Terra@xhigh pass)", async () => {
-  for (const [tier, model, effort] of [["light", "gpt-6.1-terra", "xhigh"], ["daily", "gpt-6.1-sol", "xhigh"], ["final", "gpt-6-astra", "max"]]) {
+  for (const [tier, model, effort] of [["light", "gpt-6.1-terra", "xhigh"], ["daily", "gpt-6.2-sol", "xhigh"], ["final", "gpt-6-astra", "max"]]) {
     const { result, requests } = await reviewTiers({ tier });
     assert.equal(result.tier, tier);
     assert.equal(result.effort, effort);
@@ -1009,7 +1012,7 @@ test("codex-review: an explicit tier on pass 1 keeps its own default effort (lig
 });
 
 test("codex-review pass 2 with an explicit tier keeps that tier on every lens", async () => {
-  for (const [tier, model, effort] of [["daily", "gpt-6.1-sol", "xhigh"], ["light", "gpt-6.1-terra", "xhigh"], ["final", "gpt-6-astra", "max"]]) {
+  for (const [tier, model, effort] of [["daily", "gpt-6.2-sol", "xhigh"], ["light", "gpt-6.1-terra", "xhigh"], ["final", "gpt-6-astra", "max"]]) {
     const { result, requests } = await reviewTiers({ pass: 2, tier });
     assert.equal(result.tier, tier);
     assert.deepEqual(requests.map(r => [r.model, r.effort]), Array(3).fill([model, effort]));
@@ -1021,10 +1024,10 @@ test("codex-review pass 2 with tier daily and securityTier final: other lenses o
   const { result, requests } = await reviewTiers({ pass: 2, tier: "daily", securityTier: "final", lenses: ["code", "security"] }, 2);
   assert.equal(result.tier, "daily");
   assert.deepEqual(requests.map(r => [r.label, r.model, r.effort]).sort(), [
-    ["codex:code", "gpt-6.1-sol", "xhigh"],
+    ["codex:code", "gpt-6.2-sol", "xhigh"],
     ["codex:security", "gpt-6-astra", "max"],
   ]);
-  assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model, l.effort]), [["code", "daily", "gpt-6.1-sol", "xhigh"], ["security", "final", "gpt-6-astra", "max"]]);
+  assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model, l.effort]), [["code", "daily", "gpt-6.2-sol", "xhigh"], ["security", "final", "gpt-6-astra", "max"]]);
   assert.equal(result.rereview.securityTier, "final");
 });
 
@@ -1037,7 +1040,7 @@ test("codex-review pass 2 ignores an invalid tier and falls back to light", asyn
 });
 
 test("codex-review pass 2 without tier: securityTier still sets only the security lens", async () => {
-  for (const [securityTier, model, effort] of [["final", "gpt-6-astra", "max"], ["daily", "gpt-6.1-sol", "xhigh"], ["light", "gpt-6.1-terra", "xhigh"]]) {
+  for (const [securityTier, model, effort] of [["final", "gpt-6-astra", "max"], ["daily", "gpt-6.2-sol", "xhigh"], ["light", "gpt-6.1-terra", "xhigh"]]) {
     const { result, requests } = await reviewTiers({ pass: 2, securityTier });
     assert.equal(result.tier, "light", "securityTier does not change the base tier");
     assert.deepEqual(requests.map(r => [r.label, r.model, r.effort]).sort(), [
@@ -1051,6 +1054,23 @@ test("codex-review pass 2 without tier: securityTier still sets only the securit
       ["security", securityTier, model, effort],
     ]);
   }
+});
+
+test("codex-review last gate for critical work: tier daily + effort max runs every lens, security included, on gpt-6.2-sol@max", async () => {
+  const { result, requests } = await reviewTiers({ tier: "daily", effort: "max" });
+  assert.equal(result.tier, "daily");
+  assert.equal(result.effort, "max");
+  assert.deepEqual(requests.map(r => [r.label, r.tier, r.kind, r.model, r.effort, r.serviceTier]).sort(), [
+    ["codex:code", "daily", "review", "gpt-6.2-sol", "max", null],
+    ["codex:domain", "daily", "review", "gpt-6.2-sol", "max", null],
+    ["codex:security", "daily", "review", "gpt-6.2-sol", "max", null],
+  ]);
+  assert.deepEqual(result.lenses.map(l => [l.lens, l.tier, l.model, l.effort]), Array.from(["code", "domain", "security"], lens => [lens, "daily", "gpt-6.2-sol", "max"]));
+  // an explicit securityTier is the only thing that takes the security lens off the gate: final stays astra@max
+  const astra = await reviewTiers({ tier: "daily", effort: "max", securityTier: "final" });
+  assert.deepEqual(astra.requests.map(r => [r.label, r.model, r.effort]).sort(), [
+    ["codex:code", "gpt-6.2-sol", "max"], ["codex:domain", "gpt-6.2-sol", "max"], ["codex:security", "gpt-6-astra", "max"],
+  ]);
 });
 
 test("codex-review effort: sets every lens that is not on tier final, never changes Astra, invalid values are ignored", async () => {
@@ -1067,11 +1087,11 @@ test("codex-review effort: sets every lens that is not on tier final, never chan
   assert.deepEqual(pass2.requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6.1-terra", "high"]));
   // an explicit tier: the effort applies to it, Sol too
   const daily = await reviewTiers({ tier: "daily", effort: "max" });
-  assert.deepEqual(daily.requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6.1-sol", "max"]));
+  assert.deepEqual(daily.requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6.2-sol", "max"]));
   assert.equal(daily.result.effort, "max");
   // a lens that an explicit securityTier sets takes the effort too, unless it is on final
   const split = await reviewTiers({ securityTier: "daily", effort: "high", lenses: ["code", "security"] }, 2);
-  assert.deepEqual(split.requests.map(r => [r.label, r.model, r.effort]).sort(), [["codex:code", "gpt-6.1-terra", "high"], ["codex:security", "gpt-6.1-sol", "high"]]);
+  assert.deepEqual(split.requests.map(r => [r.label, r.model, r.effort]).sort(), [["codex:code", "gpt-6.1-terra", "high"], ["codex:security", "gpt-6.2-sol", "high"]]);
   // astra never takes the effort: tier final and securityTier final stay at max
   const final = await reviewTiers({ tier: "final", effort: "low" });
   assert.deepEqual(final.requests.map(r => [r.model, r.effort]), Array(3).fill(["gpt-6-astra", "max"]));
@@ -1265,7 +1285,7 @@ test("fast: true puts only the astra nodes on the priority service tier", async 
     return { findings: [] };
   };
   await runWorkflow("cross-review", { agent, args: { dimensions: ["correctness"], fast: true } });
-  assert.deepEqual(seen, [["gpt-6.1-sol", null], ["gpt-6-astra", "priority"]]);
+  assert.deepEqual(seen, [["gpt-6.2-sol", null], ["gpt-6-astra", "priority"]]);
 });
 
 test("codex-review escalates high/critical disagreements to astra in one run: upheld → DISPUTED, refuted → settled", async () => {
@@ -2096,7 +2116,7 @@ test("judge-panel ranks only candidates judged by the other model family", async
   const agent = async (prompt, opts) => {
     if (opts.agentType === RELAY) {
       const { request } = receive(prompt);
-      assert.equal(request.model, "gpt-6.1-sol");
+      assert.equal(request.model, "gpt-6.2-sol");
       assert.equal(request.effort, "xhigh", "both candidate generation and judging use xhigh");
       if (request.label === "gen:codex") return okEnvelope(request, { approach: "codex way", plan: "p", risks: "r" });
       // the Codex juror is down for every candidate

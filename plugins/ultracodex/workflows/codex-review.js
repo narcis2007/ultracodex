@@ -1,7 +1,7 @@
 export const meta = {
   name: 'codex-review',
   description: 'Adversarial code review by Codex (GPT) through several lenses, each finding then checked in the code by Claude (Haiku 5.5 @high by default). Pass-1 lenses default to 6.1-terra@max, including security; fix-delta passes (pass > 1) default to 6.1-terra@xhigh. For critical work, securityTier: final selects astra@max for security only; an explicit tier sets every lens with its own default effort; an explicit securityTier always sets the security lens. The astra tiebreak for high/critical findings that Claude refuted or could not settle runs only with escalate: true; without it they are listed as not cross-checked. At most 2 review passes per change. Fails closed.',
-  whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: light (6.1-terra@xhigh)|daily (6.1-sol@xhigh)|final (astra@max), securityTier: light|daily|final, effort: low|medium|high|xhigh|max (every lens not on final), context, lessons, triage, triageModel: haiku|sonnet|opus|inherit, triageEffort, escalate: true (opt-in astra tiebreak), fast, pass: positive integer (default 2 with priorFindings, else 1), priorFindings: previous findings and fixes (string, array or object), ownerApproved: true to allow pass > 2 }. With no tier, pass 1 uses light at max effort (terra@max) and pass > 1 uses light at its default effort (terra@xhigh). Pass > 1 reviews only the fix delta and prior findings.',
+  whenToUse: 'Second-model review of a branch/commit/uncommitted change. args: { cwd, base | commit | uncommitted, lenses, tier: light (6.1-terra@xhigh)|daily (6.2-sol@xhigh)|final (astra@max), securityTier: light|daily|final, effort: low|medium|high|xhigh|max (every lens not on final), context, lessons, triage, triageModel: haiku|sonnet|opus|inherit, triageEffort, escalate: true (opt-in astra tiebreak), fast, pass: positive integer (default 2 with priorFindings, else 1), priorFindings: previous findings and fixes (string, array or object), ownerApproved: true to allow pass > 2 }. With no tier, pass 1 uses light at max effort (terra@max) and pass > 1 uses light at its default effort (terra@xhigh). Pass > 1 reviews only the fix delta and prior findings.',
   phases: [
     { title: 'Review', detail: 'one Codex review per lens (read-only, hermetic)' },
     { title: 'Triage', detail: 'Claude (Haiku 5.5 @high unless triageModel says otherwise) checks each Codex finding against the code' },
@@ -28,16 +28,19 @@ export const meta = {
 // codex_send / codex_interrupt — can steer or stop it while it runs, find it by its label and watch its events.
 // Same request, same result, same signatures; if the runner cannot run it that way it runs it on codex exec, and
 // steerable: false (or ULTRACODEX_NODE_BACKEND=exec in the runner's environment) always does.
-// Routing (runner policy): tier 'light' → gpt-6.1-terra@xhigh · 'daily' → gpt-6.1-sol@xhigh
+// Routing (runner policy): tier 'light' → gpt-6.1-terra@xhigh · 'daily' → gpt-6.2-sol@xhigh
 // for every kind · 'final' → gpt-6-astra@max for exceptional critical work. Pin
-// model/effort only to override with a reason (gpt-6-luna is an explicit override only; its default effort is max).
+// model/effort only to override with a reason (gpt-6-luna is an explicit override only; its default effort is max;
+// gpt-6.1-sol is a daily-tier model only when named explicitly: no tier selects it any more, its default effort is xhigh).
+// Why 6.2 sol (owner's benchmark 2026-11-18, 9 replayed review cases, 11 known medium+ bugs): 6.2 sol@xhigh found 9,
+// 6.1 sol@xhigh 2, 6.1 terra@max 9 at about 20 % lower cost; same list price as 6.1 sol.
 // Concurrency is capped intrinsically: 4 Codex jobs per workflow, an astra job counting as 2 — do not wrap calls in
 // another gate.
-const UCX_VERSION = '0.6.7'
+const UCX_VERSION = '0.6.8'
 const UCX_RELAY = 'ultracodex:codex-relay'
-const UCX_TIER_MODEL = { light: 'gpt-6.1-terra', daily: 'gpt-6.1-sol', final: 'gpt-6-astra' }
+const UCX_TIER_MODEL = { light: 'gpt-6.1-terra', daily: 'gpt-6.2-sol', final: 'gpt-6-astra' }
 const UCX_TIER_EFFORT = { light: 'xhigh', daily: 'xhigh', final: 'max' }
-const UCX_MODEL_EFFORT = { 'gpt-6-luna': 'max' }   // no tier selects luna; an explicit luna keeps its own default effort (as the runner does)
+const UCX_MODEL_EFFORT = { 'gpt-6-luna': 'max', 'gpt-6.1-sol': 'xhigh' }   // no tier selects these; an explicit luna or 6.1 sol keeps its own default effort (as the runner does)
 const UCX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
 const UCX_KINDS = ['verify', 'ask', 'review']
 const UCX_PRESETS = ['verdict', 'score', 'review', 'implement']

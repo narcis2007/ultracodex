@@ -9,7 +9,7 @@ description: >-
   or a specific review lens. Choose the review by risk: no Codex review for a small, low-risk
   change; lenses code + domain for a normal change; add security when the change touches
   authentication, permissions, personal data, money, secrets or outside input; critical work
-  gets code + domain + security, then astra at max as the last gate. With no tier, pass 1 runs
+  gets code + domain + security, then one last-gate pass on gpt-6.2-sol at max (tier daily, effort max; the owner's rule; astra at max only when the owner asks). With no tier, pass 1 runs
   every lens, including security, on gpt-6.1-terra at max effort, and a fix-delta pass (pass
   above 1) runs on gpt-6.1-terra at xhigh. At most 2 passes per change. The astra tiebreak is
   opt-in (escalate: true). It also says whether a re-review is worth it and how narrow it should be.
@@ -43,17 +43,27 @@ New files count as changed files, and their lines as changed lines.
 - **Add the `security` lens** when the change touches login or authentication, permissions or
   tenant isolation, personal data, money or payments, secrets, or input from outside (uploads,
   webhooks, URLs, third-party payloads).
-- **Critical work → `code` + `domain` + `security`, then astra at max as the last gate.**
+- **Critical work → `code` + `domain` + `security`, then one last gate (the owner's rule).**
   Critical work is: security-sensitive code (auth, keys, crypto, payments, personal data), data
   migrations, irreversible production steps, or the last gate before a production release.
-  The Terra passes come first (pass 1, and at most one fix delta). Then one astra@max gate runs
-  on the revision that is meant to ship: `tier: 'final'` for every lens, or `lenses: ['security']`
-  with `securityTier: 'final'` for security only, with `priorFindings` from the earlier passes.
+  The Terra passes come first (pass 1, and at most one fix delta). The last gate is **one pass with
+  `tier: 'daily', effort: 'max'`** (gpt-6.2-sol@max) on the revision that is meant to ship, with
+  `priorFindings` from the earlier passes. It replaces a second terra@max pass. Use it only when
+  really necessary and with the owner's OK: say why in one line and ask first. Why: a probe of 4
+  cases found 6.2 Sol at max catching bugs that Terra at max missed. What it runs (checked in the
+  workflow code and in a test): every requested lens, `security` included, on gpt-6.2-sol at `max`
+  (kind `review`, deadline 45 minutes a lens). Do not pass `securityTier`: an explicit
+  `securityTier` sets the security lens to its own tier (`final` is Astra; `light` is Terra at
+  `max`, because `effort` applies to every lens that is not on `final`). The Claude triage runs as
+  usual, and the astra tiebreak stays off unless `escalate: true`. Astra is opt-in: only when the
+  owner asks for it, use `tier: 'final'` for every lens, or `lenses: ['security']` with
+  `securityTier: 'final'` for security only; Astra uses much more of the Codex usage limit.
   The gate is one extra run on top of the cap of 2. It takes the next pass number: pass 2 when
-  pass 1 needed no delta pass, pass 3 (with `ownerApproved: true`) after a delta pass. It needs
-  the owner's OK anyway, because Astra uses much more of the Codex usage limit than Terra or
-  Sol: tell the owner, and ask first when the owner's rules say so. After the gate, a medium finding is fixed and verified with the tests and the diff
-  (a `daily` delta only if the owner wants one); a high/critical finding goes to the owner.
+  pass 1 needed no delta pass, pass 3 (with `ownerApproved: true`) after a delta pass. The
+  `Re-review:` line after a gate pass proposes `light` for a fix delta, as after any non-final pass
+  (the workflow logic is unchanged); pass `tier: 'daily', effort: 'max'` again if the delta must stay
+  on the gate. After the gate, a medium finding is fixed and verified with the tests and the diff;
+  a high/critical finding goes to the owner.
 - The `tests` lens stays available, but it is not a default: measured, it finds almost nothing
   the other lenses miss. Add it only when the owner asks.
 
@@ -61,10 +71,11 @@ The tiers:
 
 - no `tier` (the default) → pass 1: gpt-6.1-terra@**max** on every lens, including `security`;
   a fix-delta pass (pass above 1): gpt-6.1-terra@xhigh. Why: on replayed review jobs, Terra at
-  max found more must-find defects than Sol at xhigh, at the same cost;
+  max found as many must-find defects as 6.2 Sol at xhigh (9 of 11) at about 20 % lower cost, and more than 6.1 Sol at xhigh (2 of 11);
 - `light` → gpt-6.1-terra@xhigh — an explicit quick pass on a small change the owner wants
   reviewed, and the default for a fix-delta pass. An explicit tier keeps its own default effort;
-- `daily` → gpt-6.1-sol@xhigh — only when the owner asks for Sol. Sol stays the model for plan
+- `daily` → gpt-6.2-sol@xhigh — only when the owner asks for Sol, or with `effort: 'max'` as the
+  last gate for critical work (see above). Sol stays the model for plan
   checks, second opinions and implementation; code review moved to Terra;
 - `final` → gpt-6-astra@max — critical work only (see above).
 
@@ -85,8 +96,8 @@ own default effort. When the owner names one tier for every lens ("use sol"), do
 lens.
 
 Keep Sol at `xhigh` when you use it, including large diffs. Use Sol at `max` only as an explicit
-override for an exceptional unresolved problem after an `xhigh` attempt, or at the owner's
-request; state the reason.
+override for an exceptional unresolved problem after an `xhigh` attempt, as the last gate for
+critical work (see above), or at the owner's request; state the reason.
 
 Say which review you picked and why in one line, so the owner can override it ("use sol",
 "use astra", "no review").

@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.6.8 — 2026-11-18 (daily tier: gpt-6.2-sol)
+
+- The `daily` tier model is `gpt-6.2-sol` (before: `gpt-6.1-sol`), at `xhigh` for every kind. It is the
+  model of asks, plan checks, `crosscheck` and `cross-review` verification, jurors and `codex-implement`.
+  Reason: the owner's benchmark of 2026-11-18 on 9 replayed review cases with 11 known medium-or-worse
+  bugs: gpt-6.2-sol@xhigh found 9 of 11, gpt-6.1-sol@xhigh 2 of 11, gpt-6.1-terra@max 9 of 11 at about
+  20 % lower cost. 6.2 Sol has the same list price as 6.1 Sol. The `light` tier (terra@xhigh), the `final`
+  tier (astra@max) and the `codex-review` pass-1 default (terra@max) are unchanged, and the astra
+  tiebreak stays opt-in (`escalate: true`).
+- Runner: `POLICY.models.daily` is `gpt-6.2-sol`; `gpt-6.2-sol` has model factor 1 and is in
+  `ultraModels` (its catalog entry lists `ultra`). `gpt-6.1-sol` is no tier model any more but stays
+  usable as an explicit `model`: it is in `explicitModels` as a `daily`-tier model with default effort
+  `xhigh`, so a request that still names it resolves to tier `daily`, effort `xhigh` (also when the
+  request names another tier), keeps its deadline factor 1 and still validates against a catalog that
+  lists it. The Workflow helper (`UCX_TIER_MODEL`, `UCX_MODEL_EFFORT`) mirrors this, so the relay labels
+  read `6.2-sol@xhigh` for the tier and `6.1-sol@xhigh` for an explicit 6.1 Sol. `RUNNER_VERSION` and
+  `UCX_VERSION` are 0.6.8.
+- Last gate for critical work (the owner's rule): one `codex-review` pass with `tier: 'daily', effort:
+  'max'`, that is gpt-6.2-sol@max, instead of a second terra@max pass. Reason: a probe of 4 cases found
+  6.2 Sol@max catching bugs that Terra@max missed. It needs no workflow change: with no `securityTier`,
+  every requested lens, `security` included, runs on gpt-6.2-sol at `max` (kind `review`, deadline 45
+  minutes a lens); an explicit `securityTier` still sets its own tier for the security lens. The
+  `Re-review:` line after a non-final pass still proposes `light` for a fix delta, as before. The
+  `codex-review` skill says when to use it (only when really necessary, with the owner's OK); a test
+  checks the routing.
+- Docs: the READMEs, the `codex-ask`, `codex-implement`, `codex-review` and `codex-workflow` skills,
+  `model-policy.md`, `codex-headless.md` (catalog table) and the plugin descriptions name 6.2 Sol.
+  Tests: the fixtures list `gpt-6.2-sol` next to `gpt-6.1-sol`; new tests for the 6.2 Sol deadline and
+  `ultra` policy, the explicit 6.1 Sol, and the last-gate routing.
+
 ## 0.6.7 — 2026-11-12 (codex-review defaults: terra@max, 2 passes, opt-in astra tiebreak)
 
 - `codex-review`: with no valid `tier`, pass 1 runs every lens, including `security`, on `light`

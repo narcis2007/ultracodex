@@ -72,6 +72,7 @@ const CATALOG = {
   fetchedAt: new Date().toISOString(),
   models: [
     { slug: "gpt-6-astra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { slug: "gpt-6.2-sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { slug: "gpt-6.1-sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { slug: "gpt-6.1-terra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { slug: "gpt-6-luna", efforts: ["low", "medium", "high", "xhigh", "max"] },
@@ -216,20 +217,25 @@ test("validateValue enforces types, enums, required, extras, items and anyOf", (
 
 test("policy follows the owner's routing rule", () => {
   assert.equal(POLICY.models.light, "gpt-6.1-terra");
-  assert.equal(POLICY.models.daily, "gpt-6.1-sol");
+  assert.equal(POLICY.models.daily, "gpt-6.2-sol");
   assert.equal(POLICY.models.final, "gpt-6-astra");
   for (const row of policyTable()) {
     assert.notEqual(row.model, "gpt-6-luna", "no tier selects luna any more");
     if (row.model === "gpt-6.1-terra") assert.equal(row.effort, "xhigh", "Terra (light) defaults to xhigh for every workload");
     if (row.model === "gpt-6-astra") assert.equal(row.effort, "max");
-    if (row.model === "gpt-6.1-sol") assert.equal(row.effort, "xhigh", "Sol defaults to xhigh for every workload");
+    if (row.model === "gpt-6.2-sol") assert.equal(row.effort, "xhigh", "Sol defaults to xhigh for every workload");
     assert.notEqual(row.effort, "ultra", "ultra is never implicit");
   }
   assert.equal(resolvePolicy({ model: "gpt-6-luna", kind: "verify" }).effort, "max", "an explicit luna still defaults to max");
   assert.equal(resolvePolicy({ model: "gpt-6-luna", kind: "verify" }).tier, "light", "an explicit luna still counts as light");
   assert.equal(resolvePolicy({ tier: "daily", model: "gpt-6-luna", kind: "review", effort: "max" }).effort, "max");
   for (const kind of KINDS) {
-    assert.equal(resolvePolicy({ tier: "final", model: "gpt-6.1-sol", kind }).effort, "xhigh", "an explicit Sol uses its own effort defaults");
+    assert.equal(resolvePolicy({ tier: "final", model: "gpt-6.2-sol", kind }).effort, "xhigh", "an explicit Sol uses its own effort defaults");
+    assert.deepEqual(
+      [resolvePolicy({ tier: "final", model: "gpt-6.1-sol", kind }).tier, resolvePolicy({ tier: "final", model: "gpt-6.1-sol", kind }).effort],
+      ["daily", "xhigh"],
+      "an explicit 6.1 Sol still counts as a daily-tier model at xhigh"
+    );
     assert.equal(resolvePolicy({ tier: "daily", kind, effort: "max" }).effort, "max", "an exceptional explicit max override is preserved");
   }
   assert.equal(resolvePolicy({ tier: "final", kind: "review" }).weight, 2);
@@ -288,11 +294,45 @@ test("an explicit luna@max override validates; ultra is accepted on Terra and re
   }
 });
 
+test("the daily tier is gpt-6.2-sol: deadlines, ultra policy, the last-gate request (daily at max) and an explicit 6.1 Sol", () => {
+  for (const kind of KINDS) {
+    const daily = resolvePolicy({ tier: "daily", kind });
+    assert.deepEqual([daily.tier, daily.model, daily.effort, daily.weight], ["daily", "gpt-6.2-sol", "xhigh", 1], kind);
+    assert.equal(daily.timeoutSec, computeDeadlineSec("gpt-6.2-sol", "xhigh", kind), "the deadline follows the 6.2 Sol model factor");
+  }
+  assert.equal(computeDeadlineSec("gpt-6.2-sol", "xhigh", "verify"), 1500, "6.2 Sol has model factor 1");
+  assert.equal(computeDeadlineSec("gpt-6.2-sol", "xhigh", "review"), 2700);
+  assert.equal(computeDeadlineSec("gpt-6.2-sol", "max", "review"), 2700, "max has effort factor 1, as on Terra");
+  assert.equal(computeDeadlineSec("gpt-6.2-sol", "xhigh", "implement"), 5400);
+  assert.equal(computeDeadlineSec("gpt-6.2-sol", "ultra", "review"), 4050, "ultra has effort factor 1.5");
+  assert.equal(computeDeadlineSec("gpt-6.1-sol", "xhigh", "review"), 2700, "6.1 Sol keeps model factor 1");
+  assert.ok(POLICY.ultraModels.includes("gpt-6.2-sol"), "6.2 Sol lists ultra");
+  assert.equal(modelSupportsEffort("gpt-6.2-sol", "ultra", undefined), true);
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-sol62-"));
+  try {
+    for (const withCatalog of [{ catalog: CATALOG }, {}]) {
+      const ultra = validateRequest({ task: "x", cwd, kind: "ask", effort: "ultra" }, withCatalog);
+      assert.deepEqual([ultra.model, ultra.effort, ultra.timeoutSec], ["gpt-6.2-sol", "ultra", 2700], "ultra is accepted on 6.2 Sol (ask 1800 x 1.5 = 2700)");
+      // the last gate for critical work: tier daily at effort max on a review lens
+      const gate = validateRequest({ task: "x", cwd, tier: "daily", kind: "review", effort: "max" }, withCatalog);
+      assert.deepEqual([gate.tier, gate.model, gate.effort, gate.timeoutSec, gate.weight], ["daily", "gpt-6.2-sol", "max", 2700, 1]);
+      // a request that still names 6.1 Sol keeps working: a daily-tier model at xhigh, whatever tier the request names
+      for (const tier of [undefined, "light", "daily", "final"]) {
+        const old = validateRequest({ task: "x", cwd, kind: "review", model: "gpt-6.1-sol", ...(tier ? { tier } : {}) }, withCatalog);
+        assert.deepEqual([old.model, old.effort, old.tier, old.timeoutSec, old.weight], ["gpt-6.1-sol", "xhigh", "daily", 2700, 1], String(tier));
+      }
+      assert.equal(validateRequest({ task: "x", cwd, model: "gpt-6.1-sol", effort: "max" }, withCatalog).effort, "max", "an explicit effort is kept on 6.1 Sol");
+    }
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("validateRequest applies defaults and rejects what codex would reject later", (t) => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "ucx-req-"));
   t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
   const request = validateRequest({ task: "check it", cwd, schemaPreset: "verdict", kind: "verify" }, { catalog: CATALOG });
-  assert.equal(request.model, "gpt-6.1-sol");
+  assert.equal(request.model, "gpt-6.2-sol");
   assert.equal(request.effort, "xhigh");
   assert.equal(request.hermetic, true);
   assert.equal(request.ephemeral, false, "jobs keep a thread so account switches can resume them");
@@ -715,7 +755,7 @@ test("buildCodexArgs: hermetic read-only exec carries the Windows sandbox and re
     task: "t",
     sandbox: "read-only",
     cwd: "C:/repo",
-    model: "gpt-6.1-sol",
+    model: "gpt-6.2-sol",
     effort: "xhigh",
     ephemeral: true,
     hermetic: true,
@@ -737,7 +777,7 @@ test("buildCodexArgs: hermetic read-only exec carries the Windows sandbox and re
     "-o",
     "L",
     "-m",
-    "gpt-6.1-sol",
+    "gpt-6.2-sol",
     "-c",
     'model_reasoning_effort="xhigh"',
     "--output-schema",
@@ -785,7 +825,7 @@ test("buildCodexArgs: review and resume modes use their own flag sets", () => {
     task: "",
     sandbox: "read-only",
     cwd: "/repo",
-    model: "gpt-6.1-sol",
+    model: "gpt-6.2-sol",
     effort: "max",
     ephemeral: true,
     hermetic: true,
@@ -1028,7 +1068,7 @@ const RESUME_BASE = {
   resume: { sessionId: "01a0cec5-503d" },
   task: "follow up",
   cwd: "/repo",
-  model: "gpt-6.1-sol",
+  model: "gpt-6.2-sol",
   effort: "xhigh",
   ephemeral: false,
   hermetic: true,

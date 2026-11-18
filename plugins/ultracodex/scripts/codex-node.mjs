@@ -59,7 +59,7 @@ import {
   sessionWaitPrint,
 } from "./session.mjs";
 
-export const RUNNER_VERSION = "0.6.7";
+export const RUNNER_VERSION = "0.6.8";
 export const RUNNER_FILE = fileURLToPath(import.meta.url);
 
 export const EFFORTS = Object.freeze(["low", "medium", "high", "xhigh", "max", "ultra"]);
@@ -67,17 +67,23 @@ export const SANDBOXES = Object.freeze(["read-only", "workspace-write"]);
 export const TIERS = Object.freeze(["light", "daily", "final"]);
 export const KINDS = Object.freeze(["verify", "ask", "review", "implement"]);
 
-// Routing policy (owner's rule, updated 2026-10-27): light = 6.1 Terra at xhigh (benchmark 2026-10-27: Terra
+// Routing policy (owner's rule, updated 2026-11-18): light = 6.1 Terra at xhigh (benchmark 2026-10-27: Terra
 // xhigh found 5 of 12 known medium+ defects at 0.12 USD a run, Luna max 2 of 12; Terra max found 10 of 12 but costs
 // as much as Sol, so the light tier default stays at xhigh; codex-review pass 1 asks for Terra at max itself, as an
-// explicit effort on the light tier); 6.1 Sol at xhigh for every workload, including complex implementation.
-// Sol max needs an explicit exceptional override; Astra max handles critical work. Luna is no tier model any more:
-// it stays usable as an explicit `model` (default effort max, see explicitModels) for mechanical, high-volume work.
-// `ultra` is never implicit.
+// explicit effort on the light tier); daily = 6.2 Sol at xhigh for every workload, including complex implementation.
+// Reason for 6.2 Sol (owner's benchmark 2026-11-18, 9 replayed review cases with 11 known medium+ bugs): 6.2 Sol
+// @xhigh found 9 of 11, 6.1 Sol @xhigh 2 of 11, 6.1 Terra @max 9 of 11 at about 20 % lower cost; 6.2 Sol has the same
+// list price as 6.1 Sol. A 4-case probe found 6.2 Sol @max caught bugs that Terra @max missed, so the last gate for
+// critical work is one codex-review pass on `daily` at `max` (an explicit exceptional override). Astra max handles
+// critical work. gpt-6.1-sol is no tier model any more: it stays usable as an explicit `model` (a daily-tier model at
+// xhigh), and so does Luna (default effort max); see explicitModels. `ultra` is never implicit.
 export const POLICY = Object.freeze({
-  models: Object.freeze({ light: "gpt-6.1-terra", daily: "gpt-6.1-sol", final: "gpt-6-astra" }),
+  models: Object.freeze({ light: "gpt-6.1-terra", daily: "gpt-6.2-sol", final: "gpt-6-astra" }),
   // Models that no tier selects but an explicit `model` can still name: they count as this tier and default to this effort.
-  explicitModels: Object.freeze({ "gpt-6-luna": Object.freeze({ tier: "light", effort: "max" }) }),
+  explicitModels: Object.freeze({
+    "gpt-6-luna": Object.freeze({ tier: "light", effort: "max" }),
+    "gpt-6.1-sol": Object.freeze({ tier: "daily", effort: "xhigh" }),
+  }),
   efforts: Object.freeze({
     light: Object.freeze({ verify: "xhigh", ask: "xhigh", review: "xhigh", implement: "xhigh" }),
     daily: Object.freeze({ verify: "xhigh", ask: "xhigh", review: "xhigh", implement: "xhigh" }),
@@ -87,12 +93,12 @@ export const POLICY = Object.freeze({
   // purpose: a deadline is a runaway guard, not an estimate (measured on this
   // machine: astra@max review lens 25–35 min, implementation 30–60 min).
   baseDeadlineSec: Object.freeze({ verify: 1500, ask: 1800, review: 2700, implement: 5400 }),
-  modelFactor: Object.freeze({ "gpt-6-luna": 0.5, "gpt-6.1-terra": 1, "gpt-6.1-sol": 1, "gpt-6-sol": 1, "gpt-6-astra": 1.5 }),
+  modelFactor: Object.freeze({ "gpt-6-luna": 0.5, "gpt-6.1-terra": 1, "gpt-6.1-sol": 1, "gpt-6.2-sol": 1, "gpt-6-sol": 1, "gpt-6-astra": 1.5 }),
   effortFactor: Object.freeze({ low: 0.5, medium: 0.6, high: 0.8, xhigh: 1, max: 1, ultra: 1.5 }),
   // Concurrency weight: an astra run counts as two slots; every other model counts as one (Terra and Luna too).
   weight: Object.freeze({ "gpt-6-astra": 2 }),
   // Models whose catalog entry lists `ultra` (used when no catalog cache exists yet).
-  ultraModels: Object.freeze(["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6.1-terra", "gpt-5.6-sol", "gpt-5.6-terra"]),
+  ultraModels: Object.freeze(["gpt-6-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-sol", "gpt-6.1-terra", "gpt-5.6-sol", "gpt-5.6-terra"]),
 });
 
 export const MAX_TIMEOUT_SEC = 4 * 3600;

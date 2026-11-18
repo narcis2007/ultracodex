@@ -28,6 +28,15 @@ const CATALOG = {
       context_window: 272000,
     },
     {
+      slug: "gpt-6.2-sol",
+      display_name: "GPT-6.2-Sol",
+      description: "fake sol",
+      visibility: "list",
+      default_reasoning_level: "medium",
+      supported_reasoning_levels: ["low", "medium", "high", "xhigh", "max", "ultra"].map((effort) => ({ effort })),
+      context_window: 272000,
+    },
+    {
       slug: "gpt-6.1-sol",
       display_name: "GPT-6.1-Sol",
       description: "fake sol",

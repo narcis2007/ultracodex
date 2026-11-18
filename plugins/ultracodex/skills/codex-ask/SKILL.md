@@ -8,7 +8,7 @@ description: >-
   way to consult Codex). Use for "ask codex", "what does codex / gpt think", "second opinion
   from codex", "double-check this with astra / sol / terra", "have codex refute this",
   "cross-check before we do X". Tier by role and risk: gpt-6.1-terra@xhigh for light questions,
-  gpt-6.1-sol@xhigh for routine asks, coding analysis and design, gpt-6-astra@max for critical work only.
+  gpt-6.2-sol@xhigh for routine asks, coding analysis and design, gpt-6-astra@max for critical work only.
 ---
 
 # Ask Codex directly
@@ -25,7 +25,7 @@ for a branch review, `codex-review`.
 | the question is… | tier → model | kind + output |
 | --- | --- | --- |
 | light: "where is X handled", a quick sanity check, a small factual claim about the code | `light` → 6.1-terra@xhigh | `verify` + `schemaPreset: "verdict"`, or `ask` (text) |
-| coding analysis: a bug hypothesis, complex debugging, a design second opinion, routine checks including security | `daily` → 6.1-sol@xhigh | as above |
+| coding analysis: a bug hypothesis, complex debugging, a design second opinion, routine checks including security | `daily` → 6.2-sol@xhigh | as above |
 | critical work: security-sensitive code (auth, keys, crypto, payments, personal data), data migrations, irreversible production steps, the last gate before a production release | `final` → astra@max | usually `verify` + `verdict` |
 
 Decide what you want before writing the brief:

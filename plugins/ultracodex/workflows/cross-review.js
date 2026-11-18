@@ -28,16 +28,19 @@ export const meta = {
 // codex_send / codex_interrupt — can steer or stop it while it runs, find it by its label and watch its events.
 // Same request, same result, same signatures; if the runner cannot run it that way it runs it on codex exec, and
 // steerable: false (or ULTRACODEX_NODE_BACKEND=exec in the runner's environment) always does.
-// Routing (runner policy): tier 'light' → gpt-6.1-terra@xhigh · 'daily' → gpt-6.1-sol@xhigh
+// Routing (runner policy): tier 'light' → gpt-6.1-terra@xhigh · 'daily' → gpt-6.2-sol@xhigh
 // for every kind · 'final' → gpt-6-astra@max for exceptional critical work. Pin
-// model/effort only to override with a reason (gpt-6-luna is an explicit override only; its default effort is max).
+// model/effort only to override with a reason (gpt-6-luna is an explicit override only; its default effort is max;
+// gpt-6.1-sol is a daily-tier model only when named explicitly: no tier selects it any more, its default effort is xhigh).
+// Why 6.2 sol (owner's benchmark 2026-11-18, 9 replayed review cases, 11 known medium+ bugs): 6.2 sol@xhigh found 9,
+// 6.1 sol@xhigh 2, 6.1 terra@max 9 at about 20 % lower cost; same list price as 6.1 sol.
 // Concurrency is capped intrinsically: 4 Codex jobs per workflow, an astra job counting as 2 — do not wrap calls in
 // another gate.
-const UCX_VERSION = '0.6.7'
+const UCX_VERSION = '0.6.8'
 const UCX_RELAY = 'ultracodex:codex-relay'
-const UCX_TIER_MODEL = { light: 'gpt-6.1-terra', daily: 'gpt-6.1-sol', final: 'gpt-6-astra' }
+const UCX_TIER_MODEL = { light: 'gpt-6.1-terra', daily: 'gpt-6.2-sol', final: 'gpt-6-astra' }
 const UCX_TIER_EFFORT = { light: 'xhigh', daily: 'xhigh', final: 'max' }
-const UCX_MODEL_EFFORT = { 'gpt-6-luna': 'max' }   // no tier selects luna; an explicit luna keeps its own default effort (as the runner does)
+const UCX_MODEL_EFFORT = { 'gpt-6-luna': 'max', 'gpt-6.1-sol': 'xhigh' }   // no tier selects these; an explicit luna or 6.1 sol keeps its own default effort (as the runner does)
 const UCX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
 const UCX_KINDS = ['verify', 'ask', 'review']
 const UCX_PRESETS = ['verdict', 'score', 'review', 'implement']
@@ -702,10 +705,10 @@ if (gated.length) {
 phase('Synthesize')
 const report = await agent(`Write a code-review report for ${TARGET}${WHERE}.${ucxWhere(CWD)}
 ${failedDims.length ? 'At the very top, state that these dimensions were NOT reviewed (their finder failed): ' + JSON.stringify(failedDims.map(x => ({ dimension: x.dimension, why: x.failed }))) : ''}
-${gate.failed ? 'At the top, state that the gpt-6-astra final gate FAILED for ' + gate.failed + ' finding(s) (those with finalGate.error): they are confirmed by gpt-6.1-sol only, and the review is incomplete.' : ''}
-CONFIRMED findings (a second model family could not refute them; finalGate, when present, is gpt-6-astra's verdict on top of gpt-6.1-sol's) — rank by severity, give file:line, the failure scenario and a fix:
+${gate.failed ? 'At the top, state that the gpt-6-astra final gate FAILED for ' + gate.failed + ' finding(s) (those with finalGate.error): they are confirmed by gpt-6.2-sol only, and the review is incomplete.' : ''}
+CONFIRMED findings (a second model family could not refute them; finalGate, when present, is gpt-6-astra's verdict on top of gpt-6.2-sol's) — rank by severity, give file:line, the failure scenario and a fix:
 ${JSON.stringify(confirmed)}
-${disputed.length ? 'DISPUTED findings (gpt-6.1-sol confirmed them, the gpt-6-astra final gate refuted them — present both reasonings and say the owner must decide):\n' + JSON.stringify(disputed.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, severity: f.severity, sol: f.verdict.reasoning, astra: f.finalGate.reasoning }))) : ''}
+${disputed.length ? 'DISPUTED findings (gpt-6.2-sol confirmed them, the gpt-6-astra final gate refuted them — present both reasonings and say the owner must decide):\n' + JSON.stringify(disputed.map(f => ({ id: f.id, title: f.title, file: f.file, line: f.line, severity: f.severity, sol: f.verdict.reasoning, astra: f.finalGate.reasoning }))) : ''}
 UNVERIFIED findings (the Codex verifier failed — state this plainly at the top; they are neither confirmed nor refuted):
 ${JSON.stringify(part.unverified.map(f => ({ id: f.id, title: f.title, file: f.file, why: f.verdict && f.verdict.kind })))}
 REFUTED count: ${part.refuted.length} (list their titles briefly at the end).`, { label: 'synthesize', phase: 'Synthesize', agentType: UCX_READER })

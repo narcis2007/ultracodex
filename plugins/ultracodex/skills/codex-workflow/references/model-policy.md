@@ -1,4 +1,4 @@
-# Model policy — GPT-6 astra / GPT-6.1 sol / GPT-6.1 terra (luna on request)
+# Model policy — GPT-6 astra / GPT-6.2 sol / GPT-6.1 terra (luna and 6.1 sol on request)
 
 The runner (`scripts/codex-node.mjs`, `POLICY`) is the single source of truth; this page
 explains it. Every request names a **tier** and a **kind**; the runner turns them into a model,
@@ -9,7 +9,7 @@ an effort and a deadline. Pin `model`/`effort` only to override, with a reason.
 | Tier | Model | Use it for | Effort |
 | --- | --- | --- | --- |
 | `light` | `gpt-6.1-terra` — the low-cost GPT-6.1 model ($1/$5 per MTok) | code review lenses (`codex-review` pass 1 runs them at `max`), a quick review or verification pass, triage and dedupe of findings, wide fan-outs of small self-contained checks, summaries, smoke tests | **`xhigh` for every kind** (`codex-review` pass 1 passes `effort: 'max'`) |
-| `daily` | `gpt-6.1-sol` — "latest workhorse for coding and everyday work" | implementation including complex modules, debugging, architecture analysis, verification of findings, jurors, plan checks and second opinions | **`xhigh` for every kind** |
+| `daily` | `gpt-6.2-sol` — the workhorse for coding and everyday work (before 0.6.8: `gpt-6.1-sol`) | implementation including complex modules, debugging, architecture analysis, verification of findings, jurors, plan checks and second opinions | **`xhigh` for every kind** |
 | `final` | `gpt-6-astra` — "frontier intelligence for the most demanding work" | critical security work, data migrations, irreversible production steps, the last gate before a production release, or high/critical issues escalated from Sol | `max` |
 
 Light tier rationale (2026-10-27): the light tier moved from `gpt-6-luna@max` to `gpt-6.1-terra@xhigh`.
@@ -23,7 +23,15 @@ is small and run-to-run noise is large. Terra at `max` costs as much as Sol, so 
 The live catalog lists `gpt-6.1-terra` with efforts low, medium, high, xhigh, max and ultra
 (context 500000).
 
-Review rationale (2026-11-12): `codex-review` pass 1 moved from sol@xhigh to terra@max on every lens.
+Daily tier rationale (2026-11-18, 0.6.8): the daily tier moved from `gpt-6.1-sol` to `gpt-6.2-sol`. Owner's benchmark
+on 9 replayed review cases with 11 known medium-or-worse bugs: gpt-6.2-sol@xhigh found 9 of 11,
+gpt-6.1-sol@xhigh 2 of 11, gpt-6.1-terra@max 9 of 11 at about 20 % lower cost. 6.2 Sol has the same list
+price as 6.1 Sol. A 4-case probe found 6.2 Sol@max catching bugs that Terra@max missed, so the last
+gate for critical work is one `codex-review` pass with `tier: 'daily', effort: 'max'` (6.2 Sol at `max`).
+Review pass 1 stays on terra@max (unchanged), and astra stays opt-in. `gpt-6.1-sol` is no tier model
+any more: named explicitly as `model`, it counts as a daily-tier model and defaults to `xhigh`.
+
+Review rationale (2026-11-12): `codex-review` pass 1 moved from sol@xhigh (then 6.1) to terra@max on every lens.
 On the replayed jobs above, terra@max found 10 of 12 must-find defects and sol@xhigh 4 of 12, at the
 same cost per run. A pass after a low-only pass found nothing medium or worse (0 of 12). Codex usage is
 scarce, and astra uses 5 to 7 times more of the weekly quota than sol. So: pass 1 = terra@max, a
@@ -45,15 +53,18 @@ Rules of thumb:
   (auth, keys, crypto, payments, personal data), data migrations, irreversible production steps
   and the last gate before a production release. Routine asks use Sol at `xhigh`. Routine reviews
   use Terra (pass 1 at `max`), including the security lens.
-- **Prefer `xhigh` on Sol 6.1.** Verification, analysis and implementation all use
+- **Prefer `xhigh` on Sol 6.2.** Verification, analysis and implementation all use
   `xhigh`, including complex modules and long tasks. Code review runs on Terra. This is the owner's cost/quality
   preference (2026-10-01); an exact cost ratio is workload-dependent.
 - **Sol `max` is exceptional and explicit.** Set `effort: 'max'` only when a concrete,
   consequential problem remains unresolved after an `xhigh` attempt and extra reasoning
   is justified, or when the owner requests it. State the reason and keep it to the decisive
-  node; size, duration and complexity alone do not justify `max`. Critical security or
-  final gates still use Astra at `max`. The light tier (Terra) defaults to `xhigh`; `codex-review`
+  node; size, duration and complexity alone do not justify `max`. One decided exception: the last gate
+  for critical work is one `codex-review` pass with `tier: 'daily', effort: 'max'` (6.2 Sol at `max`),
+  only when really necessary and with the owner's OK. Astra at `max` stays opt-in for critical security work. The light tier (Terra) defaults to `xhigh`; `codex-review`
   pass 1 asks for Terra at `max` itself.
+- **`gpt-6.1-sol` is an explicit override only.** No tier selects it since 0.6.8. Named as `model`, it
+  counts as a daily-tier model and defaults to `xhigh` (deadline factor 1, `ultra` accepted).
 - **Luna is an explicit override only.** No tier selects `gpt-6-luna` any more. Use
   `model: 'gpt-6-luna', effort: 'max'` for mechanical, high-volume work where cost beats recall
   (renames, boilerplate, docs, test scaffolding, wide fan-outs of tiny checks). Luna has no
@@ -68,7 +79,7 @@ Rules of thumb:
   In `codex-review`, omit `tier` for `light` at effort `max` on every lens of pass 1, including
   `security`, and for `light` at its default effort (xhigh) on every lens of a pass above 1. An
   explicit `tier` keeps its own default effort: `light` is terra@xhigh (a quick pass), `daily` is
-  sol@xhigh, `final` is astra@max. Optional `effort` (`low|medium|high|xhigh|max`) sets the effort of
+  sol@xhigh (6.2), `final` is astra@max. Optional `effort` (`low|medium|high|xhigh|max`) sets the effort of
   every lens that is not on `final`; it never changes Astra. Why: see the review rationale above. At
   most 2 passes per change; a pass above 2 needs `ownerApproved: true`. After pass 1 with a medium or
   high/critical finding, the delta pass uses `rereview.tier`: `light` after a non-final pass (add
@@ -109,7 +120,8 @@ Rules of thumb:
 | a normal review (code + domain), with a security lens when the change needs one | omit `tier`: on pass 1, Terra at `max` on every lens, including `security` (~$0.49 and ~7.5 min per lens) |
 | a fix-delta review (pass 2, the last pass) | omit `tier` or pass `rereview.tier`: Terra at `xhigh` on every lens (Terra at `max`, `effort: 'max'`, for a large or design-changing delta); when `rereview.securityTier` is set, pass it again |
 | critical security work needing Astra on security only | `codex-review` `securityTier: 'final'`, omit `tier` (or add `tier` for the other lenses) |
-| a critical change or the last gate before a production release | `codex-review` `tier: 'final'` (astra per lens, ≤2 at a time) |
+| the last gate for critical work (owner's rule, only when really necessary and with the owner's OK) | `codex-review` `tier: 'daily', effort: 'max'` (6.2 Sol at `max` on every lens, one pass; no `securityTier`) |
+| a critical change or the last gate before a production release, when the owner asks for astra | `codex-review` `tier: 'final'` (astra per lens, ≤2 at a time) |
 
 When astra disagrees with sol or Claude, the item is **disputed**: report both reasonings and
 let the owner decide — do not re-run until the answer you want appears. Every shipped workflow
@@ -124,7 +136,7 @@ returns `codexUsage` (runs, failed runs and tokens per model); use it to see wha
 | `review` | one lens of a code review (reads the diff and the code) | 45 min |
 | `implement` | writes code in a worktree (`sandbox: workspace-write`) — skills only, never a workflow node | 90 min |
 
-Deadline = base × model factor (luna 0.5, terra 1, sol 1, astra 1.5) × effort factor (xhigh/max 1,
+Deadline = base × model factor (luna 0.5, terra 1, sol (6.1 and 6.2) 1, astra 1.5) × effort factor (xhigh/max 1,
 ultra 1.5), and for a batch of N items × (1 + 0.25·(N−1)), at most ×4. Examples: luna@max verify 12.5 min · terra@xhigh verify 25 min · terra@xhigh review
 45 min · terra@max review 45 min (same as xhigh; the `codex-review` pass-1 default) · sol@xhigh verify 25 min · sol@xhigh review 45 min · astra@max review 67.5 min · astra@max implement 135 min. The deadline is a runaway
 guard, not an estimate: measured on this machine, terra@xhigh review lenses take about 80 s
@@ -150,5 +162,5 @@ only their astra nodes on it.
 `node <runner> preflight` refreshes `~/.ultracodex/models.json` from `codex debug models` and
 reports `missingPolicyModels` if a policy model disappeared (e.g. after a Codex update). The
 runner rejects models that are not in the catalog and efforts a model does not list — before
-spending a run. `gpt-6-sol` and the GPT-5.6 tiers are still available as explicit `model` overrides; `gpt-5.5`
+spending a run. `gpt-6.1-sol`, `gpt-6-sol` and the GPT-5.6 tiers are still available as explicit `model` overrides; `gpt-5.5`
 retires on 2026-10-14.

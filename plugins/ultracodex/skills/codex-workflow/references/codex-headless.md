@@ -408,7 +408,8 @@ Knobs: `ULTRACODEX_NODE_BACKEND` (`exec` = kill switch), `ULTRACODEX_CONFIG_READ
 | slug | efforts | note |
 | --- | --- | --- |
 | `gpt-6-astra` | low · medium · high · xhigh · max · ultra | frontier; Fast tier 2× |
-| `gpt-6.1-sol` | low · medium · high · xhigh · max · ultra | workhorse |
+| `gpt-6.2-sol` | low · medium · high · xhigh · max · ultra | workhorse; the `daily` tier (xhigh) |
+| `gpt-6.1-sol` | low · medium · high · xhigh · max · ultra | previous workhorse; explicit `model` override only (counts as `daily`, default effort xhigh) |
 | `gpt-6.1-terra` | low · medium · high · xhigh · max · ultra | the `light` tier (xhigh); context 500K |
 | `gpt-6-luna` | low · medium · high · xhigh · max | easier tasks; explicit `model` override only (default effort max); `ultra` is silently accepted by the CLI — the runner refuses it |
 | `gpt-5.6-sol/terra/luna` | as above | "older" |

@@ -46,12 +46,13 @@ an echo check with no independent angle, not for open-ended ideation with nothin
 | tier | model @ effort | for |
 | --- | --- | --- |
 | `light` | gpt-6.1-terra @ xhigh (every kind) | code review lenses (`codex-review` pass 1 asks for `max`), quick review or verification passes, triage, dedupe, wide fan-outs of small checks, summaries |
-| `daily` | gpt-6.1-sol @ xhigh (every kind) | implementation including complex code, debugging, design, verification, jurors, plan checks, second opinions |
+| `daily` | gpt-6.2-sol @ xhigh (every kind) | implementation including complex code, debugging, design, verification, jurors, plan checks, second opinions |
 | `final` | gpt-6-astra @ max | critical security work, data migrations, irreversible production steps, production release gates, high/critical issues escalated from Sol |
 
 Cascade with astra last; never fan astra out wide; `ultra` only by explicit request, once.
-Sol stays at `xhigh`, including long or complex tasks. Use `effort: 'max'` only for an
-exceptional unresolved problem after an `xhigh` attempt or an owner request, with a reason.
+Sol (6.2) stays at `xhigh`, including long or complex tasks. Use `effort: 'max'` only for an
+exceptional unresolved problem after an `xhigh` attempt, an owner request, or the last gate for critical work
+(one `codex-review` pass with `tier: 'daily', effort: 'max'`), with a reason.
 Astra is for critical work only: security-sensitive code (auth, keys, crypto, payments,
 personal data), data migrations, irreversible production steps and the last gate before a
 production release. Routine asks use Sol; routine reviews use Terra (pass 1 at `max`), including the
