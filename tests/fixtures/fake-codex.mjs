@@ -19,6 +19,15 @@ const withoutRequest = (text) => (text.startsWith("SYSTEM NOTICE") ? text.replac
 const CATALOG = {
   models: [
     {
+      slug: "gpt-6.2-astra",
+      display_name: "GPT-6.2-Astra",
+      description: "fake astra 6.2",
+      visibility: "list",
+      default_reasoning_level: "medium",
+      supported_reasoning_levels: ["low", "medium", "high", "xhigh", "max", "ultra"].map((effort) => ({ effort })),
+      context_window: 272000,
+    },
+    {
       slug: "gpt-6-astra",
       display_name: "GPT-6-Astra",
       description: "fake astra",

@@ -9,10 +9,11 @@ description: >-
   or a specific review lens. Choose the review by risk: no Codex review for a small, low-risk
   change; lenses code + domain for a normal change; add security when the change touches
   authentication, permissions, personal data, money, secrets or outside input; critical work
-  gets code + domain + security, then one last-gate pass on gpt-6.2-sol at max (tier daily, effort max; the owner's rule; astra at max only when the owner asks). With no tier, pass 1 runs
-  every lens, including security, on gpt-6.1-terra at max effort, and a fix-delta pass (pass
-  above 1) runs on gpt-6.1-terra at xhigh. At most 2 passes per change. The astra tiebreak is
-  opt-in (escalate: true). It also says whether a re-review is worth it and how narrow it should be.
+  gets code + domain + security with the security lens on astra 6.2 at max (securityTier final),
+  then one last-gate pass on astra 6.2 at max (tier final). With no tier, every pass runs every
+  lens, including security, on gpt-6.2-sol at xhigh (tier daily), a fix-delta pass (pass above 1)
+  too; pass tier light with effort max for the old terra@max pass. At most 2 passes per change.
+  The astra tiebreak is opt-in (escalate: true). It also says whether a re-review is worth it and how narrow it should be.
 ---
 
 # Codex adversarial review
@@ -38,46 +39,46 @@ New files count as changed files, and their lines as changed lines.
   migrations or external effects. These risk categories win over the size shortcut: a one-line
   change in any of them gets a review. Verify the diff and the tests yourself. If the owner asks
   for a review anyway, run one with `tier: 'light'` (gpt-6.1-terra@xhigh).
-- **Normal change → lenses `code` + `domain`**, with the defaults: pass 1 runs every lens on
-  gpt-6.1-terra at `max`.
+- **Normal change → lenses `code` + `domain`**, with the defaults: every lens on
+  gpt-6.2-sol at `xhigh`.
 - **Add the `security` lens** when the change touches login or authentication, permissions or
   tenant isolation, personal data, money or payments, secrets, or input from outside (uploads,
   webhooks, URLs, third-party payloads).
-- **Critical work → `code` + `domain` + `security`, then one last gate (the owner's rule).**
-  Critical work is: security-sensitive code (auth, keys, crypto, payments, personal data), data
-  migrations, irreversible production steps, or the last gate before a production release.
-  The Terra passes come first (pass 1, and at most one fix delta). The last gate is **one pass with
-  `tier: 'daily', effort: 'max'`** (gpt-6.2-sol@max) on the revision that is meant to ship, with
-  `priorFindings` from the earlier passes. It replaces a second terra@max pass. Use it only when
-  really necessary and with the owner's OK: say why in one line and ask first. Why: a probe of 4
-  cases found 6.2 Sol at max catching bugs that Terra at max missed. What it runs (checked in the
-  workflow code and in a test): every requested lens, `security` included, on gpt-6.2-sol at `max`
-  (kind `review`, deadline 45 minutes a lens). Do not pass `securityTier`: an explicit
-  `securityTier` sets the security lens to its own tier (`final` is Astra; `light` is Terra at
-  `max`, because `effort` applies to every lens that is not on `final`). The Claude triage runs as
-  usual, and the astra tiebreak stays off unless `escalate: true`. Astra is opt-in: only when the
-  owner asks for it, use `tier: 'final'` for every lens, or `lenses: ['security']` with
-  `securityTier: 'final'` for security only; Astra uses much more of the Codex usage limit.
+- **Critical work → `code` + `domain` + `security`, with the security lens on astra, then one
+  last gate.** Critical work is: security-sensitive code (auth, keys, crypto, payments, personal
+  data), data migrations, irreversible production steps, or the last gate before a production
+  release. Pass `securityTier: 'final'` on every pass: the `security` lens runs on
+  gpt-6.2-astra@max, the other lenses on the default (gpt-6.2-sol@xhigh). The last gate is **one
+  pass with `tier: 'final'`** (gpt-6.2-astra@max on every lens) on the revision that is meant to
+  ship, with `priorFindings` from the earlier passes. Use the gate only when really necessary.
+  Astra for critical work needs no extra ask: say in one line why the work is critical. Why:
+  in the owner's benchmark of 2026-11-20 Astra 6.2 at max found 10 of 11 known medium-or-worse
+  bugs with about twice as many real extra defects as Sol; Sol (at xhigh or max) and Terra at max
+  found 9. The price is about 7 times a Sol lens at xhigh ($4.65 against $0.63) and about 19
+  minutes a lens (kind `review`, deadline 67.5 minutes a lens). The Claude triage runs as usual,
+  and the astra tiebreak stays off unless `escalate: true`. Astra uses much more of the Codex
+  usage limit than Sol: for anything that is not critical work, use it only when the owner asks.
   The gate is one extra run on top of the cap of 2. It takes the next pass number: pass 2 when
   pass 1 needed no delta pass, pass 3 (with `ownerApproved: true`) after a delta pass. The
-  `Re-review:` line after a gate pass proposes `light` for a fix delta, as after any non-final pass
-  (the workflow logic is unchanged); pass `tier: 'daily', effort: 'max'` again if the delta must stay
-  on the gate. After the gate, a medium finding is fixed and verified with the tests and the diff;
-  a high/critical finding goes to the owner.
+  `Re-review:` line after a gate pass follows the rules for a final pass (medium → `daily`,
+  high/critical → `final`). After the gate, a medium finding is fixed and verified with the
+  tests and the diff; a high/critical finding goes to the owner.
 - The `tests` lens stays available, but it is not a default: measured, it finds almost nothing
   the other lenses miss. Add it only when the owner asks.
 
 The tiers:
 
-- no `tier` (the default) → pass 1: gpt-6.1-terra@**max** on every lens, including `security`;
-  a fix-delta pass (pass above 1): gpt-6.1-terra@xhigh. Why: on replayed review jobs, Terra at
-  max found as many must-find defects as 6.2 Sol at xhigh (9 of 11) at about 20 % lower cost, and more than 6.1 Sol at xhigh (2 of 11);
+- no `tier` (the default) → `daily`: gpt-6.2-sol@**xhigh** on every lens, including `security`,
+  on pass 1 and on a fix-delta pass (pass above 1). Why (the owner's benchmark of 2026-11-20:
+  9 replayed review cases, 11 known medium-or-worse bugs, judged blind): Sol at xhigh found 9 of
+  11 for about $0.63 and 6.4 minutes a lens run. Sol at max also found 9 ($1.08, 17.6 minutes),
+  Terra at max 9 (about $0.52), Astra 6.2 at max 10 ($4.65, 19 minutes, about twice as many real
+  extra defects). More effort buys nothing on Sol, so Astra is kept for critical work;
 - `light` → gpt-6.1-terra@xhigh — an explicit quick pass on a small change the owner wants
-  reviewed, and the default for a fix-delta pass. An explicit tier keeps its own default effort;
-- `daily` → gpt-6.2-sol@xhigh — only when the owner asks for Sol, or with `effort: 'max'` as the
-  last gate for critical work (see above). Sol stays the model for plan
-  checks, second opinions and implementation; code review moved to Terra;
-- `final` → gpt-6-astra@max — critical work only (see above).
+  reviewed. With `effort: 'max'` it is the old pass 1 (Terra at max). An explicit tier keeps its
+  own default effort;
+- `daily` → gpt-6.2-sol@xhigh — the default. `effort: 'max'` only as an exceptional override;
+- `final` → gpt-6.2-astra@max — critical work only (see above).
 
 Optional `effort` (`low|medium|high|xhigh|max`) sets the effort of every lens that is not on
 `final`. Astra always runs at its own default (`max`).
@@ -87,17 +88,17 @@ under review first. Record `git -C "<repo>" rev-parse HEAD` as the reviewed comm
 pass — it is the base of a later fix delta.
 
 For pass 2, use `rereview.tier` and, when it is set, `rereview.securityTier` (see section 6),
-or omit `tier`: the workflow then uses `light` at its default effort (xhigh).
+or omit `tier`: the workflow then uses `daily` at its default effort (xhigh).
 
 An explicit owner-selected `tier` sets every lens, including security, unless you also pass
 `securityTier`: an explicit `securityTier` always sets the security lens, and keeps that tier's
-own default effort. When the owner names one tier for every lens ("use sol"), do not pass
-`securityTier`. For a critical final gate, pass `tier: 'final'` so Astra reviews every requested
-lens.
+own default effort. When the owner names one tier for every lens ("use terra"), do not pass
+`securityTier`. For the last gate of critical work, pass `tier: 'final'` so Astra reviews every
+requested lens.
 
 Keep Sol at `xhigh` when you use it, including large diffs. Use Sol at `max` only as an explicit
-override for an exceptional unresolved problem after an `xhigh` attempt, as the last gate for
-critical work (see above), or at the owner's request; state the reason.
+override for an exceptional unresolved problem after an `xhigh` attempt, or at the owner's
+request; state the reason. In the benchmark Sol at `max` found no more than Sol at `xhigh`.
 
 Say which review you picked and why in one line, so the owner can override it ("use sol",
 "use astra", "no review").
@@ -114,15 +115,15 @@ Workflow({ name: 'ultracodex:codex-review', args: {
   context: '<what the change is for>', lessons: '<abs path or omit>' } })
 ```
 
-Add `tier` when the owner asked for one. With no tier, pass 1 uses Terra 6.1 at `max` on every
-lens, and a pass above 1 uses Terra 6.1 at `xhigh` (`light`) on every lens. Optional
+Add `tier` when the owner asked for one. With no tier, every pass uses Sol 6.2 at `xhigh`
+(`daily`) on every lens, security included, also a pass above 1. Optional
 `securityTier: 'light'|'daily'|'final'` always sets the security lens, also when `tier` is given;
 `tier` sets every other lens, and the security lens only when no valid `securityTier` is given.
-With no `securityTier`, the security lens follows the other lenses (Terra at `max` on pass 1).
-Use `securityTier: 'final'` for the security lens of the astra gate (see section 1). Once you
+With no `securityTier`, the security lens follows the other lenses (Sol at `xhigh`).
+Use `securityTier: 'final'` for the security lens of critical work (see section 1). Once you
 pass a `securityTier` on a pass, pass the same one on every later pass of the change. Invalid
 values are ignored. If the owner names one tier for every lens ("use
-sol"), do not pass `securityTier`. `lenses[].tier`, `lenses[].model` and `lenses[].effort` record
+terra"), do not pass `securityTier`. `lenses[].tier`, `lenses[].model` and `lenses[].effort` record
 what ran, including failed lenses.
 
 `pass` is a positive integer. Missing or invalid values default to `2` when `priorFindings`
@@ -131,13 +132,13 @@ pass a string, or an array/object (serialized as JSON). For `pass > 1`, each len
 findings and only the fix delta. At most **2 passes** per change: `ownerApproved` is a boolean,
 and a pass above `2` is refused unless the owner gave OK and you pass `ownerApproved: true`.
 
-It runs one Codex review per lens (hermetic, read-only, astra ≤2 at a time) and has Claude check
+It runs one Codex review per lens (hermetic, read-only, up to 4 Codex jobs at a time) and has Claude check
 every finding in the code (confirmed / refuted / needs-info) and rate its severity itself —
 Codex tends to rate findings above their real impact, so the ranking and the verdict follow
 Claude's rating, with every change listed (`severityChanges`). Then it writes the report.
 
 The **astra tiebreak is opt-in**. With `escalate: true`, the workflow sends the high/critical
-findings (by Codex's rating) that Claude refuted or could not settle to gpt-6-astra in one run,
+findings (by Codex's rating) that Claude refuted or could not settle to astra (gpt-6.2-astra) in one run,
 for findings from non-Astra lenses; Astra findings are not sent to Astra again. Nothing is dropped
 silently: a high/critical finding that Claude doubted and no tiebreak gave a verdict on is listed as
 **not cross-checked**, in `notCrossChecked` (with Codex's evidence and failure scenario, and a
@@ -165,8 +166,7 @@ backslashes break Bash commands on Windows):
 {
   "taskFile": "<abs path of the lens brief you wrote>",
   "cwd": "<abs repo path>",
-  "tier": "light",
-  "effort": "max",
+  "tier": "daily",
   "kind": "review",
   "schemaPreset": "review",
   "label": "review:code"
@@ -175,10 +175,11 @@ backslashes break Bash commands on Windows):
 
 The brief = the lens text from `references/lenses.md` + the scope sentence ("Review the changes
 on the current branch against main: `git diff main...HEAD`, plus uncommitted changes") + context
-+ lessons. Use `"tier": "light", "effort": "max"` (Terra at max) for every lens on pass 1,
-including security, and `"tier": "light"` without `effort` (Terra at xhigh) on a fix-delta pass
-(pass above 1) or for a quick pass. For critical work, use `final` on the security lens or on
-every lens for a final critical gate. An explicit owner-selected tier overrides that choice.
++ lessons. Use `"tier": "daily"` (Sol at xhigh, no `effort`) for every lens on every pass,
+including security; `"tier": "light", "effort": "max"` (Terra at max) for the old pass 1, and
+`"tier": "light"` without `effort` (Terra at xhigh) for a quick pass. For critical work, use
+`final` on the security lens, and on every lens for the last gate. An explicit owner-selected
+tier overrides that choice.
 Then:
 
 ```bash
@@ -186,10 +187,10 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" start --request "<request.js
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" wait <runId> --max-wait 7200   # run_in_background: true
 ```
 
-You are notified when the background `wait` exits. One Terra at max lens took about 8 minutes
+You are notified when the background `wait` exits. One Sol lens at xhigh took about 6 minutes
 in the benchmark and takes longer on a large diff; the runner stops it after 45 minutes. One
-Astra lens takes 25–35 minutes. Start the lenses together (the runner queues beyond its
-machine-wide cap).
+Astra 6.2 lens at max takes about 19 minutes (up to 35 on a large diff); the runner stops it
+after 67.5 minutes. Start the lenses together (the runner queues beyond its machine-wide cap).
 
 ## 4. Triage — never forward Codex findings unverified
 
@@ -231,8 +232,8 @@ pass 2 → the pass 2 rules in section 6). Say plainly that this overrides the w
 Follow `rereview` in the workflow result, also shown in the report's last `Re-review:` line.
 If lenses failed, re-run only `rereview.rerunLenses` first, on the same scope and with the SAME
 arguments as the first call (same `pass`, same `tier` or no `tier`, same `securityTier`, same
-`effort`). Do not pass the returned `tier: 'light'` explicitly: on a default pass 1 that would run
-terra@xhigh instead of terra@max. That is not a new pass.
+`effort`). Do not pass the returned `rereview.tier` for the re-run: it is the tier of the next
+pass, not of this one. That is not a new pass.
 Each result covers only its lenses: keep the first result and merge both runs' findings and
 `rereview.carry` after the retry. Follow the stricter `rereview`: worse `worst`, recommendation
 `owner > delta > none`, tier `final > daily > light`.
@@ -251,11 +252,11 @@ per change:
   one call can run the other lenses on `light` and the security lens on `final`.
   Build `priorFindings` from `rereview.carry` (id, status, severity, title, file:line).
   For each, add what was done: fixed (how), still open (why), or left as a follow-up / known limit.
-  After a non-final pass, medium and high/critical deltas use `light` (Terra at xhigh by default).
+  After a non-final pass, medium and high/critical deltas use `daily` (Sol at xhigh by default).
   After a `final` pass, medium deltas use `daily` and high/critical deltas use `final`.
-  When the tier is `light` and the delta is more than about 50 changed lines or more than 3 files,
-  or the fix changed the design, keep `light` and pass `effort: 'max'` (Terra at max). Do not move
-  to `daily`. A full re-review (`base: 'main'`) is only for a large or design-changing fix.
+  When the tier is `daily` after a non-final pass and the delta is more than about 50 changed lines
+  or more than 3 files, or the fix changed the design, keep `daily` and pass `effort: 'max'` (Sol at
+  max). A full re-review (`base: 'main'`) is only for a large or design-changing fix.
   When Codex implemented the change, send the fix brief to its open implement session as a
   follow-up (`codex_send` / `send <runId>`), not as a new run (see `codex-implement`).
 - **`owner`** → stop and report; do not ship with a high or critical finding open. After pass 2

@@ -16,9 +16,9 @@ see [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 | Component | What it is |
 | --- | --- |
-| Workflow `ultracodex:cross-review` | Claude finders per dimension → Codex (sol@xhigh, batched) refutes each finding against the code → one astra@max run re-checks the confirmed high/critical ones → report. Fails closed. |
+| Workflow `ultracodex:cross-review` | Claude finders per dimension → Codex (sol@xhigh, batched) refutes each finding against the code → one astra 6.2@max run re-checks the confirmed high/critical ones → report. Fails closed. |
 | Workflow `ultracodex:codex-review` | Codex reviews through lenses (code, domain, security, tests, performance) → Claude checks every finding in the code → report. Opt-in (`escalate: true`): high/critical disagreements settled by astra in one run; otherwise they are listed as "not cross-checked". |
-| Workflow `ultracodex:crosscheck` | One Codex (astra@max) attempt to refute a load-bearing claim. |
+| Workflow `ultracodex:crosscheck` | One Codex (astra 6.2@max) attempt to refute a load-bearing claim. |
 | Workflow `ultracodex:judge-panel` | Claude angles + a Codex candidate, a Claude+Codex jury, cross-family ranking, synthesis. |
 | Skill `codex-ask` | One question or claim from the conversation, straight to the runner (no relay — the cheapest way to consult Codex). |
 | Skill `codex-workflow` | Modes and cost levers; how to blend Codex nodes into custom Workflow scripts (the `codexNode` helper). |
@@ -36,20 +36,20 @@ see [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 | Tier | Model | For | Effort |
 | --- | --- | --- | --- |
-| `light` | gpt-6.1-terra | code review lenses (`codex-review` pass 1 asks for `max`), quick review or verification passes, triage, dedupe, wide fan-outs of small checks | `xhigh` for every workload |
-| `daily` | gpt-6.2-sol | implementation including complex code, debugging, architecture analysis, verification, jurors, plan checks, second opinions | `xhigh` for every workload |
-| `final` | gpt-6-astra | critical security work, data migrations, irreversible production steps, production release gates, high/critical issues escalated from Sol | `max` |
+| `light` | gpt-6.1-terra | quick review or verification passes (`tier: 'light', effort: 'max'` is the old terra@max review pass), triage, dedupe, wide fan-outs of small checks | `xhigh` for every workload |
+| `daily` | gpt-6.2-sol | implementation including complex code, debugging, architecture analysis, code review lenses (the `codex-review` default), verification, jurors, plan checks, second opinions | `xhigh` for every workload |
+| `final` | gpt-6.2-astra | critical security work, data migrations, irreversible production steps, production release gates, high/critical issues escalated from Sol | `max` |
 
 Sol 6.2 is the default for implementation, including complex modules, and for plan checks and
-asks (since 0.6.8; before that 6.1 Sol, which stays usable as an explicit `model: 'gpt-6.1-sol'`: a daily-tier model at `xhigh`). Code review runs on Terra: in `codex-review`, omitting `tier` uses Terra at `max` on every
-lens of pass 1, including `security`, and Terra at `xhigh` (`light`) on every lens of a fix-delta
-pass (pass above 1). At most 2 passes per change; a pass above 2 needs `ownerApproved: true`.
+asks (since 0.6.8; before that 6.1 Sol, which stays usable as an explicit `model: 'gpt-6.1-sol'`: a daily-tier model at `xhigh`). Code review runs on Sol at `xhigh` too (since 0.6.9): in `codex-review`, omitting `tier` uses
+Sol 6.2 at `xhigh` (`daily`) on every lens of every pass, including `security` and a fix-delta
+pass (pass above 1). Pass `tier: 'light', effort: 'max'` for the old terra@max pass. At most 2 passes per change; a pass above 2 needs `ownerApproved: true`.
 An explicit `tier` keeps its own default effort (`light` is terra@xhigh, `daily` is sol@xhigh);
 optional `effort` (`low` to `max`) sets the effort of every lens that is not on `final`.
 Astra is for critical work only: security-sensitive code (auth, keys, crypto, payments,
 personal data), data migrations, irreversible production steps and the last gate before a
-production release. For critical work, pass `securityTier: 'final'` for Astra on security only,
-or `tier: 'final'` for every lens. `securityTier` accepts `light`, `daily` or `final`; invalid
+production release. For critical work, pass `securityTier: 'final'` for Astra 6.2 on security only,
+and `tier: 'final'` for every lens as the last gate. `securityTier` accepts `light`, `daily` or `final`; invalid
 values are ignored. An explicit `securityTier` always sets the security lens, also when `tier` is
 given; `tier` sets every other lens. Actual routing is reported in
 `lenses[].tier`, `lenses[].model` and `lenses[].effort`. The astra tiebreak for high/critical
@@ -61,14 +61,17 @@ review (see the `codex-review` skill).
 Prefer Sol 6.2 at `xhigh`, including complex and long tasks. Use Sol at `max` only with an
 explicit effort override for an exceptional unresolved problem or at the owner's request;
 state the reason. The last gate for critical work is one `codex-review` pass with
-`tier: 'daily', effort: 'max'` (6.2 Sol at `max`) when really necessary. Astra at `max` remains opt-in and reserved for critical work.
+`tier: 'final'` (6.2 Astra at `max`) when really necessary. Astra at `max` is reserved for critical work.
 Why 6.2 Sol (0.6.8, owner's benchmark 2026-11-18, 9 replayed review cases with 11 known medium-or-worse bugs):
 6.2 Sol@xhigh found 9, 6.1 Sol@xhigh 2, 6.1 Terra@max 9 at about 20 % lower cost; 6.2 Sol has the same list price as 6.1 Sol.
-A 4-case probe found 6.2 Sol@max catching bugs that Terra@max missed.
+Why 6.2 Astra for critical work and Sol@xhigh for reviews (0.6.9, owner's benchmark 2026-11-20, the same 9 cases, judged blind):
+6.2 Astra@max found 10 of 11 with about twice as many real extra defects, at about $4.65 and 19 minutes a lens run;
+6.2 Sol@max found 9 ($1.08, 17.6 min), 6.2 Sol@xhigh 9 ($0.63, 6.4 min), 6.1 Terra@max 9 (about $0.52).
+`gpt-6-astra` stays usable as an explicit `model` (a final-tier model at `max`, weight 2).
 The light tier moved from luna@max to terra@xhigh on 2026-10-27: on 10 replayed review jobs with 12
 known medium-or-worse defects, luna@max found 2, terra@xhigh 5 ($0.12 a run, ~80 s), terra@max 10
-($0.49, ~7.5 min, as costly as sol@xhigh, which found 4). Small sample, noisy. Since 0.6.7 the
-`codex-review` pass-1 default is terra@max for that reason; the light tier default stays at `xhigh`. Luna stays usable as
+($0.49, ~7.5 min, as costly as sol@xhigh, which found 4). Small sample, noisy. From 0.6.7 to 0.6.8 the
+`codex-review` pass-1 default was terra@max for that reason; the light tier default stays at `xhigh`. Luna stays usable as
 an explicit `model: 'gpt-6-luna', effort: 'max'` for mechanical, high-volume work. `ultra` only on
 explicit request, once per run. Details:
 [model-policy.md](plugins/ultracodex/skills/codex-workflow/references/model-policy.md).
@@ -76,7 +79,7 @@ explicit request, once per run. Details:
 Cost, in short: ask directly (`codex-ask`) when one answer is enough; batch small items into
 one run; let sol verify broadly and astra re-check only what would block a merge (`cross-review`
 does this by default and reports any astra disagreement as *disputed*; `codex-review` reviews on
-terra and sends findings to astra only with `escalate: true`); every shipped
+sol and sends findings to astra only with `escalate: true`); every shipped
 workflow returns `codexUsage` — runs and tokens per model.
 
 ## Requirements

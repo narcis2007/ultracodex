@@ -654,7 +654,7 @@ test("review mode invokes `codex exec review` with the target flags", async (t) 
   const { final } = await startAndWait(fastEnv(home, { FAKE_CODEX_ARGV_LOG: argvLog }), { review: { base: "main" }, schemaPreset: "review", tier: "final" }, { home });
   assert.equal(final.ok, true);
   assert.equal(final.provenance.mode, "review");
-  assert.equal(final.provenance.model, "gpt-6-astra");
+  assert.equal(final.provenance.model, "gpt-6.2-astra");
   const argv = JSON.parse(fs.readFileSync(argvLog, "utf8").trim()).argv;
   assert.deepEqual(argv.slice(0, 4), ["exec", "review", "--base", "main"]);
 });
@@ -698,7 +698,7 @@ test("dry-run shows the invocation without running codex", async (t) => {
     env: fastEnv(home, { FAKE_CODEX_ARGV_LOG: argvLog }),
   });
   assert.equal(result.json.ok, true);
-  assert.equal(result.json.model, "gpt-6-astra");
+  assert.equal(result.json.model, "gpt-6.2-astra");
   assert.ok(result.json.args.includes("--ignore-user-config"));
   assert.equal(fs.existsSync(argvLog), false);
 });

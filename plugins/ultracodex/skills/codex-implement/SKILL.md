@@ -7,7 +7,7 @@ description: >-
   the same session. Use when the user asks to have Codex implement / build / fix / refactor /
   migrate something, "give this to codex", "let codex write it", "use codex as the
   implementer or subagent", or any implement-then-review combination. Tiers: gpt-6.2-sol@xhigh by
-  default, including complex code; gpt-6-astra@max for an explicit escalation or final critical
+  default, including complex code; gpt-6.2-astra@max for an explicit escalation or final critical
   review, gpt-6.1-terra@xhigh for mechanical changes (gpt-6-luna@max only as an explicit override).
 ---
 
@@ -28,13 +28,13 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-node.mjs" preflight
 
 - `daily` → gpt-6.2-sol@xhigh: features, fixes, debugging, refactors and cross-module designs
   from a clear brief, including complex implementation;
-- `final` → gpt-6-astra@max: implementation only when the owner explicitly requests Astra,
+- `final` → gpt-6.2-astra@max: implementation only when the owner explicitly requests Astra,
   or when a concrete unresolved issue justifies escalation after a Sol attempt;
 - `light` → gpt-6.1-terra@xhigh: mechanical work (renames, boilerplate, docs, test scaffolding).
   For high-volume mechanical edits where cost matters most, name `model: "gpt-6-luna", effort: "max"`.
 
 Complexity alone does not switch the implementer to Astra. Use Sol to implement routine
-changes; their code review runs on Terra (the `codex-review` defaults). Use Astra for the final
+changes; their code review runs on Sol at xhigh (the `codex-review` defaults). Use Astra for the final
 review only for critical work: security-sensitive code
 (auth, keys, crypto, payments, personal data), data migrations, irreversible production steps,
 or the last gate before a production release, unless the owner chose another model. In
@@ -108,7 +108,7 @@ Request file (Write tool):
 
 `"session": true` makes the run a **steerable session**: Codex runs on a private app-server, and you can
 steer it, send follow-ups, answer its questions and see what it does (the `codex-steer` skill has the
-command reference). `timeoutSec` (default sol@xhigh ≈ 90 min, astra@max ≈ 135 min) is the deadline of
+command reference). `timeoutSec` (default sol@xhigh ≈ 90 min, astra 6.2@max ≈ 135 min) is the deadline of
 **each turn**. The cwd and `addDirs` of a writable run must not contain or lie inside the runner's home
 (`~/.ultracodex`): a Codex job must never be able to write its own inbox.
 
@@ -168,8 +168,8 @@ a follow-up is then a new run with `"resume": { "sessionId": "<provenance.thread
   (the runner restates the sandbox on every resume — `codex exec resume` alone runs read-only — so a follow-up that
   must write says `"sandbox": "workspace-write"`).
 - **Adversarial review of the result**: the `codex-review` skill (or the
-  `ultracodex:codex-review` workflow) on the worktree branch. Sol implements → Terra reviews
-  routine changes (the `codex-review` defaults), including security lenses; a small, low-risk
+  `ultracodex:codex-review` workflow) on the worktree branch. Sol implements → a separate Sol run
+  reviews routine changes (the `codex-review` defaults), including security lenses; a small, low-risk
   change needs no Codex review (see the `codex-review` skill). For the critical categories in section 1,
   use `securityTier: 'final'` for an Astra security review or `tier: 'final'` for every lens.
   Or use `ultracodex:cross-review` so Claude finds and Codex verifies.

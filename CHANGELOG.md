@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.6.9 — 2026-11-20 (final tier: gpt-6.2-astra; reviews default to sol@xhigh)
+
+- The `final` tier model is `gpt-6.2-astra` (before: `gpt-6-astra`), at `max` for every kind. Astra stays
+  for critical work only: the `securityTier: 'final'` security lens, the last gate (`tier: 'final'`), the
+  opt-in astra tiebreak (`escalate: true`), the `cross-review` final gate and the `crosscheck` default.
+- `codex-review`: with no valid `tier`, every lens (security included) runs on `daily` (`gpt-6.2-sol`) at its
+  default effort (`xhigh`), on pass 1 and on a fix-delta pass (pass > 1). The automatic raise to effort `max`
+  on pass 1 is removed. Before: pass 1 ran `light` at `max` (terra@max), pass > 1 `light` at `xhigh`. An
+  explicit `tier` and an explicit `effort` work as before. To get the old terra@max pass 1, pass
+  `tier: 'light', effort: 'max'`. The `rereview` recommendation after a non-final pass is now tier `daily`
+  (before: `light`); the hint for a larger delta reads "Pass effort: 'max' (the tier stays daily)".
+- Reason: the owner's benchmark of 2026-11-20 on 9 replayed review cases with 11 known medium-or-worse bugs,
+  judged blind. gpt-6.2-astra@max found 10 of 11 with about twice the real extra defects, at about 4.65 USD
+  list price and 19 minutes for a review lens run. gpt-6.2-sol@max found 9 (1.08 USD, 17.6 min),
+  gpt-6.2-sol@xhigh 9 (0.63 USD, 6.4 min), gpt-6.1-terra@max 9 (about 0.52 USD). So normal reviews run on
+  sol@xhigh, and astra is kept for critical work. The owner's Codex plan (Pro 100) has enough usage for this.
+- Runner: `POLICY.models.final` is `gpt-6.2-astra` (model factor 1.5 for the deadline guard, the longest
+  measured run was 32 minutes; listed in `ultraModels`; weight 1). `gpt-6-astra` is no tier model any more
+  but stays usable as an explicit `model`: it is in `explicitModels` as a `final`-tier model with default
+  effort `max`, keeps weight 2 and model factor 1.5. The slot limit (`ULTRACODEX_MAX_CONCURRENT`) is now only
+  a runaway guard, not a usage budget. The Workflow helper (`UCX_TIER_MODEL`, `UCX_MODEL_EFFORT`, the new
+  `UCX_MODEL_WEIGHT`) mirrors this, and the `codex-review` and `cross-review` log lines and report prompts
+  take the final-tier model from `UCX_TIER_MODEL.final` instead of a fixed name. `RUNNER_VERSION` and
+  `UCX_VERSION` are 0.6.9.
+- Docs: the READMEs, the five skills, `model-policy.md`, `workflow-templates.md`, `codex-headless.md` and the
+  plugin descriptions name 6.2 Astra and the new `codex-review` default. Tests: the fixtures list
+  `gpt-6.2-astra` next to `gpt-6-astra`; the default-tier tests expect `daily` at `xhigh`; new tests for the
+  no-tier routing on pass 1 and pass 2, the explicit `light` + `max` pass, `securityTier: 'final'` on
+  6.2 Astra, the explicit `gpt-6-astra` model and the final-tier weight.
+
 ## 0.6.8 — 2026-11-18 (daily tier: gpt-6.2-sol)
 
 - The `daily` tier model is `gpt-6.2-sol` (before: `gpt-6.1-sol`), at `xhigh` for every kind. It is the

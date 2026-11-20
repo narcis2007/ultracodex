@@ -6,8 +6,8 @@ Two ways to use Codex nodes in a Workflow:
 
    | Workflow | What it does | Key args |
    | --- | --- | --- |
-   | `ultracodex:cross-review` | Claude finders per dimension → Codex (sol@xhigh, batched) refutes each finding against the code → one astra@max run re-checks the confirmed high/critical ones → Claude report | `target`, `cwd`, `dimensions`, `verifyTier: 'daily'\|'final'`, `finalGate` (default on), `fast`, `context`, `lessons`, `batch` |
-   | `ultracodex:codex-review` | Codex reviews through lenses (code, domain, security, tests, performance), terra@max on pass 1 → Claude checks each finding in the code → report; with `escalate: true`, high/critical disagreements go to astra@max in one run | `cwd`, `base` \| `commit` \| `uncommitted`, `lenses`, `tier: 'light'\|'daily'\|'final'`, `effort`, `escalate` (default off), `pass` (at most 2), `fast`, `context`, `lessons`, `triage` |
+   | `ultracodex:cross-review` | Claude finders per dimension → Codex (sol@xhigh, batched) refutes each finding against the code → one astra@max run (gpt-6.2-astra) re-checks the confirmed high/critical ones → Claude report | `target`, `cwd`, `dimensions`, `verifyTier: 'daily'\|'final'`, `finalGate` (default on), `fast`, `context`, `lessons`, `batch` |
+   | `ultracodex:codex-review` | Codex reviews through lenses (code, domain, security, tests, performance), sol@xhigh on every lens and pass by default → Claude checks each finding in the code → report; with `escalate: true`, high/critical disagreements go to astra@max in one run | `cwd`, `base` \| `commit` \| `uncommitted`, `lenses`, `tier: 'light'\|'daily'\|'final'`, `effort`, `escalate` (default off), `pass` (at most 2), `fast`, `context`, `lessons`, `triage` |
    | `ultracodex:crosscheck` | one Codex attempt to refute one load-bearing claim (astra@max) | `claim`, `evidence`, `cwd`, `tier`, `fast` |
    | `ultracodex:judge-panel` | Claude angles + a Codex candidate, Claude+Codex jury, cross-family ranking, synthesis | `problem`, `angles`, `cwd`, `codexCandidate` |
 
@@ -60,18 +60,21 @@ stage works in the session's directory, not in the workflow's `cwd`.
 // Same request, same result, same signatures; if the runner cannot run it that way it runs it on codex exec, and
 // steerable: false (or ULTRACODEX_NODE_BACKEND=exec in the runner's environment) always does.
 // Routing (runner policy): tier 'light' → gpt-6.1-terra@xhigh · 'daily' → gpt-6.2-sol@xhigh
-// for every kind · 'final' → gpt-6-astra@max for exceptional critical work. Pin
+// for every kind · 'final' → gpt-6.2-astra@max for critical work only. Pin
 // model/effort only to override with a reason (gpt-6-luna is an explicit override only; its default effort is max;
-// gpt-6.1-sol is a daily-tier model only when named explicitly: no tier selects it any more, its default effort is xhigh).
-// Why 6.2 sol (owner's benchmark 2026-11-18, 9 replayed review cases, 11 known medium+ bugs): 6.2 sol@xhigh found 9,
-// 6.1 sol@xhigh 2, 6.1 terra@max 9 at about 20 % lower cost; same list price as 6.1 sol.
-// Concurrency is capped intrinsically: 4 Codex jobs per workflow, an astra job counting as 2 — do not wrap calls in
-// another gate.
-const UCX_VERSION = '0.6.8'
+// gpt-6.1-sol is a daily-tier model only when named explicitly: no tier selects it any more, its default effort is xhigh;
+// gpt-6-astra, the 6.0 astra, is a final-tier model only when named explicitly: default effort max, weight 2).
+// Why (owner's benchmark 2026-11-20, 9 replayed review cases, 11 known medium+ bugs): 6.2 astra@max found 10 (about
+// 4.65 USD a lens run, 19 min), 6.2 sol@max 9 (1.08 USD), 6.2 sol@xhigh 9 (0.63 USD, 6.4 min), 6.1 terra@max 9 (about
+// 0.52 USD). So normal reviews run on sol@xhigh and astra stays for critical work.
+// Concurrency is capped intrinsically: 4 Codex jobs per workflow, a gpt-6-astra job counting as 2 (every other model
+// counts as 1, 6.2 astra too, as in the runner's POLICY.weight) — do not wrap calls in another gate.
+const UCX_VERSION = '0.6.9'
 const UCX_RELAY = 'ultracodex:codex-relay'
-const UCX_TIER_MODEL = { light: 'gpt-6.1-terra', daily: 'gpt-6.2-sol', final: 'gpt-6-astra' }
+const UCX_TIER_MODEL = { light: 'gpt-6.1-terra', daily: 'gpt-6.2-sol', final: 'gpt-6.2-astra' }
 const UCX_TIER_EFFORT = { light: 'xhigh', daily: 'xhigh', final: 'max' }
-const UCX_MODEL_EFFORT = { 'gpt-6-luna': 'max', 'gpt-6.1-sol': 'xhigh' }   // no tier selects these; an explicit luna or 6.1 sol keeps its own default effort (as the runner does)
+const UCX_MODEL_EFFORT = { 'gpt-6-luna': 'max', 'gpt-6.1-sol': 'xhigh', 'gpt-6-astra': 'max' }   // no tier selects these; an explicit luna, 6.1 sol or 6.0 astra keeps its own default effort (as the runner does)
+const UCX_MODEL_WEIGHT = { 'gpt-6-astra': 2 }   // mirrors the runner's POLICY.weight: every other model counts as one slot
 const UCX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
 const UCX_KINDS = ['verify', 'ask', 'review']
 const UCX_PRESETS = ['verdict', 'score', 'review', 'implement']
@@ -140,7 +143,7 @@ function ucxDelimiter(lines) {
   return d
 }
 
-// Weighted limiter: capacity 4, an astra job weighs 2. Releases on throw.
+// Weighted limiter: capacity 4, a gpt-6-astra job weighs 2 (UCX_MODEL_WEIGHT). Releases on throw.
 function ucxMakeGate(capacity) {
   let used = 0
   const queue = []
@@ -489,7 +492,7 @@ function codexNode(task, opts = {}) {
   const target = targetModel.replace(/^gpt-6(?:\.(\d+))?-/, (_, minor) => minor ? '6.' + minor + '-' : '') + '@' +
     (effort || UCX_MODEL_EFFORT[targetModel] || UCX_TIER_EFFORT[targetTier])
   const relayLabel = 'relay → ' + (label || 'codex') + ' (' + target + ')'
-  const weight = targetModel === 'gpt-6-astra' ? 2 : 1
+  const weight = UCX_MODEL_WEIGHT[targetModel] || 1
   // agent() may reject (runtime error, exhausted budget): that is a failed node, never a vanished one.
   const call = async (prompt, callOpts) => {
     try { return await agent(prompt, callOpts) } catch (e) { return { __ucxRejected: String((e && e.message) || e) } }
@@ -654,8 +657,9 @@ Rules the helper already enforces — do not work around them:
   behind other agents) the run is marked `orphaned` but keeps going (`onOrphan: finish`), and a
   resumed workflow joins it; `cancel --orphaned` ends the leftovers. Only well-formed run ids from
   a relay's reply ever reach another relay's prompt.
-- **Intrinsic concurrency cap:** 4 Codex jobs per workflow, an astra job counting as 2, plus the
-  runner's machine-wide cap (`ULTRACODEX_MAX_CONCURRENT`, default 4). Don't add another gate.
+- **Intrinsic concurrency cap:** 4 Codex jobs per workflow, a `gpt-6-astra` job counting as 2 (every
+  other model, 6.2 astra included, as 1), plus the runner's machine-wide cap
+  (`ULTRACODEX_MAX_CONCURRENT`, default 4). Don't add another gate.
 - **Fail closed.** A dead node is unverified, never a pass: partition with `ucxPartition`, report
   `status: 'incomplete'` when a required node failed.
 
@@ -789,9 +793,9 @@ Policy (enforced by the runner; override per node only with a reason):
 | wide fan-out of small checks, triage, dedupe | `light` / `verify` | gpt-6.1-terra @ xhigh |
 | everyday adversarial verify, jurors | `daily` / `verify` | gpt-6.2-sol @ xhigh |
 | a second opinion | `daily` / `ask` | gpt-6.2-sol @ xhigh |
-| one lens of a code review | `light` / `review` with `effort: 'max'` (the `codex-review` pass-1 default) | gpt-6.1-terra @ max |
-| last gate for critical work (owner's rule, only when really necessary) | `daily` / `review` with `effort: 'max'` (one `codex-review` pass) | gpt-6.2-sol @ max |
-| final critical gate, load-bearing single verdict, unresolved issue escalated from Sol | `final` / any | gpt-6-astra @ max |
+| one lens of a code review | `daily` / `review` (the `codex-review` default, every pass) | gpt-6.2-sol @ xhigh |
+| the old cheap review pass | `light` / `review` with `effort: 'max'` | gpt-6.1-terra @ max |
+| security lens of critical work, last gate for critical work (only when really necessary), final critical gate, load-bearing single verdict, unresolved issue escalated from Sol | `final` / any | gpt-6.2-astra @ max |
 
 `ultra` is never implicit: pass `effort: 'ultra'` on at most one decisive astra/sol node per run
 (it delegates to sub-agents and runs long). Details: `model-policy.md`.

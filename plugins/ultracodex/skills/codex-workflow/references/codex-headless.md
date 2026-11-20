@@ -407,7 +407,8 @@ Knobs: `ULTRACODEX_NODE_BACKEND` (`exec` = kill switch), `ULTRACODEX_CONFIG_READ
 
 | slug | efforts | note |
 | --- | --- | --- |
-| `gpt-6-astra` | low · medium · high · xhigh · max · ultra | frontier; Fast tier 2× |
+| `gpt-6.2-astra` | low · medium · high · xhigh · max · ultra | frontier; the `final` tier (max); context 272K |
+| `gpt-6-astra` | low · medium · high · xhigh · max · ultra | previous frontier model; explicit `model` override only (counts as `final`, default effort max, weight 2); Fast tier 2× |
 | `gpt-6.2-sol` | low · medium · high · xhigh · max · ultra | workhorse; the `daily` tier (xhigh) |
 | `gpt-6.1-sol` | low · medium · high · xhigh · max · ultra | previous workhorse; explicit `model` override only (counts as `daily`, default effort xhigh) |
 | `gpt-6.1-terra` | low · medium · high · xhigh · max · ultra | the `light` tier (xhigh); context 500K |

@@ -27,24 +27,23 @@ Codex (GPT-6 via `codex exec`) inside Claude Code.
   records which Claude session started it.
 
 Tier policy: `light` → gpt-6.1-terra@xhigh · `daily` → gpt-6.2-sol@xhigh (all workloads) ·
-`final` → gpt-6-astra@max. `gpt-6-luna` is an explicit `model` override only (default effort `max`); so is
-`gpt-6.1-sol` (a daily-tier model at `xhigh`).
+`final` → gpt-6.2-astra@max. `gpt-6-luna` is an explicit `model` override only (default effort `max`); so are
+`gpt-6.1-sol` (a daily-tier model at `xhigh`) and `gpt-6-astra` (a final-tier model at `max`, weight 2).
 See `skills/codex-workflow/references/model-policy.md`.
 
-Sol 6.2 implements complex code and handles plan checks and asks by default; code review runs on
-Terra. Astra is for critical work only: security-sensitive code (auth, keys, crypto, payments, personal data), data
+Sol 6.2 implements complex code and handles plan checks, asks and code review by default. Astra 6.2 is for critical work only: security-sensitive code (auth, keys, crypto, payments, personal data), data
 migrations, irreversible production steps and the last gate before a production release.
 Use Sol at `max` only as an explicit override for an exceptional unresolved problem or
 an owner request, with a stated reason. Task complexity or duration alone does not justify it.
-The last gate for critical work is one `codex-review` pass with `tier: 'daily', effort: 'max'` (6.2 Sol at `max`).
-`codex-review` without `tier` routes every lens of pass 1, including `security`, to Terra at `max`,
-and every lens of a fix-delta pass (pass above 1) to Terra at `xhigh` (`light`). At most 2 passes
+The last gate for critical work is one `codex-review` pass with `tier: 'final'` (6.2 Astra at `max`).
+`codex-review` without `tier` routes every lens of every pass, including `security` and a fix-delta
+pass (pass above 1), to Sol 6.2 at `xhigh` (`daily`). `tier: 'light', effort: 'max'` is the old terra@max pass. At most 2 passes
 per change (`ownerApproved: true` for more). An explicit `tier` keeps its own default effort; optional
 `effort` sets the effort of every lens that is not on `final`. The astra tiebreak is opt-in
 (`escalate: true`); without it, high/critical findings that Claude doubted are listed as "not
 cross-checked".
-For critical work, use `securityTier: 'final'` for Astra on security only, or `tier: 'final'`
-for every lens. `securityTier` accepts `light`, `daily` or `final`; invalid values are ignored.
+For critical work, use `securityTier: 'final'` for Astra on security only, and `tier: 'final'`
+for every lens as the last gate. `securityTier` accepts `light`, `daily` or `final`; invalid values are ignored.
 An explicit `securityTier` always sets the security lens, also when `tier` is given; `tier` sets every
 other lens. Results name each lens's actual tier and model.
 
